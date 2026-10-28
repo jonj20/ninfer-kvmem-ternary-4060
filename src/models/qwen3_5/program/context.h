@@ -57,7 +57,10 @@ struct PrefillContext {
     std::int32_t state_source_slot                          = 0;
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
-    const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // Per-chunk DFlash prefill controls: append count, destination slot, and KV table row,
+    // written by the chunk's first pass and consumed by dflash_append_context.
+    std::int32_t dflash_kv_table_row                           = 0;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
 };
 
 struct OrdinaryBatchContext {

@@ -119,8 +119,17 @@ struct MtpPrefillStateLayout {
     TensorRegion target_positions;
 };
 
+// Prefill binds the current chunk independently of the compact decode batch.
+
+struct DFlashPrefillIngress {
+    std::int32_t append_count           = 0;
+    std::int32_t state_destination_slot = 0;
+    std::int32_t full_kv_table_row      = 0;
+};
+
 struct DFlashPrefillStateLayout {
-    TensorRegion produced_count;
+    LayoutRegion ingress;
+    TensorRegion local_append_count;
 };
 
 struct MtpDecodeStateLayout {
@@ -215,7 +224,12 @@ struct MtpPrefillState {
 };
 
 struct DFlashPrefillState {
-    Tensor produced_count;
+    DeviceSpan ingress;
+    Tensor append_count;
+    Tensor state_destination_slot;
+    Tensor full_kv_table_row;
+    // Oversized chunks retain only their tail locally; full KV still uses append_count.
+    Tensor local_append_count;
 
     DFlashPrefillState() = default;
     DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout);

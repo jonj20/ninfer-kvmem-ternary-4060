@@ -670,6 +670,7 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_5::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
 
     // Mean-key capture staging (kvmem-port.md 2.6 stage 4b). Allocated once, only when Retrieval
     // selection is active, because the ordinary decode route captures this reduction and its
