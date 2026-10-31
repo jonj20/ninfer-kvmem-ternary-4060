@@ -21,19 +21,25 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
                                                          const std::int32_t* current_extents,
+                                                         const std::int32_t* cache_position_deltas,
                                                          std::int32_t* verify_ids,
-                                                         std::int32_t* positions, std::int32_t k) {
+                                                         std::int32_t* positions,
+                                                         std::int32_t* cache_positions, std::int32_t k) {
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    const std::int32_t shift =
+        cache_position_deltas == nullptr ? 0 : cache_position_deltas[row];
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
         const int off = row * T + j;
         verify_ids[off] =
             j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
+        const std::int32_t position = base_positions[row] + (j <= extent ? j : extent);
         if (positions != nullptr) {
-            positions[off] = base_positions[row] + (j <= extent ? j : extent);
+            positions[off]        = position;
+            cache_positions[off] = position + shift;
         }
     }
 }

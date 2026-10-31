@@ -164,6 +164,9 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {verify_columns, batch}, "MTP decode verify ids");
         decode.target_positions =
             add_tensor(builder, DType::I32, {verify_columns, batch}, "MTP decode target positions");
+        decode.target_cache_positions =
+            add_tensor(builder, DType::I32, {verify_columns, batch},
+                       "MTP decode target cache positions");
         decode.target_argmax =
             add_tensor(builder, DType::I32, {verify_columns, batch}, "MTP decode target argmax");
         decode.target_logits =
@@ -187,6 +190,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
         decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive positions");
+        decode.ar_cache_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                               "MTP decode autoregressive cache positions");
         decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
@@ -302,6 +307,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     state_destination_slots =
         ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
+    cache_position_deltas =
+        ingress_tensor(offsetof(MtpDecodeIngress, cache_position_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
 
@@ -316,6 +323,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
+    target_cache_positions = layout.target_cache_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
     target_logits    = layout.target_logits.bind(backing);
     target_hidden    = layout.target_hidden.bind(backing);
@@ -326,6 +334,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     ar_hidden                  = layout.ar_hidden.bind(backing);
     next_hidden                = layout.next_hidden.bind(backing);
     ar_positions               = layout.ar_positions.bind(backing);
+    ar_cache_positions         = layout.ar_cache_positions.bind(backing);
     ar_rope_positions          = layout.ar_rope_positions.bind(backing);
     ar_valid_columns           = layout.ar_valid_columns.bind(backing);
     if (ar_positions.ne[0] != batch || ar_positions.ne[1] != steps) {
@@ -371,6 +380,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     if (layout.proposal_q) { proposal_q = layout.proposal_q->bind(backing); }
     target_rope_positions = ingress_tensor(offsetof(DFlashDecodeIngress, target_rope_positions),
                                            DType::I32, {width, batch});
+    cache_position_deltas =
+        ingress_tensor(offsetof(DFlashDecodeIngress, cache_position_deltas), DType::I32, {batch});
+    verify_cache_positions =
+        ingress_tensor(offsetof(DFlashDecodeIngress, verify_cache_positions), DType::I32, {width, batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =

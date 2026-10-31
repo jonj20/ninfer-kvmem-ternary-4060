@@ -673,7 +673,7 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         // are not. Restore their Device residency first (H2D, synced here), then re-hold their
         // ownership; abort_active_capture undoes the hold if the snapshot never commits, while a
         // successful commit transfers the references to the destination by convention.
-        stage_in_all_holes(sequence.kv->text);
+        stage_in_all_holes(KVWindowSpace{*text_kv_addresses, *text_kv_pages}, sequence.kv->text);
         transaction.held_text_holes = text_kv_addresses->hold_window_holes(sequence.kv->text);
         transaction.text_snapshot.emplace(text_kv_addresses->prepare_active_snapshot(
             sequence.kv->text, *transaction.active_text_destination, sequence.text_kv_valid));

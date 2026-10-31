@@ -483,13 +483,44 @@ reselect 的产物只有两样，形状都已经确定：
   由"启动 ensure 全量 + 每轮 reselect 后释放"的组合承担同一职责。
 - **验收状态**：单测见 2.6 头部证据行；端到端 262144 实测待模型产物。
 
-**阶段 6 — draft/MTP 池**
-- MTP backend KV 是独立稠密池（`text.cpp:376-391` 也读 `[0,p]`）。
-- 第一版方案：**draft 池保持稠密但按 target 同步裁剪**（draft 只需要最近
-  `draft_window` + 与 target 对齐的行），显存上按 `startup.cpp:124-132` 的
-  `mtp_extra_pages` 单独核算。
-- 若不可行，第一版**默认 `--spec off`**，把 MTP 列为已知限制写进文档。
-- **验收**：开/关 spec 各跑一次阶段 0 的验收 1/2。
+**阶段 6a — MTP × KVMem 窗口化 落地记录**（2026-10-29；`--spec mtp` 与真实 `--kvmem-budget` 并存，
+DFlash/DFlash2 保持恒等窗口，留阶段 6b）：
+
+- **门禁**（D2/P2）：`resident_staging_active()` / `retrieval_selection_active()` 放开 `--spec mtp`
+ （新增 `kvmem_resident_staging(backend)` 在 `src/models/load_options.h:55`，`program_impl.h` 两 gate、
+  `model_instance.cpp:157` 与之同步改）；`storage/context.cpp:1645` reselect 门改为
+  `is_masked_draft_backend` 硬拒绝（DFlash 系恒等），MTP 通过窗口行移消费表。
+- **位置管线**（D4/P3）：`speculative_prepare_verify_inputs` 与 `mtp_prepare_next_round` 各增
+  `cache_position_deltas [B]` 输入（每 lane 窗口行移，为 0 时恒等），分别输出
+  `cache_positions [W,B]` / `ar_cache_positions [B,S]`（注意力与 KV 唯一行基）；RoPE 与
+  `rope_deltas` 不动；dflash 路径传空 deltas；`MtpDecodeIngress` 增 `cache_position_deltas`
+  字段；op 单元测试（`tests/ops/test_speculative_round.cpp`、`tests/ops/test_mtp_round.cpp`）
+  已扩展并通过（GPU 实测 PASS）。
+- **MTP 轮 reselect**（D3/P4）：`decode_mtp_batch` 逐 lane 先 `ensure_sequence_kv_mapped(
+  frontier + extent + 1, min(capacity, frontier + extent + draft_window))`，再
+  `reselect_sequence_window(sequence, frontier, frontier + extent + draft_window)`，返回行移
+  写入 `cache_position_deltas[row]`；拒绝时下一轮 `truncate_to` 收回（既有逻辑复用）；
+  `apply_window_transition` 对 text 与 backend 各调一次 `apply_window_space_transition`（P4
+  纯重构，text 行为逐位不变）；`mtp_kv_table_rows` 已由 bound row 覆盖，不动。
+- **启动校验**（D6/P2）：`kv_capacity ≥ budget + prefill_chunk + max_concurrency × draft_window`
+ （MTP 导线）；Host tier 要求按两空间字节统筹（`demoted_pages × (text_stride +
+  backend_stride)`，`--host-kv-mib 0` 口径与 2.6 阶段 5 一致，显式传或省略均可）。
+- **准入**（P2）：staging 下 `main_kv_pages = min(text entitlement, pool_pages)`，
+  `backend_kv_pages = min(backend entitlement, backend_pool_pages)`，其中 `backend_pool_pages`
+  取自该空间的 Device 池容量（`page_pool().capacity_pages()`，即 `pages_for_tokens(kv_capacity)`
+  加上 MTP draft lead 页）。用 text 池页数封顶会让超池 prompt 的激活多领一页，materialization
+  随即按"取消"回滚（HTTP 200、`finish_reason:"stop"`、0 输出）；已按上述口径修正。
+- **捕获**（P5）：`KVMemCaptureMode::MtpVerify`，verify 预 RoPE K 按 flat 列
+  `lane × W + j` 分列单 token 求和入 staging（`text.cpp:839` 扩展），`prepare_kvmem_capture`
+  容量加 `8 × 16 = 128` 列；decode 后按 `licensed_counts` 只折叠 committed 列（`accumulate_
+  kvmem_decode_scores` 改按 `column` 索引 staging，ordinary decode `column = lane`，逐位不变）。
+- **文档**：`docs/cli.md` / `docs/serving.md` `--kvmem-budget` 行已更新（“ignored while --spec
+  enabled” 改为仅 dflash 系忽略，mtp 加入 staging；kv-capacity 下界注明 MTP draft lead）。
+- **验收**：`ninfer_model_runtime` 全量编译通过；`ninfer_mtp_round_test`、`ninfer_speculative_round_test`
+  GPU 实测 PASS；`git diff --check` 干净。端到端 262144 验收 1/2 待模型产物（阶段 7）。
+
+原占位块（"MTP backend KV 是独立稠密池……若不可行，第一版默认 --spec off"）已作废。
+
 
 **阶段 7 — 文档与端到端**（文档部分 2026-10-04 已完成；端到端未跑）
 - **已完成**：`docs/serving.md` 选项行 + Execution behavior 的 `--kvmem-budget` 段落；

@@ -4,6 +4,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/load_options.h"
 
 #include <algorithm>
 #include <chrono>
@@ -155,7 +156,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .vision_max_tokens        = options.vision_max_tokens})),
       capacity(options.max_context),
       resident_staging(options.kvmem_budget != 0 &&
-                       options.speculative.backend == SpeculativeBackend::None) {}
+                       models::kvmem_resident_staging(options.speculative.backend)) {}
 
 ModelInstance::~ModelInstance() = default;
 

@@ -549,6 +549,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
+            // Mapping first: a moved window republishes pages the query itself addresses. Reselect
+            // then renumbers the retained rows for [frontier, window_end], which covers the verify
+            // columns and every AR step this round may touch. The resulting per-lane row shift is
+            // broadcast into every verify/AR cache row.
+            //
+            // The published window extends through the draft lead, so BOTH KV spaces are mapped
+            // through the same token count: set_window refuses a window that claims more tokens
+            // than the address maps, and the verified-column count (extent + 1) can sit a few
+            // tokens below the lead inside one page-aligned run, which used to trip that check on
+            // the first decode round after a boundary. `window_end` also clamps to the last
+            // admissible position so a round near the context ceiling does not ask for a token
+            // past --max-context.
+            const std::uint32_t window_end =
+                std::min(capacity - 1U, frontier + extent + draft_window);
+            ensure_sequence_kv_mapped(sequence, window_end + 1U, window_end + 1U);
+            const std::int32_t cache_delta =
+                reselect_sequence_window(sequence, frontier, window_end);
+            mtp_host_ingress->cache_position_deltas[row] = cache_delta;
             mtp_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             mtp_host_ingress->mtp_kv_table_rows[row] =
@@ -558,15 +576,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
-            // Text KV covers the verified columns; MTP KV also covers the K-1 AR steps that
-            // follow the accepted prefix, so its end depends on the depth K, not on W.
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
-                                      std::min(capacity, frontier + extent + draft_window));
         }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    round_replay_records(width), io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   kvmem_capture_target(
+                                                       execution::KVMemCaptureMode::MtpVerify,
+                                                       kMaximumConcurrency)},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -636,6 +653,23 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
+
+        if (retrieval_selection_active()) {
+            // Fold every committed verify column of this round into the block-mean store before
+            // the next round's reselect ranks blocks. Column (row, j) of the verify matrix is the
+            // token at absolute position frontier + j; its staging column is row * width + j, and
+            // padding columns beyond the licensed prefix are never folded.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                SequenceState& sequence = active_sequence(lanes[row]);
+                const std::uint32_t frontier = sequence.execution_frontier;
+                const std::uint32_t licensed =
+                    static_cast<std::uint32_t>(mtp_host_egress->licensed_counts[row]);
+                for (std::uint32_t j = 0; j < licensed; ++j) {
+                    accumulate_kvmem_decode_scores(sequence, row * width + j, frontier + j);
+                }
+            }
+        }
+
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
                                                    lanes.size() * width),

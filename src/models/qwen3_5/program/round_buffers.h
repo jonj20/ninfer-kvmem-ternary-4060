@@ -60,6 +60,9 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumDrafts> current_drafts{};
     std::array<std::int32_t, kMaximumConcurrency * kMtpVerifyMaximumWidth> target_rope_positions{};
+    // Per-lane window row shift (window rel minus absolute position). Set by the executor after
+    // reselect; zero for identity windows. Broadcast into every cache row of the lane.
+    std::array<std::int32_t, kMaximumConcurrency> cache_position_deltas{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
@@ -90,6 +93,10 @@ struct DFlashDecodeIngress {
     // continuation RoPE position so multimodal rows retain their per-sequence rope_delta.
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth>
         target_rope_positions{};
+    // Identity window: all-zero per-lane shift and verify cache rows equal to logical positions.
+    std::array<std::int32_t, kMaximumConcurrency> cache_position_deltas{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth>
+        verify_cache_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
@@ -137,6 +144,7 @@ struct MtpDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion verify_ids;
     TensorRegion target_positions;
+    TensorRegion target_cache_positions;
     TensorRegion target_argmax;
     TensorRegion target_logits;
     TensorRegion target_hidden;
@@ -147,6 +155,7 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_hidden;
     TensorRegion next_hidden;
     TensorRegion ar_positions;
+    TensorRegion ar_cache_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
 };
@@ -245,6 +254,8 @@ struct MtpDecodeState {
     Tensor target_valid_columns;
     Tensor current_drafts;
     Tensor target_rope_positions;
+    Tensor cache_position_deltas;
+    Tensor target_cache_positions;
     Tensor text_kv_table_rows;
     Tensor mtp_kv_table_rows;
     Tensor state_source_slots;
@@ -268,6 +279,7 @@ struct MtpDecodeState {
     Tensor ar_hidden;
     Tensor next_hidden;
     Tensor ar_positions;
+    Tensor ar_cache_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
 
@@ -291,6 +303,8 @@ struct DFlashDecodeState {
     Tensor target_valid_columns;
     Tensor proposal_valid_columns;
     Tensor target_rope_positions;
+    Tensor cache_position_deltas;
+    Tensor verify_cache_positions;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
     Tensor active_lanes;

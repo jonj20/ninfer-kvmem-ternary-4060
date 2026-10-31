@@ -12,8 +12,9 @@ namespace ninfer::ops::detail {
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,
-                                   const Tensor& rope_deltas, Tensor& alignment_ids,
-                                   Tensor& next_extents, Tensor& ar_positions,
+                                   const Tensor& rope_deltas, const Tensor& cache_position_deltas,
+                                   Tensor& alignment_ids, Tensor& next_extents,
+                                   Tensor& ar_positions, Tensor& ar_cache_positions,
                                    Tensor& ar_rope_positions, Tensor& ar_valid_columns,
                                    std::int32_t proposal_depth, std::int32_t max_context,
                                    cudaStream_t stream) {
@@ -32,9 +33,13 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
         static_cast<const std::int32_t*>(remaining_budgets.data),
         static_cast<const std::int32_t*>(licensed_counts.data),
         static_cast<const std::int32_t*>(rope_deltas.data),
+        cache_position_deltas.data == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(cache_position_deltas.data),
         static_cast<std::int32_t*>(alignment_ids.data),
         static_cast<std::int32_t*>(next_extents.data),
         static_cast<std::int32_t*>(ar_positions.data),
+        static_cast<std::int32_t*>(ar_cache_positions.data),
         static_cast<std::int32_t*>(ar_rope_positions.data),
         static_cast<std::int32_t*>(ar_valid_columns.data), width, proposal_depth, ar_step_stride,
         max_context);

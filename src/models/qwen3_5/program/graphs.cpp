@@ -312,8 +312,11 @@ void ProgramImpl::prepare_graphs() {
                                       prefill_hidden,
                                       prefill_chunk,
                                       proposal_head};
-        core.kvmem_capture = kvmem_capture_target(execution::KVMemCaptureMode::SequenceBatch,
-                                               ninfer::kMaximumConcurrency);
+        core.kvmem_capture = kvmem_capture_target(
+            speculative_backend == SpeculativeBackend::Mtp
+                ? execution::KVMemCaptureMode::MtpVerify
+                : execution::KVMemCaptureMode::SequenceBatch,
+            ninfer::kMaximumConcurrency);
         return core;
     };
 

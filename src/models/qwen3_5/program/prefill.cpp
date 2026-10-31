@@ -1086,7 +1086,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             // call writes into, so coverage extends to the nominal range first. In the dense case
             // this is a no-op (the prompt was mapped whole); under staging it is the one growth
             // point per round.
-            ensure_sequence_kv_mapped(sequence, staged.cursor + nominal, 0);
+            // MTP staging writes the draft head's KV for the same chunk, so that space grows in
+            // lockstep and its commit would otherwise name pages nobody mapped. DFlash keeps its
+            // own context-append frontier and maps nothing here (stage 6b).
+            ensure_sequence_kv_mapped(sequence, staged.cursor + nominal,
+                                      backend_kv_cache() && staged.prepare_mtp
+                                          ? staged.cursor + nominal
+                                          : 0U);
             const std::int32_t cache_position_delta =
                 reselect_sequence_window(sequence, staged.cursor, staged.cursor + nominal - 1U);
             while (remaining != 0) {

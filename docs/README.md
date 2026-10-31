@@ -75,6 +75,7 @@ other references own narrower contracts:
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
 | [N-gram speculation plan](maintainer/ngram-speculation-plan.md) | temporary: where phase 1 (`--ngram chain`) is documented, and the optional n-gram-only backend and verification wider than 16 |
+| [MTP × KVMem windowing](maintainer/kvmem-port.md) | staged: `--spec mtp` shares the retrieval window with the host KV tier (kvmem-port.md stage 6a landing record) |
 
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config

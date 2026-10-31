@@ -19,24 +19,30 @@ namespace ninfer::ops {
  *     next_extents[b] = min(K,max(remaining_after-1,0),context_after);
  *     For S=max(K-1,1) and 0<=s<S:
  *       ar_positions[b,s]      = updated_frontiers[b]+s;
+ *       ar_cache_positions[b,s] = ar_positions[b,s] + cache_position_deltas[b];
  *       ar_rope_positions[b,s] = ar_positions[b,s]+rope_deltas[b];
  *       ar_valid_columns[b,s]  = (s+1 < next_extents[b]).
  *
  * Logical shapes / effects:
- *   verify_ids/alignment_ids are distinct contiguous I32 [T,B]. ar_positions,
+ *   verify_ids/alignment_ids are distinct contiguous I32 [T,B]. ar_positions, ar_cache_positions,
  *   ar_rope_positions, and ar_valid_columns are I32 [B,max(K-1,1)] with contiguous rows and one
- *   shared step stride at least B; this permits an exact-B prefix of a fixed-capacity frame. All
- *   other tensors are contiguous I32 [B]. B>=1, 1<=K<=5, K+1<=T<=16, 0<=accepted[b]<=T-1,
- *   licensed_counts[b]=accepted[b]+1, updated_frontiers and remaining_budgets are non-negative,
- *   and max_context is positive. The Op writes every output slot, including safe invalid-tail
- *   values. Inputs remain unchanged. No workspace or other state is used.
+ *   shared step stride at least B; this permits an exact-B prefix of a fixed-capacity frame.
+ *   `cache_position_deltas`, when non-empty, is a contiguous I32 vector [B] holding the per-lane
+ *   window row shift (same convention as speculative_prepare_verify_inputs); empty means
+ *   all-zero shifts. All other tensors are contiguous I32 [B]. B>=1, 1<=K<=5, K+1<=T<=16,
+ *   0<=accepted[b]<=T-1, licensed_counts[b]=accepted[b]+1, updated_frontiers and
+ *   remaining_budgets are non-negative, and max_context is positive. The Op writes every output
+ *   slot, including safe invalid-tail values. Inputs remain unchanged. No workspace or other state
+ *   is used.
  */
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
-                            const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
-                            Tensor& ar_positions, Tensor& ar_rope_positions,
-                            Tensor& ar_valid_columns, std::int32_t proposal_depth,
+                            const Tensor& rope_deltas, const Tensor& cache_position_deltas,
+                            Tensor& alignment_ids, Tensor& next_extents,
+                            Tensor& ar_positions, Tensor& ar_cache_positions,
+                            Tensor& ar_rope_positions, Tensor& ar_valid_columns,
+                            std::int32_t proposal_depth,
                             std::int32_t max_context, cudaStream_t stream);
 
 } // namespace ninfer::ops

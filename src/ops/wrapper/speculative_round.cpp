@@ -100,7 +100,8 @@ std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
 
 void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                                        const Tensor& base_positions, const Tensor& current_extents,
-                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream) {
+                                       const Tensor& cache_position_deltas, Tensor& verify_ids,
+                                       Tensor& positions, Tensor& cache_positions, cudaStream_t stream) {
     constexpr const char* op = "speculative_prepare_verify_inputs";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -112,10 +113,20 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_vector(base_positions, DType::I32, batch, op, "base_positions");
     require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    if (cache_position_deltas.data != nullptr) {
+        if (cache_position_deltas.dtype != DType::I32 || cache_position_deltas.ne[0] != batch ||
+            cache_position_deltas.ne[1] != 1 || cache_position_deltas.ne[2] != 1 ||
+            cache_position_deltas.ne[3] != 1) {
+            throw std::invalid_argument(
+                "speculative_prepare_verify_inputs: cache_position_deltas must be empty or an I32 [B] vector");
+        }
+    }
     require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
     require_matrix(positions, DType::I32, k + 1, batch, op, "positions");
+    require_matrix(cache_positions, DType::I32, k + 1, batch, op, "cache_positions");
     detail::speculative_prepare_verify_inputs_launch(
-        anchors, drafts, base_positions, current_extents, verify_ids, positions, stream);
+        anchors, drafts, base_positions, current_extents, cache_position_deltas, verify_ids,
+        positions, cache_positions, stream);
 }
 
 void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,

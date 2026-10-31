@@ -610,8 +610,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                             state_destinations, dflash_rows, envelopes.append);
 
         propose_batch_impl(state, frame, batch_size, k, envelopes);
-        ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
-                                               target_positions, state.execution.device.stream);
+        ops::speculative_prepare_verify_inputs(
+            anchors, drafts, frontiers, extents,
+            frame.cache_position_deltas.slice(0, 0, batch_size), verify_ids, target_positions,
+            frame.verify_cache_positions, state.execution.device.stream);
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -626,7 +628,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 state.execution, state.continuation_hidden_store, card,
                 TargetVerifyFrameView{
                     .ids                     = verify_ids,
-                    .cache_positions         = target_positions,
+                    .cache_positions         = frame.verify_cache_positions,
                     .rope_positions          = target_rope,
                     .valid_columns           = valid_columns,
                     .kv_table_rows           = text_rows,

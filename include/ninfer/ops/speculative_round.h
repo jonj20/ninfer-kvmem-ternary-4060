@@ -33,8 +33,16 @@ struct SpeculativeAcceptExecutionEnvelope {
  *
  * Logical shapes:
  *   All tensors are contiguous I32. anchors/base_positions/current_extents are [B], drafts is
- *   [K,B] with K>=1 and B>=1, and verify_ids/positions are [K+1,B]. Each current extent is in
- *   [0,K]. Inputs and outputs do not overlap.
+ *   [K,B] with K>=1 and B>=1, and verify_ids/positions/cache_positions are [K+1,B]. Each current
+ *   extent is in [0,K]. `cache_position_deltas`, when non-empty, is a contiguous I32 vector [B]
+ *   holding the per-lane window row shift (a non-positive multiple of the page size); empty means
+ *   all-zero shifts. Inputs and outputs do not overlap except that positions and cache_positions
+ *   must be distinct tensors.
+ *
+ * Window rows:
+ *   cache_positions[j,b] = positions[j,b] + cache_position_deltas[b]. The row consumed by
+ *   attention/KV append is the renumbered window row; RoPE continues to use the absolute token
+ *   position supplied separately.
  *
  * Effects:
  *   Writes every physical output element, including safe invalid-tail values. Inputs remain
@@ -45,7 +53,9 @@ struct SpeculativeAcceptExecutionEnvelope {
  */
 void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                                        const Tensor& base_positions, const Tensor& current_extents,
-                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream);
+                                       const Tensor& cache_position_deltas, Tensor& verify_ids,
+                                       Tensor& positions, Tensor& cache_positions,
+                                       cudaStream_t stream);
 
 /**
  * Prepare only the target verification ids when the caller already owns the matching position

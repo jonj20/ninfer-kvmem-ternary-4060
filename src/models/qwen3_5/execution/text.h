@@ -45,7 +45,7 @@ struct NullTap {
 // argument is invariant for a one-token range, so the captured constant stays correct on replay.
 // `Single` is the prefill shape: one contiguous sequence, real absolute positions, one recorded
 // segment per reduced call so a multi-call chunk keeps every segment's identity.
-enum class KVMemCaptureMode : std::uint8_t { None, Single, SequenceBatch };
+enum class KVMemCaptureMode : std::uint8_t { None, Single, SequenceBatch, MtpVerify };
 
 struct KVMemCaptureSegment {
     std::int32_t first_position = 0;
@@ -55,9 +55,14 @@ struct KVMemCaptureSegment {
 
 // Program-owned capture target. `sums` and `host` both hold `capacity_blocks` columns of
 // `key_width` floats; `segments` receives one entry per reduced call in `Single` mode and is
-// unused in `SequenceBatch` mode, whose layout the Program derives from the lane order.
-// `segment_count` is traversal output: the execution writes it as it fills `segments`, and the
-// Program reads it after the traversal synchronizes.
+// unused in `SequenceBatch` and `MtpVerify` modes, whose layout the Program derives from the
+// lane order. `segment_count` is traversal output: the execution writes it as it fills
+// `segments`, and the Program reads it after the traversal synchronizes.
+//
+// Staging columns are key_width-float columns. `SequenceBatch` fixes one column per lane at
+// `lane * key_width`. `MtpVerify` fixes one column per verify column at flat column
+// `lane * W + j` over the [key_width, W x B] pre-RoPE key matrix; every column is a single
+// captured token, and the host folds only committed columns at fold time.
 struct KVMemCaptureTarget {
     float* sums              = nullptr;
     float* host              = nullptr;

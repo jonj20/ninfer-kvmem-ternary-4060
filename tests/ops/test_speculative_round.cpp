@@ -46,15 +46,24 @@ int prepare_verify_case(int k, int batch) {
     DeviceBuffer d_anchors = to_device(anchors), d_lengths = to_device(lengths), d_drafts = to_device(drafts);
     DeviceBuffer d_extents = to_device(extents);
     GuardedDeviceBuffer d_full(width * batch * sizeof(std::int32_t));
-    GuardedDeviceBuffer d_ids(d_full.bytes()), d_positions(d_full.bytes());
+    GuardedDeviceBuffer d_ids(d_full.bytes());
+    GuardedDeviceBuffer d_positions(width * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_cache(width * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_deltas(batch * sizeof(std::int32_t));
+    std::vector<std::int32_t> deltas(batch);
+    for (int b = 0; b < batch; ++b) deltas[b] = -64 * b;
+    DeviceBuffer d_cd = to_device(deltas);
     Tensor a(d_anchors.p, DType::I32, {batch}), l(d_lengths.p, DType::I32, {batch});
     Tensor d(d_drafts.p, DType::I32, {k, batch}), e(d_extents.p, DType::I32, {batch});
     Tensor full(d_full.data(), DType::I32, {width, batch}), ids(d_ids.data(), DType::I32, {width, batch});
     Tensor positions(d_positions.data(), DType::I32, {width, batch});
+    Tensor cache(d_cache.data(), DType::I32, {width, batch});
+    Tensor cd(d_cd.p, DType::I32, {batch});
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::speculative_prepare_verify_inputs(a, d, l, e, full, positions, context.stream);
+        ops::speculative_prepare_verify_inputs(a, d, l, e, cd, full, positions, cache,
+                                               context.stream);
         ops::speculative_prepare_verify_ids(a, d, e, ids, context.stream);
     };
     DecodeGraphDefinition definition;
@@ -66,16 +75,32 @@ int prepare_verify_case(int k, int batch) {
         CUDA_CHECK(cudaMemcpyAsync(d_extents.p, extents.data(), d_extents.bytes, cudaMemcpyHostToDevice, context.stream));
         if (graph.ready()) graph.launch(context.stream); else launch();
         context.synchronize();
-        std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
+        std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch),
+            expected_cache(width * batch);
         for (int b = 0; b < batch; ++b)
             for (int j = 0; j < width; ++j) {
                 expected_ids[b * width + j] = j > 0 && j <= extents[b] ? drafts[b * k + j - 1] : anchors[b];
                 expected_positions[b * width + j] = lengths[b] + std::min(j, extents[b]);
+                expected_cache[b * width + j] = expected_positions[b * width + j] + deltas[b];
             }
         failures += verify_exact("verify ids", read<std::int32_t>(d_ids, expected_ids.size()), expected_ids);
         failures += verify_exact("verify full ids", read<std::int32_t>(d_full, expected_ids.size()), expected_ids);
         failures += verify_exact("verify positions", read<std::int32_t>(d_positions, expected_positions.size()), expected_positions);
+        failures += verify_exact("verify cache positions", read<std::int32_t>(d_cache, expected_cache.size()), expected_cache);
         failures += verify_exact("extents unchanged", from_device<std::int32_t>(d_extents, batch), extents);
+    }
+    {
+        // Empty deltas select all-zero shifts: cache positions mirror positions exactly.
+        Tensor empty{};
+        ops::speculative_prepare_verify_inputs(a, d, l, e, empty, full, positions, cache,
+                                               context.stream);
+        context.synchronize();
+        std::vector<std::int32_t> identity(width * batch);
+        for (int b = 0; b < batch; ++b)
+            for (int j = 0; j < width; ++j)
+                identity[b * width + j] = lengths[b] + std::min(j, extents[b]);
+        failures += verify_exact("verify cache positions identity",
+                                 read<std::int32_t>(d_cache, identity.size()), identity);
     }
     failures += verify_exact("anchors unchanged", from_device<std::int32_t>(d_anchors, batch), anchors);
     failures += verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
@@ -83,6 +108,7 @@ int prepare_verify_case(int k, int batch) {
     failures += d_full.verify_guards("verify full ids");
     failures += d_ids.verify_guards("verify ids");
     failures += d_positions.verify_guards("verify positions");
+    failures += d_cache.verify_guards("verify cache positions");
     return failures;
 }
 

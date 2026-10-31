@@ -833,7 +833,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--kvmem-budget N` | device KV working-set budget in tokens (multiples of 128; `0` keeps the whole context resident); once the context exceeds it, attention retains only a sink prefix and the newest tail; ignored while `--spec` is enabled; a nonzero budget requires `--kv-capacity` to cover the budget plus one prefill chunk and a Host KV tier, disables prefix capture, and lets prompts without a reusable prefix reach `--max-context` | `0` |
+| `--kvmem-budget N` | device KV working-set budget in tokens (multiples of 128; `0` keeps the whole context resident); once the context exceeds it, attention retains only a sink prefix and the newest tail; ignored while `--spec dflash` or `--spec dflash2` is enabled (`--spec mtp` joins staging through its cache-position pipeline); a nonzero budget requires `--kv-capacity` to cover the budget plus one prefill chunk (and, under MTP, one draft lead per lane) and a Host KV tier, disables prefix capture, and lets prompts without a reusable prefix reach `--max-context` | `0` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |

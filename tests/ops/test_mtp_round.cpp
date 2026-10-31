@@ -24,10 +24,12 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
     std::vector<std::int32_t> budgets(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> licensed(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> rope_deltas(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> deltas(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> expected_alignment(static_cast<std::size_t>(T * batch));
     std::vector<std::int32_t> expected_extents(static_cast<std::size_t>(batch));
     const int steps = std::max(k - 1, 1);
     std::vector<std::int32_t> expected_positions(static_cast<std::size_t>(batch * steps));
+    std::vector<std::int32_t> expected_cache_positions(static_cast<std::size_t>(batch * steps));
     std::vector<std::int32_t> expected_rope_positions(static_cast<std::size_t>(batch * steps));
     std::vector<std::int32_t> expected_valid(static_cast<std::size_t>(batch * steps));
     for (int b = 0; b < batch; ++b) {
@@ -38,6 +40,7 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
         budgets[static_cast<std::size_t>(b)] =
             b == batch - 1 ? licensed[static_cast<std::size_t>(b)] : 12 - b;
         rope_deltas[static_cast<std::size_t>(b)] = 3 * b - 2;
+        deltas[static_cast<std::size_t>(b)] = -64 * b;
         for (int j = 0; j < T; ++j) {
             verify[static_cast<std::size_t>(b * T + j)] = 1000 + 101 * b + 7 * j;
         }
@@ -55,9 +58,10 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
             std::min({k, budget_extent, context_extent});
         for (int s = 0; s < steps; ++s) {
             const std::size_t offset   = static_cast<std::size_t>(s * batch + b);
-            expected_positions[offset] = frontiers[static_cast<std::size_t>(b)] + s;
-            expected_rope_positions[offset] =
-                expected_positions[offset] + rope_deltas[static_cast<std::size_t>(b)];
+            const int position         = frontiers[static_cast<std::size_t>(b)] + s;
+            expected_positions[offset] = position;
+            expected_cache_positions[offset] = position + deltas[static_cast<std::size_t>(b)];
+            expected_rope_positions[offset] = position + rope_deltas[static_cast<std::size_t>(b)];
             expected_valid[offset] = s + 1 < expected_extents[static_cast<std::size_t>(b)] ? 1 : 0;
         }
     }
@@ -69,14 +73,17 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
     DeviceBuffer d_budgets     = to_device(budgets);
     DeviceBuffer d_licensed    = to_device(licensed);
     DeviceBuffer d_rope_deltas = to_device(rope_deltas);
+    DeviceBuffer d_deltas      = to_device(deltas);
     GuardedDeviceBuffer d_alignment(expected_alignment.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer d_extents(expected_extents.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer d_positions(expected_positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_cache_positions(expected_cache_positions.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer d_rope_positions(expected_rope_positions.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer d_valid(expected_valid.size() * sizeof(std::int32_t));
     d_alignment.fill(0xcd);
     d_extents.fill(0xcd);
     d_positions.fill(0xcd);
+    d_cache_positions.fill(0xcd);
     d_rope_positions.fill(0xcd);
     d_valid.fill(0xcd);
 
@@ -87,14 +94,17 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
     Tensor t_budgets(d_budgets.p, DType::I32, {batch});
     Tensor t_licensed(d_licensed.p, DType::I32, {batch});
     Tensor t_rope_deltas(d_rope_deltas.p, DType::I32, {batch});
+    Tensor t_deltas(d_deltas.p, DType::I32, {batch});
     Tensor t_alignment(d_alignment.data(), DType::I32, {T, batch});
     Tensor t_extents(d_extents.data(), DType::I32, {batch});
     Tensor t_positions(d_positions.data(), DType::I32, {batch, steps});
+    Tensor t_cache_positions(d_cache_positions.data(), DType::I32, {batch, steps});
     Tensor t_rope_positions(d_rope_positions.data(), DType::I32, {batch, steps});
     Tensor t_valid(d_valid.data(), DType::I32, {batch, steps});
     ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
-                                t_rope_deltas, t_alignment, t_extents, t_positions,
-                                t_rope_positions, t_valid, k, max_context, nullptr);
+                                t_rope_deltas, t_deltas, t_alignment, t_extents, t_positions,
+                                t_cache_positions, t_rope_positions, t_valid, k, max_context,
+                                nullptr);
     cuda_synchronize();
 
     const std::string label = "mtp next round V=" + std::to_string(v) + " K=" + std::to_string(k) +
@@ -111,6 +121,10 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
                      from_device<std::int32_t>(d_positions.data(), expected_positions.size()),
                      expected_positions);
     failures += verify_exact(
+        (label + " AR cache positions").c_str(),
+        from_device<std::int32_t>(d_cache_positions.data(), expected_cache_positions.size()),
+        expected_cache_positions);
+    failures += verify_exact(
         (label + " AR rope positions").c_str(),
         from_device<std::int32_t>(d_rope_positions.data(), expected_rope_positions.size()),
         expected_rope_positions);
@@ -120,6 +134,7 @@ int run_case(int v, int k, const std::vector<std::int32_t>& accepted) {
     failures += d_alignment.verify_guards((label + " alignment guards").c_str());
     failures += d_extents.verify_guards((label + " extent guards").c_str());
     failures += d_positions.verify_guards((label + " position guards").c_str());
+    failures += d_cache_positions.verify_guards((label + " cache position guards").c_str());
     failures += d_rope_positions.verify_guards((label + " rope position guards").c_str());
     failures += d_valid.verify_guards((label + " valid guards").c_str());
     return failures;

@@ -874,6 +874,28 @@ void TextContext::capture_key_sums(const Tensor& normalized_key, int fidx, cudaS
         return;
     }
 
+    if (target->mode == KVMemCaptureMode::MtpVerify) {
+        // Verify: the [key_width, W x B] key matrix has one column per verify column, laid out as
+        // flat column c = lane * W + j. Every column is a one-token range, so block_count is one
+        // regardless of first_position; the position argument is therefore irrelevant and zero is
+        // exact. The host re-derives each column's absolute position from the round's frontier
+        // and extent at fold time and folds only committed columns.
+        const std::int32_t lanes = active_sequence_batch_;
+        if (active_sequence_width_ != 1 || lanes * active_sequence_width_ != tokens) {
+            throw std::logic_error(
+                "mean-key MtpVerify capture expects one verify column per decode lane");
+        }
+        for (std::int32_t c = 0; c < tokens; ++c) {
+            Tensor keys = normalized_key.slice(1, c, 1);
+            Tensor sums = staged.slice(1, c, 1);
+            ops::block_sum_by_position(keys, sums, 0, block_tokens, stream);
+            kernel_copy_async(target->host +
+                                  static_cast<std::size_t>(c) * static_cast<std::size_t>(width),
+                              sums.data, sizeof(float) * static_cast<std::size_t>(width), stream);
+        }
+        return;
+    }
+
     // Prefill: one contiguous sequence at a real absolute position. Segments pack densely from
     // zero, so the recorded offsets are what tells the Program where each call's blocks landed.
     const std::int32_t blocks = ops::block_sum_by_position_blocks(kvmem_capture_first_position_, tokens,

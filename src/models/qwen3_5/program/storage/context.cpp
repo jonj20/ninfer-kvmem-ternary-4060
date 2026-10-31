@@ -1518,7 +1518,13 @@ void ProgramImpl::prepare_kvmem_capture() {
     const std::uint32_t decode_blocks = ninfer::kMaximumConcurrency;
     const std::uint32_t prefill_blocks =
         (prefill_chunk / kvmem_config.block_tokens) + 1U;
-    const std::uint32_t capacity = std::max(decode_blocks, prefill_blocks);
+    // MTP verify stages one column per verify column (up to W x B) on top of the per-lane column
+    // of ordinary decode; the extra staging stays allocated but unused for other backends.
+    const std::uint32_t verify_blocks =
+        speculative_backend == SpeculativeBackend::Mtp
+            ? static_cast<std::uint32_t>(ninfer::kMaximumConcurrency) * kMtpVerifyMaximumWidth
+            : 0U;
+    const std::uint32_t capacity = std::max({decode_blocks, prefill_blocks, verify_blocks});
     kvmem_capture_key_width       = key_width;
     kvmem_capture_capacity_blocks = capacity;
     kvmem_capture_segment_capacity = prefill_blocks + 1U;
@@ -1595,7 +1601,7 @@ void ProgramImpl::accumulate_kvmem_scores(SequenceState& sequence,
 }
 
 void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
-                                                 std::uint32_t lane,
+                                                 std::uint32_t column,
                                                  std::uint32_t token_position) {
     if (!retrieval_selection_active()) { return; }
     const std::optional<AttentionConfig>& attention = parameters.model.config().text.attention;
@@ -1610,8 +1616,12 @@ void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
         sequence.kvmem_scores.emplace(block_tokens, key_width, attention->head_dim);
     }
     qwen3_5::detail::KVMemScoreStore& scores = *sequence.kvmem_scores;
+    // `column` indexes the staging column holding this token's key-sum row (one key_width-float
+    // column per captured token under MTP verify; one per lane under ordinary decode), so the
+    // host offset is column * key_width. `token_position` is the absolute token index whose block
+    // receives this token's contribution.
     const float* host = static_cast<const float*>(kvmem_sums_host->data()) +
-                        static_cast<std::size_t>(lane) * key_width;
+                        static_cast<std::size_t>(column) * key_width;
     const std::uint32_t block_id = token_position / block_tokens;
     // The lane contributed exactly one token, so the mean completes only when this token fills the
     // block; a block already promoted (or not yet mirrored) is skipped.
@@ -1644,9 +1654,10 @@ KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockS
 
 std::int32_t ProgramImpl::reselect_sequence_window(SequenceState& sequence, std::uint32_t call_min,
                                                    std::uint32_t call_max) {
-    // MTP/DFlash target verification reads this table with absolute positions, so it must keep
-    // the identity window until phase 6 gives the draft pool its own store.
-    if (speculative_backend != SpeculativeBackend::None) { return 0; }
+    // Masked draft backends read this table with absolute positions and have no cache-position
+    // pipeline yet, so they keep the identity window (stage 6b). MTP verification consumes the
+    // window row shift through the verify/AR cache positions instead (mtp-kvmem-plan.md D4).
+    if (is_masked_draft_backend(speculative_backend)) { return 0; }
     if (!sequence.kv) { throw std::logic_error("kvmem reselect without a text KV bundle"); }
     if (call_min > call_max || call_max == std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("kvmem reselect range is invalid");
@@ -1675,34 +1686,34 @@ std::int32_t ProgramImpl::reselect_sequence_window(SequenceState& sequence, std:
            static_cast<std::int32_t>(call_min);
 }
 
-bool ProgramImpl::stage_in_demoted_pages(KVAddressSpaceHandle handle,
+bool ProgramImpl::stage_in_demoted_pages(const KVWindowSpace& space, KVAddressSpaceHandle handle,
                                          std::span<const std::uint32_t> logical_pages) {
     if (logical_pages.empty()) { return false; }
-    if (!text_kv_addresses || !text_kv_pages || !host_kv_extents) {
-        throw std::logic_error("text KV stores are unavailable for stage-in");
-    }
+    if (!host_kv_extents) { throw std::logic_error("KV stores are unavailable for stage-in"); }
+    KVAddressSpaceStore&                   addresses = space.addresses;
+    LogicalKVPageStore&                    pages     = space.pages;
     bool enqueued = false;
     for (const std::uint32_t page : logical_pages) {
-        const LogicalKVPageHandle logical = text_kv_addresses->logical_page(handle, page);
+        const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
         // Holes left Device-resident by an abort heal (or a window change whose stage-out has
         // not run yet) need no transfer; publish just never saw them demoted-without-device.
-        if (text_kv_pages->device_resident(logical)) { continue; }
+        if (pages.device_resident(logical)) { continue; }
         // Read the Host replica before reserving so a stale page fails before any pool claim
         // moves; reserve_stage_in re-checks currency against the live page.
-        const HostKVPageReplica replica = text_kv_pages->host_replica(logical);
-        const DeviceKVPageHandle destination = text_kv_addresses->reserve_stage_in(handle, page);
+        const HostKVPageReplica replica = pages.host_replica(logical);
+        const DeviceKVPageHandle destination = addresses.reserve_stage_in(handle, page);
         try {
             const HostKVAllocationConstView source =
                 host_kv_extents->view(replica.extent).subview(replica.page_offset, 1U);
             const std::array<DeviceKVPageHandle, 1> destinations{destination};
-            text_kv_pages->physical_pool().copy_from_host(
+            pages.physical_pool().copy_from_host(
                 source, std::span<const DeviceKVPageHandle>(destinations), device.transfer_stream);
-            text_kv_pages->publish_device_replica(logical);
+            pages.publish_device_replica(logical);
         } catch (...) {
             // Land any copy that was enqueued before the failure so abort_stage_in never returns
             // the destination while the transfer stream still writes into it.
             (void)cudaStreamSynchronize(device.transfer_stream);
-            text_kv_addresses->abort_stage_in(handle, page);
+            addresses.abort_stage_in(handle, page);
             throw;
         }
         enqueued = true;
@@ -1710,12 +1721,13 @@ bool ProgramImpl::stage_in_demoted_pages(KVAddressSpaceHandle handle,
     return enqueued;
 }
 
-void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMemWindow& window) {
-    if (!text_kv_addresses || !text_kv_pages || !host_kv_extents) {
-        throw std::logic_error("text KV stores are unavailable for stage-out");
-    }
+void ProgramImpl::stage_out_window_holes(const KVWindowSpace& space, KVAddressSpaceHandle handle,
+                                         const KVMemWindow& window) {
+    if (!host_kv_extents) { throw std::logic_error("KV stores are unavailable for stage-out"); }
+    KVAddressSpaceStore& addresses = space.addresses;
+    LogicalKVPageStore&  pages     = space.pages;
     const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-    const std::uint32_t mapped    = text_kv_addresses->mapped_pages(handle);
+    const std::uint32_t mapped    = addresses.mapped_pages(handle);
     const auto retained           = [&](std::uint32_t page) {
         return page * page_size < window.sink_end || page * page_size >= window.recent_begin;
     };
@@ -1726,11 +1738,11 @@ void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMe
     std::vector<std::uint32_t> ready;
     std::vector<std::vector<std::uint32_t>> backup_runs;
     for (std::uint32_t page = 0; page < mapped; ++page) {
-        if (retained(page) || !text_kv_addresses->demoted_page(handle, page)) { continue; }
-        const LogicalKVPageHandle logical = text_kv_addresses->logical_page(handle, page);
-        if (!text_kv_pages->device_resident(logical)) { continue; }
-        if (text_kv_pages->host_resident(logical)) {
-            if (text_kv_pages->host_replica_current(logical)) { ready.push_back(page); }
+        if (retained(page) || !addresses.demoted_page(handle, page)) { continue; }
+        const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
+        if (!pages.device_resident(logical)) { continue; }
+        if (pages.host_resident(logical)) {
+            if (pages.host_replica_current(logical)) { ready.push_back(page); }
             continue;
         }
         if (!backup_runs.empty() && backup_runs.back().back() + 1U == page) {
@@ -1753,10 +1765,10 @@ void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMe
             std::vector<LogicalKVPageHandle> run_pages;
             run_pages.reserve(run.size());
             for (const std::uint32_t page : run) {
-                run_pages.push_back(text_kv_addresses->logical_page(handle, page));
+                run_pages.push_back(addresses.logical_page(handle, page));
             }
             std::optional<HostKVExtentReservation> reserved =
-                host_kv_extents->prepare(*text_kv_pages, run_pages);
+                host_kv_extents->prepare(pages, run_pages);
             if (!reserved) { throw std::bad_alloc(); }
             // Move the reservation into backups before enqueueing its copy: the catch below can
             // only free extents after the transfer stream has drained, and only backups (an
@@ -1767,7 +1779,7 @@ void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMe
             // only fills a caller-sized span, so handing it the still-empty vector that
             // push_back just wrote would reject every window slide.
             entry.sources = host_kv_extents->device_sources(entry.reservation);
-            text_kv_pages->physical_pool().copy_to_host(
+            pages.physical_pool().copy_to_host(
                 entry.sources, host_kv_extents->writable_view(entry.reservation),
                 device.transfer_stream);
         }
@@ -1787,7 +1799,7 @@ void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMe
     const auto drop = [&](std::uint32_t page) {
         // can_drop gates the shared/pinned cases; a skip keeps the page Device-resident, which
         // is a bounded budget overshoot, never a correctness problem.
-        (void)text_kv_pages->drop_device_replica(text_kv_addresses->logical_page(handle, page));
+        (void)pages.drop_device_replica(addresses.logical_page(handle, page));
     };
     for (const std::uint32_t page : ready) { drop(page); }
     for (const std::vector<std::uint32_t>& run : backup_runs) {
@@ -1795,48 +1807,72 @@ void ProgramImpl::stage_out_window_holes(KVAddressSpaceHandle handle, const KVMe
     }
 }
 
-void ProgramImpl::stage_in_all_holes(KVAddressSpaceHandle handle) {
-    if (!text_kv_addresses) { throw std::logic_error("text KV address store is unavailable"); }
-    const std::uint32_t mapped = text_kv_addresses->mapped_pages(handle);
+void ProgramImpl::stage_in_all_holes(const KVWindowSpace& space, KVAddressSpaceHandle handle) {
+    const std::uint32_t mapped = space.addresses.mapped_pages(handle);
     std::vector<std::uint32_t> holes;
     for (std::uint32_t page = 0; page < mapped; ++page) {
-        if (text_kv_addresses->demoted_page(handle, page)) { holes.push_back(page); }
+        if (space.addresses.demoted_page(handle, page)) { holes.push_back(page); }
     }
-    if (stage_in_demoted_pages(handle, holes)) {
+    if (stage_in_demoted_pages(space, handle, holes)) {
         (void)cudaStreamSynchronize(device.transfer_stream);
     }
 }
 
-void ProgramImpl::apply_window_transition(SequenceState& sequence, const KVMemWindow& window) {
-    if (!sequence.kv) { throw std::logic_error("kvmem window transition without a text KV bundle"); }
-    const KVAddressSpaceHandle handle = sequence.kv->text;
-    if (!text_kv_addresses || !text_kv_pages) {
-        throw std::logic_error("text KV stores are unavailable for a window transition");
-    }
+void ProgramImpl::apply_window_space_transition(const KVWindowSpace& space, KVAddressSpaceHandle handle,
+                                                const KVMemWindow& window) {
+    KVAddressSpaceStore& addresses = space.addresses;
+    LogicalKVPageStore&  pages     = space.pages;
     const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-    const std::uint32_t mapped    = text_kv_addresses->mapped_pages(handle);
+    const std::uint32_t mapped    = addresses.mapped_pages(handle);
     const auto retained           = [&](std::uint32_t page) {
         return page * page_size < window.sink_end || page * page_size >= window.recent_begin;
     };
     std::vector<std::uint32_t> entries;
     for (std::uint32_t page = 0; page < mapped; ++page) {
-        if (retained(page) && text_kv_addresses->demoted_page(handle, page) &&
-            !text_kv_pages->device_resident(text_kv_addresses->logical_page(handle, page))) {
+        if (retained(page) && addresses.demoted_page(handle, page) &&
+            !pages.device_resident(addresses.logical_page(handle, page))) {
             entries.push_back(page);
         }
     }
-    const bool restored = stage_in_demoted_pages(handle, entries);
+    const bool restored = stage_in_demoted_pages(space, handle, entries);
     // A moved window is the only reason to pay for a republish; the address keeps its window
     // across deactivate and activation republishes window-aware through commit_activation.
-    const KVMemWindow current = text_kv_addresses->window(handle);
+    const KVMemWindow current = addresses.window(handle);
     if (current.sink_end != window.sink_end || current.recent_begin != window.recent_begin ||
         current.window_tokens != window.window_tokens) {
-        text_kv_addresses->set_window(handle, window, device.stream);
+        addresses.set_window(handle, window, device.stream);
     }
-    stage_out_window_holes(handle, window);
+    stage_out_window_holes(space, handle, window);
     // Stage-in copies are read by attention through the freshly published table before reselect
     // returns; the stage-out sync above does not order them when no backup ran.
     if (restored) { (void)cudaStreamSynchronize(device.transfer_stream); }
+}
+
+void ProgramImpl::apply_window_transition(SequenceState& sequence, const KVMemWindow& window) {
+    if (!sequence.kv) { throw std::logic_error("kvmem window transition without a text KV bundle"); }
+    if (!text_kv_addresses || !text_kv_pages) {
+        throw std::logic_error("text KV stores are unavailable for a window transition");
+    }
+    // Phase 6a: both address spaces follow the same window under MTP staging; the draft pool
+    // reads its own table with the same row shift as the text pool (D1). Backend space exists
+    // exactly when MTP staging is active.
+    apply_window_space_transition(KVWindowSpace{*text_kv_addresses, *text_kv_pages},
+                                  sequence.kv->text, window);
+    if (sequence.kv->backend) {
+        if (!backend_kv_addresses || !backend_kv_pages) {
+            throw std::logic_error("backend KV stores are unavailable for a window transition");
+        }
+        // Prefill reselects before the first commit, when the draft pool holds no tokens and the
+        // identity table ensure_materialize published is still the right answer: verify cannot
+        // read a row below its own committed frontier, so a window over positions this space has
+        // never committed carries no information and would fail set_window's coverage check
+        // (window_tokens against zero mapped pages). The commit reselect publishes the real
+        // window in the same round the pool first gains rows.
+        if (backend_kv_addresses->committed_frontier(*sequence.kv->backend) != 0) {
+            apply_window_space_transition(KVWindowSpace{*backend_kv_addresses, *backend_kv_pages},
+                                          *sequence.kv->backend, window);
+        }
+    }
 }
 
 void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

@@ -20,8 +20,9 @@ struct ModelInstance {
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
-    // Whether the Device KV tier is a bounded working set (a real --kvmem-budget with plain
-    // speculation). One active sequence then needs only its window resident, so the resident bound
+    // Whether the Device KV tier is a bounded working set (a real --kvmem-budget with a backend
+    // the window can serve: plain decoding, or MTP with its cache-position pipeline). One active
+    // sequence then needs only its window resident, so the resident bound
     // below stops limiting prompts and equals the logical capacity.
     const bool resident_staging;
     std::unique_ptr<models::qwen3_5::Program> program;

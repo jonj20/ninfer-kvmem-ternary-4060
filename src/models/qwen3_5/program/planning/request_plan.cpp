@@ -298,15 +298,28 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     // the pool when staging is active, because a windowed request never holds more than the pool at
     // once - its activation claim is capped and topped up as pages are mapped. Without this cap the
     // logical entitlement of a context larger than the pool could never fit, which is exactly the
-    // PermanentlyInfeasible admission that --kvmem-budget exists to remove.
+    // PermanentlyInfeasible admission that --kvmem-budget exists to remove. The backend claim
+    // mirrors the text cap: under MTP staging the rows attention reads are the same bounded window.
     const std::uint32_t pool_pages        = pages_for_tokens(kv_capacity);
+    // The MTP backend pool is the main pool plus the draft lead's pages (persistent_layout gives
+    // mtp_kv max_concurrency * ceil((draft_window - 1) / page) extra groups). A capped claim must
+    // use that space's own Device capacity: capping it with the text pool made an over-pool prompt
+    // activate one page past the planned entitlement, which materialization then unwound as if the
+    // request had been cancelled.
+    const qwen3_5::PagedKVCache* backend_pool = backend_kv_cache();
+    const std::uint32_t backend_pool_pages =
+        backend_pool != nullptr ? backend_pool->page_pool().capacity_pages() : pool_pages;
     const std::uint32_t admitted_text     = staging ? std::min(base->text_kv_page_entitlement, pool_pages)
                                                     : base->text_kv_page_entitlement;
+    const std::uint32_t admitted_backend  = staging
+                                                ? std::min(base->backend_kv_page_entitlement,
+                                                           backend_pool_pages)
+                                                : base->backend_kv_page_entitlement;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
         .main_kv_pages    = admitted_text,
-        .backend_kv_pages = base->backend_kv_page_entitlement,
+        .backend_kv_pages = admitted_backend,
     };
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {

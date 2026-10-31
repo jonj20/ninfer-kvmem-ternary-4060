@@ -1129,26 +1129,44 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
     // that cannot hold that fails mid-prefill rather than at admission, so check it here. The
     // Host KV tier is then required, not optional: staging a page out means a Host replica behind
     // it, and stage_out_window_holes throws instead of silently overshooting the budget.
+    // Under MTP the same reselect call range grows by the round's draft lead (the window must
+    // retain through it), and the MTP backend space is demoted with the text space, so both go
+    // into the pool and Host requirements (mtp-kvmem-plan.md D6/D8).
+    const std::uint64_t backend_lead_tokens =
+        plan->kvmem_budget != 0 && plan->speculative_backend == SpeculativeBackend::Mtp
+            ? static_cast<std::uint64_t>(plan->max_concurrency) * plan->draft_window
+            : 0ULL;
     if (plan->kvmem_budget != 0 &&
-        plan->speculative_backend == SpeculativeBackend::None) {
-        const std::uint64_t budget     = plan->kvmem_budget;
-        const std::uint64_t chunk      = plan->prefill_chunk;
+        kvmem_resident_staging(plan->speculative_backend)) {
+        const std::uint64_t budget      = plan->kvmem_budget;
+        const std::uint64_t chunk       = plan->prefill_chunk;
         const std::uint64_t pool_tokens = plan->kv_capacity;
         if (pool_tokens < budget) {
             throw std::invalid_argument(
                 "--kvmem-budget " + std::to_string(budget) +
                 " exceeds the Device KV capacity of " + std::to_string(pool_tokens) + " tokens");
         }
-        if (pool_tokens < budget + chunk) {
+        if (pool_tokens < budget + chunk + backend_lead_tokens) {
             throw std::invalid_argument(
-                "--kv-capacity must cover --kvmem-budget plus one --prefill-chunk: " +
-                std::to_string(pool_tokens) + " tokens available, need " +
-                std::to_string(budget + chunk) + " (budget " + std::to_string(budget) +
-                " + chunk " + std::to_string(chunk) + ")");
+                "--kv-capacity must cover --kvmem-budget plus one --prefill-chunk" +
+                std::string(backend_lead_tokens != 0
+                                ? " plus the MTP draft lead (" +
+                                      std::to_string(backend_lead_tokens) + " tokens for " +
+                                      std::to_string(plan->max_concurrency) + " lanes)"
+                                : "") +
+                ": " + std::to_string(pool_tokens) + " tokens available, need " +
+                std::to_string(budget + chunk + backend_lead_tokens) +
+                " (budget " + std::to_string(budget) + " + chunk " + std::to_string(chunk) +
+                " + lead " + std::to_string(backend_lead_tokens) + ")");
         }
         const std::size_t host_stride = plan_host_kv_page_layout(
                                             plan->persistent.decoder.text_kv.pages.spec.geometry)
                                             .page_stride;
+        const std::size_t backend_stride =
+            backend_lead_tokens != 0 && plan->persistent.decoder.mtp_kv
+                ? plan_host_kv_page_layout(plan->persistent.decoder.mtp_kv->pages.spec.geometry)
+                      .page_stride
+                : 0;
         const std::uint64_t logical_pages = page_count(plan->capacity);
         const std::uint64_t window_pages  = page_count(plan->kvmem_budget);
         const std::uint64_t demoted_pages =
@@ -1169,23 +1187,22 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         // selects the ContextCacheOptions default of 8 GiB addressable, which is measured working.
         if (plan->context_cache.host_kv_capacity_bytes == 0) {
             plan->context_cache.host_kv_capacity_bytes =
-                static_cast<std::size_t>(demoted_pages * host_stride);
+                static_cast<std::size_t>(demoted_pages * (host_stride + backend_stride));
         }
-        const std::uint64_t host_pages =
-            host_stride == 0
-                ? 0U
-                : static_cast<std::uint64_t>(plan->context_cache.host_kv_capacity_bytes) /
-                      static_cast<std::uint64_t>(host_stride);
-        if (host_pages < demoted_pages) {
+        const std::uint64_t required_bytes =
+            demoted_pages * (host_stride + backend_stride);
+        const std::uint64_t host_bytes = plan->context_cache.host_kv_capacity_bytes;
+        if (host_bytes < required_bytes) {
             throw std::invalid_argument(
-                "--kvmem-budget needs a Host KV tier for every page that leaves the window: "
-                "host_pages=" +
-                std::to_string(host_pages) + " required_pages=" +
-                std::to_string(demoted_pages) + " window_pages=" +
-                std::to_string(window_pages) + " logical_pages=" +
+                "--kvmem-budget needs a Host KV tier for every page that leaves the window" +
+                std::string(backend_stride != 0
+                                ? " for both KV spaces (text and the MTP backend)"
+                                : "") +
+                ": host_bytes=" +
+                std::to_string(host_bytes) + " required_bytes=" + std::to_string(required_bytes) +
+                " window_pages=" + std::to_string(window_pages) + " logical_pages=" +
                 std::to_string(logical_pages) + " (raise --host-kv-mib to at least " +
-                std::to_string(demoted_pages * host_stride / (1024ULL * 1024ULL) + 1ULL) +
-                " MiB)");
+                std::to_string(required_bytes / (1024ULL * 1024ULL) + 1ULL) + " MiB)");
         }
     }
     return plan;

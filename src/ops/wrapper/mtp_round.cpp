@@ -46,9 +46,11 @@ void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t
 void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
-                            const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
-                            Tensor& ar_positions, Tensor& ar_rope_positions,
-                            Tensor& ar_valid_columns, std::int32_t proposal_depth,
+                            const Tensor& rope_deltas, const Tensor& cache_position_deltas,
+                            Tensor& alignment_ids, Tensor& next_extents,
+                            Tensor& ar_positions, Tensor& ar_cache_positions,
+                            Tensor& ar_rope_positions, Tensor& ar_valid_columns,
+                            std::int32_t proposal_depth,
                             std::int32_t max_context, cudaStream_t stream) {
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
@@ -71,22 +73,32 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     require_vector(remaining_budgets, DType::I32, batch, op, "remaining_budgets");
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(rope_deltas, DType::I32, batch, op, "rope_deltas");
+    if (cache_position_deltas.data != nullptr) {
+        if (cache_position_deltas.dtype != DType::I32 || cache_position_deltas.ne[0] != batch ||
+            cache_position_deltas.ne[1] != 1 || cache_position_deltas.ne[2] != 1 ||
+            cache_position_deltas.ne[3] != 1) {
+            throw std::invalid_argument(
+                "mtp_prepare_next_round: cache_position_deltas must be empty or an I32 [B] vector");
+        }
+    }
     require_matrix(alignment_ids, DType::I32, T, batch, op, "alignment_ids");
     require_vector(next_extents, DType::I32, batch, op, "next_extents");
     const std::int32_t steps = std::max(k - 1, 1);
     require_row_pitched_matrix(ar_positions, batch, steps, op, "ar_positions");
+    require_row_pitched_matrix(ar_cache_positions, batch, steps, op, "ar_cache_positions");
     require_row_pitched_matrix(ar_rope_positions, batch, steps, op, "ar_rope_positions");
     require_row_pitched_matrix(ar_valid_columns, batch, steps, op, "ar_valid_columns");
     if (ar_rope_positions.nb[1] != ar_positions.nb[1] ||
-        ar_valid_columns.nb[1] != ar_positions.nb[1]) {
+        ar_valid_columns.nb[1] != ar_positions.nb[1] ||
+        ar_cache_positions.nb[1] != ar_positions.nb[1]) {
         throw std::invalid_argument(
             "mtp_prepare_next_round: AR outputs must share one step stride");
     }
     detail::mtp_prepare_next_round_launch(verify_ids, next_anchors, accepted, updated_frontiers,
                                           remaining_budgets, licensed_counts, rope_deltas,
-                                          alignment_ids, next_extents, ar_positions,
-                                          ar_rope_positions, ar_valid_columns, k, max_context,
-                                          stream);
+                                          cache_position_deltas, alignment_ids, next_extents,
+                                          ar_positions, ar_cache_positions, ar_rope_positions,
+                                          ar_valid_columns, k, max_context, stream);
 }
 
 } // namespace ninfer::ops

@@ -441,6 +441,14 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
+// The store pair backing one tiered KV address space: the address-space store carries the
+// windowed row publication, the logical page store carries the Device/Host replicas, and one
+// shared HostKVExtentStore owns the Host bytes of both spaces.
+struct KVWindowSpace {
+    KVAddressSpaceStore& addresses;
+    LogicalKVPageStore& pages;
+};
+
 class ProgramImpl {
 public:
     struct PressureRecoveryScratch {
@@ -1261,15 +1269,16 @@ private:
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     // Whether the Device KV tier is a bounded working set rather than an image of the context:
-    // a real --kvmem-budget with plain speculation, which is what makes reselect open a hole and
-    // lets a context exceed the pool. Speculative backends keep the identity window, so their
-    // budget never activates staging and their resident bound is unchanged.
+    // a real --kvmem-budget with a backend the window can serve. MTP target verification reads the
+    // renumbered table through its cache-position pipeline (stage 6a, mtp-kvmem-plan.md), so it
+    // joins staging; masked draft backends keep the identity window and are excluded here.
     [[nodiscard]] bool resident_staging_active() const noexcept {
-        return kvmem_budget != 0 && speculative_backend == SpeculativeBackend::None;
+        return kvmem_budget != 0 && kvmem_resident_staging(speculative_backend);
     }
     // Whether reselect spends leftover window budget on mean-key similarity (Retrieval) instead of
     // pure recency. It is the same gate as resident_staging_active(): without a bounded window
-    // there is nothing to choose between, and speculative decoding keeps the identity window.
+    // there is nothing to choose between, and backends without the cache-position pipeline keep
+    // the identity window.
     [[nodiscard]] bool retrieval_selection_active() const noexcept {
         return kvmem_selection == KVMemSelection::Retrieval && resident_staging_active();
     }
@@ -1288,9 +1297,10 @@ private:
     // token count are promoted to their mean in the same call.
     void accumulate_kvmem_scores(SequenceState& sequence,
                                  std::span<const execution::KVMemCaptureSegment> segments);
-    // Decode counterpart: lane `lane` staged exactly one token at `token_position`, so the block
-    // identity comes from the lane's own frontier rather than from a recorded segment.
-    void accumulate_kvmem_decode_scores(SequenceState& sequence, std::uint32_t lane,
+    // Decode counterpart: staging column `column` holds exactly one token's key-sum row at
+    // `token_position`, so the block identity comes from that absolute position rather than from a
+    // recorded segment.
+    void accumulate_kvmem_decode_scores(SequenceState& sequence, std::uint32_t column,
                                         std::uint32_t token_position);
     // One selection round over the sequence's blocks. Recency always; Retrieval scores the blocks
     // against the newest captured mean and spends the leftover budget on the best matches, falling
@@ -1315,18 +1325,24 @@ private:
     // instead of growing with the frontier. One transfer-stream sync per call, only when a
     // direction actually moved.
     void apply_window_transition(SequenceState& sequence, const KVMemWindow& window);
+    // Per-space worker behind apply_window_transition: one address space (its own page store)
+    // against one window. The sequence-level form drives the text space and, under MTP staging,
+    // the draft backend space with the same boundaries.
+    void apply_window_space_transition(const KVWindowSpace& space, KVAddressSpaceHandle handle,
+                                       const KVMemWindow& window);
     // Restore Device residency for specific window holes (reserve + H2D + publish). Returns
     // whether any transfer was enqueued; the caller must synchronize device.transfer_stream
     // before the restored data is observed (set_window publish, attention, snapshot commit).
-    bool stage_in_demoted_pages(KVAddressSpaceHandle handle,
+    bool stage_in_demoted_pages(const KVWindowSpace& space, KVAddressSpaceHandle handle,
                                 std::span<const std::uint32_t> logical_pages);
     // Collect the pages outside `window` that still hold a Device replica and demote them:
     // back up any without a current Host replica, synchronize, then drop. Pages the gates skip
     // (shared, pinned) stay Device-resident; that is an accepted budget overshoot, not an error.
-    void stage_out_window_holes(KVAddressSpaceHandle handle, const KVMemWindow& window);
+    void stage_out_window_holes(const KVWindowSpace& space, KVAddressSpaceHandle handle,
+                                const KVMemWindow& window);
     // Full Device restore of every window hole - foreign consumers (active snapshot) that are
     // not window-aware run against a fully resident address. Synchronizes the transfer stream.
-    void stage_in_all_holes(KVAddressSpaceHandle handle);
+    void stage_in_all_holes(const KVWindowSpace& space, KVAddressSpaceHandle handle);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     void release_active_sequence_kv_strict(SequenceState& sequence) noexcept;
     void release_sequence_kv_strict(SequenceState& sequence) noexcept;

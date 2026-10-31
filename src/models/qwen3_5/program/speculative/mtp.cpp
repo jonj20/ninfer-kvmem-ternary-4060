@@ -107,6 +107,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
         Tensor current_drafts     = exact_verify_view(frame.current_drafts, {W - 1, B});
         Tensor target_rope        = exact_verify_view(frame.target_rope_positions, {W, B});
+        Tensor target_cache       = exact_verify_view(frame.target_cache_positions, {W, B});
         Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
         Tensor state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
@@ -127,12 +128,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
         Tensor next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
         Tensor ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
+        Tensor ar_cache_positions = frame.ar_cache_positions.slice(0, 0, batch_size);
         Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
+        Tensor cache_deltas = frame.cache_position_deltas.slice(0, 0, batch_size);
+
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
-                                               verify_ids, target_positions,
+                                               cache_deltas, verify_ids, target_positions,
+                                               target_cache,
                                                state.execution.device.stream);
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
@@ -140,7 +145,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  TargetVerifyFrameView{
                                      .ids                     = verify_ids,
-                                     .cache_positions         = target_positions,
+                                     .cache_positions         = target_cache,
                                      .rope_positions          = target_rope,
                                      .valid_columns           = target_valid,
                                      .kv_table_rows           = text_rows,
@@ -167,13 +172,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
             ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
-                                        licensed_counts, rope_deltas, alignment_ids, next_extents,
-                                        ar_positions, ar_rope_positions, ar_valid_columns,
+                                        licensed_counts, rope_deltas, cache_deltas, alignment_ids,
+                                        next_extents, ar_positions, ar_cache_positions,
+                                        ar_rope_positions, ar_valid_columns,
                                         static_cast<std::int32_t>(k),
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
                                         state.execution.device.stream);
-            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
-                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
+            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_cache, target_rope,
+                                          licensed_counts, mtp_rows, envelopes.batch,
                                           alignment_hidden);
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                     state.execution.device.stream);
@@ -187,7 +193,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 Tensor next =
                     next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1).view({batch_size});
                 Tensor position =
-                    ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1, batch_size});
+                    ar_cache_positions.slice(1, static_cast<std::int32_t>(step), 1)
+                        .view({1, batch_size});
                 Tensor rope = ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
                                   .view({1, batch_size});
                 Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)

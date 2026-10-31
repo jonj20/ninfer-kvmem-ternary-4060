@@ -9,8 +9,10 @@ namespace ninfer::ops::detail {
 
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
-                                              const Tensor& current_extents, Tensor& verify_ids,
-                                              Tensor& positions, cudaStream_t stream);
+                                              const Tensor& current_extents,
+                                              const Tensor& cache_position_deltas,
+                                              Tensor& verify_ids, Tensor& positions,
+                                              Tensor& cache_positions, cudaStream_t stream);
 void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
                                            const Tensor& current_extents, Tensor& verify_ids,
                                            cudaStream_t stream);
