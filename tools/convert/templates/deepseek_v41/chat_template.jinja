@@ -1,0 +1,126 @@
+{#- DeepSeek-V4.1 chat template, rendering a conversation as the release's encoding/encoding.py
+    encodes it: a leading <｜System｜> block (the reasoning effort in thinking mode, the system
+    message, the tool schemas), user turns with tool results merged into them, assistant turns
+    closed by <｜end▁of▁sentence｜>, and DSML tool calls. enable_thinking (default true) selects the
+    thinking mode, reasoning_effort low, high (the default) or max its budget, and
+    preserve_thinking keeps the reasoning of turns before the last user message, which a
+    conversation with tools always keeps. A message's image is the release's placeholder
+    <｜deepseek_image｜>, a block of its own joined to the message's other blocks by a blank line. -#}
+{%- macro render_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for block in content -%}
+            {%- if not loop.first -%}{{- '\n\n' -}}{%- endif -%}
+            {%- if block.type == 'image' -%}
+                {{- '<｜deepseek_image｜>' -}}
+            {%- elif block.type == 'text' -%}
+                {{- block.text -}}
+            {%- else -%}
+                {{- raise_exception('DeepSeek-V4.1 reads text and images, not ' ~ block.type) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set thinking = enable_thinking is not defined or enable_thinking is none or enable_thinking -%}
+{%- set budgets = {'low': 50, 'high': 75, 'max': 100} -%}
+{#- The effort sets the budget of the thinking mode only (`none` comes with thinking off). -#}
+{%- if thinking and reasoning_effort is defined and reasoning_effort is not none -%}
+    {%- if reasoning_effort not in budgets -%}
+        {{- raise_exception('DeepSeek-V4.1 takes reasoning_effort low, high or max') -}}
+    {%- endif -%}
+    {%- set budget = budgets[reasoning_effort] -%}
+{%- else -%}
+    {%- set budget = 75 -%}
+{%- endif -%}
+{%- set has_tools = tools is defined and tools is not none and tools | length > 0 -%}
+{%- set drop_thinking = not has_tools and not (preserve_thinking is defined and preserve_thinking) -%}
+{%- set leading_system = messages | length > 0 and messages[0].role == 'system' -%}
+{#- The last message that opens a turn: a user message, or a system message after the first. -#}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+    {%- if message.role == 'user' or (message.role == 'system' and not loop.first) -%}
+        {%- set ns.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{{- bos_token -}}
+{%- if thinking or leading_system or has_tools -%}
+    {{- '<｜System｜>' -}}
+    {%- if thinking -%}
+        {{- 'Reasoning Effort: ' ~ budget ~ ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -}}
+    {%- endif -%}
+    {%- if leading_system -%}
+        {{- messages[0].content -}}
+    {%- endif -%}
+    {%- if has_tools -%}
+        {{- '\n\n## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="$TOOL_NAME">\n<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name="$TOOL_NAME2">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n' -}}
+        {%- for tool in tools -%}
+            {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+            {{- (tool.function if tool.function is defined else tool) | tojson -}}
+        {%- endfor -%}
+        {{- '\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -}}
+    {%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- set i = loop.index0 -%}
+    {%- set previous = messages[i - 1] if i > 0 else none -%}
+    {%- set next = messages[i + 1] if i + 1 < messages | length else none -%}
+    {%- if message.role == 'system' -%}
+        {%- if i > 0 -%}
+            {{- '<｜System｜>' -}}{{- message.content -}}
+        {%- endif -%}
+    {%- elif message.role == 'user' or message.role == 'tool' -%}
+        {#- Consecutive user messages and tool results form one user turn. -#}
+        {%- if previous is not none and previous.role in ['user', 'tool'] -%}
+            {{- '\n\n' -}}
+        {%- else -%}
+            {{- '<｜User｜>' -}}
+        {%- endif -%}
+        {%- if message.role == 'tool' -%}
+            {{- '<tool_result>' -}}{{- render_content(message.content) -}}{{- '</tool_result>' -}}
+        {%- else -%}
+            {{- render_content(message.content) -}}
+        {%- endif -%}
+    {%- elif message.role == 'assistant' -%}
+        {%- if thinking and (not drop_thinking or i > ns.last_user) -%}
+            {%- if message.reasoning_content is defined and message.reasoning_content is not none -%}
+                {{- message.reasoning_content -}}
+            {%- endif -%}
+            {{- '</think>' -}}
+        {%- endif -%}
+        {%- if message.content is not none -%}{{- render_content(message.content) -}}{%- endif -%}
+        {%- if message.tool_calls is defined and message.tool_calls -%}
+            {{- '\n\n<｜DSML｜ calls>\n' -}}
+            {%- for call in message.tool_calls -%}
+                {%- set function = call.function if call.function is defined else call -%}
+                {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+                {{- '<｜DSML｜ invoke name="' -}}{{- function.name -}}{{- '">\n' -}}
+                {%- set arguments = function.arguments if function.arguments is mapping else {'arguments': function.arguments} -%}
+                {%- for key, value in arguments.items() -%}
+                    {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+                    {{- '<｜DSML｜ parameter name="' -}}{{- key -}}
+                    {%- if value is string -%}
+                        {{- '" string="true">' -}}{{- value -}}
+                    {%- else -%}
+                        {{- '" string="false">' -}}{{- value | tojson -}}
+                    {%- endif -%}
+                    {{- '</｜DSML｜ parameter>' -}}
+                {%- endfor -%}
+                {{- '\n</｜DSML｜ invoke>' -}}
+            {%- endfor -%}
+            {{- '\n</｜DSML｜ calls>' -}}
+        {%- endif -%}
+        {{- '<｜end▁of▁sentence｜>' -}}
+    {%- endif -%}
+    {#- The assistant header after a turn's last message: before the assistant's reply, or as the
+        generation prompt. -#}
+    {%- set opens = (message.role in ['user', 'tool'] and (next is none or next.role not in ['user', 'tool'])) or (message.role == 'system' and i > 0) -%}
+    {%- if opens and ((next is none and add_generation_prompt) or (next is not none and next.role == 'assistant')) -%}
+        {{- '<｜Assistant｜>' -}}
+        {%- if thinking and (not drop_thinking or i >= ns.last_user) -%}
+            {{- '<think>' -}}
+        {%- else -%}
+            {{- '</think>' -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}

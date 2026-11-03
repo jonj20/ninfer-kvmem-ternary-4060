@@ -1,0 +1,204 @@
+#pragma once
+
+#include "core/stage_plan.h"
+#include "core/weight_view.h"
+#include "models/qwen3_5/config.h"
+#include "ninfer/ops/linear.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace ninfer::models::qwen3_5 {
+
+struct WeightId {
+    std::size_t index                          = std::numeric_limits<std::size_t>::max();
+    friend bool operator==(WeightId, WeightId) = default;
+};
+
+struct WeightUseId {
+    WeightId parameter;
+    std::size_t use_index = std::numeric_limits<std::size_t>::max();
+};
+
+struct WeightUse {
+    std::string input;
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    std::optional<float> activation_input_divisor;
+    // BF16 sign vector of a Hadamard-rotated matrix, bound as its own device weight. The Use reads
+    // its K elements from `hadamard_begin`: a tensor-parallel piece of a matrix's columns turns its
+    // own whole 1024-column blocks of the input.
+    std::optional<WeightId> hadamard_signs;
+    std::uint64_t hadamard_begin = 0;
+    // INT32 [K] input gather of a GGUF matrix stored over permuted input columns.
+    std::optional<WeightId> input_columns;
+};
+
+struct BoundWeight {
+    std::string name;
+    std::vector<std::string> source_objects;
+    WeightView view;
+    std::vector<WeightUse> uses;
+    // The device rank the weight is materialized on: its layer's pipeline stage, 0 unless placed.
+    std::size_t rank = 0;
+};
+
+// Byte extent inside the pinned Host weight block.
+struct PinnedRange {
+    std::size_t offset = 0;
+    std::size_t bytes  = 0;
+};
+
+// Overlay Vision residency: the pinned groups a window stages through borrowed device memory. Each
+// range covers exactly its group's parents; staging_bytes is the prelude, the merger and two layer
+// slots of slot_bytes, each 256-aligned.
+struct VisionOverlayLayout {
+    PinnedRange prelude; // patch embedding, its bias, position embedding
+    std::vector<PinnedRange> layers;
+    PinnedRange merger; // merger norm, fc1, fc2 and biases
+    std::size_t slot_bytes    = 0;
+    std::size_t staging_bytes = 0;
+};
+
+struct AttentionWeights {
+    WeightId query, key, gate, value;
+    WeightId query_norm, key_norm, output;
+};
+
+struct GdnWeights {
+    WeightId query, key, value, z;
+    WeightId a_projection, b_projection, a_log, dt_bias;
+    WeightId convolution, norm, output;
+};
+
+struct DenseWeights {
+    WeightId gate, up, down;
+};
+
+struct MoeWeights {
+    WeightId router, shared_score;
+    std::vector<DenseWeights> experts;
+    DenseWeights shared;
+    // Absent for a resident bank, including MTP's explicit load-time Q4 storage trade.
+    std::optional<std::size_t> delivery_layer;
+
+    // Expert parallelism, a tensor-parallel rank's share of the layer: its experts are
+    // [expert_begin, expert_begin + experts.size()) of the router's, and only rank 0 holds the
+    // shared expert (`shared` is unbound elsewhere). Where the ranks divide every expert's
+    // intermediate columns instead, a rank holds all experts and the shared one, each with the
+    // `intermediate` columns of its share (0: whole experts). Absent for a whole layer.
+    struct ExpertShare {
+        std::uint32_t expert_begin = 0;
+        bool shared_expert         = true;
+        std::uint32_t intermediate = 0;
+    };
+
+    std::optional<ExpertShare> share;
+};
+
+struct BlockWeights {
+    WeightId input_norm, post_attention_norm;
+    std::variant<AttentionWeights, GdnWeights> mixer;
+    std::variant<DenseWeights, MoeWeights> ffn;
+};
+
+// A tensor-parallel rank's share of one layer beyond rank 0: the norms its share reads, its GDN
+// heads or its attention heads (neither in an attention layer when the rank holds no KV heads),
+// and its dense FFN rows or its experts with a replica of the router.
+struct RankLayerWeights {
+    WeightId input_norm, post_attention_norm;
+    std::optional<GdnWeights> gdn;
+    std::optional<AttentionWeights> attention;
+    std::variant<DenseWeights, MoeWeights> ffn;
+};
+
+struct TextWeights {
+    WeightId token_embedding, output_head, final_norm;
+    WeightUseId output_head_use;
+    // With tensor parallelism, rank 0's share of each layer's GDN or attention heads and dense FFN
+    // rows or experts.
+    std::vector<BlockWeights> layers;
+    // Tensor parallelism: rank_layers[r - 1][layer] is rank r's share of a layer. Empty otherwise.
+    std::vector<std::vector<RankLayerWeights>> rank_layers;
+    // Tensor parallelism: each rank's GDN heads, KV heads and FFN rows or experts, the same in
+    // every layer. Empty otherwise.
+    std::vector<TensorShare> tensor_shares;
+    // Which stage's device holds each whole layer. The identity mapping for one device, which is
+    // what keeps every consumer a no-op there; `--devices` adds stages.
+    StagePlan stages{1};
+};
+
+struct MtpWeights {
+    WeightId input_projection, embedding_norm, hidden_norm, final_norm;
+    BlockWeights layer;
+    WeightId token_embedding, output_head;
+    WeightUseId output_head_use;
+};
+
+struct NormWeights {
+    WeightId weight, bias;
+};
+
+struct VisionBlockWeights {
+    NormWeights norm1, norm2;
+    WeightId query, key, value, query_bias, key_bias, value_bias;
+    WeightId output, output_bias;
+    WeightId fc1, fc1_bias, fc2, fc2_bias;
+};
+
+struct VisionWeights {
+    WeightId patch_embedding, patch_embedding_bias, position_embedding;
+    std::vector<VisionBlockWeights> layers;
+    NormWeights merger_norm;
+    WeightId merger_fc1, merger_fc1_bias, merger_fc2, merger_fc2_bias;
+};
+
+struct DraftAttentionWeights {
+    WeightId query, key, value, context_key, context_value;
+    WeightId query_norm, key_norm, output;
+};
+
+struct DynamicConvWeights {
+    WeightId base_kernel, kernel_projection;
+};
+
+struct DraftBlockWeights {
+    WeightId input_norm, post_attention_norm;
+    DraftAttentionWeights attention;
+    DenseWeights mlp;
+    std::optional<DynamicConvWeights> attention_conv, mlp_conv;
+};
+
+struct SelectorWeights {
+    WeightId hidden_projection, predecessor_codebook, successor_codebook;
+};
+
+struct DraftWeights {
+    WeightId feature_projection, context_norm, final_norm;
+    std::vector<DraftBlockWeights> layers;
+    std::optional<SelectorWeights> selector;
+    WeightId token_embedding, output_head;
+    WeightUseId output_head_use;
+};
+
+struct ProposalWeights {
+    WeightId head;
+    std::optional<WeightId> token_ids;
+    std::uint32_t rows = 0;
+    std::vector<std::int32_t> global_token_ids;
+};
+
+// Handles refer to the frozen model's weight array. No artifact ID lookup is needed in execution.
+struct ModelWeights {
+    TextWeights text;
+    std::optional<VisionWeights> vision;
+    std::optional<MtpWeights> mtp;
+    std::optional<DraftWeights> draft;
+    std::optional<ProposalWeights> proposal;
+};
+
+} // namespace ninfer::models::qwen3_5

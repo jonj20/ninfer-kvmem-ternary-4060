@@ -1,0 +1,127 @@
+#include "core/tensor_split.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <string>
+#include <stdexcept>
+
+namespace ninfer {
+namespace {
+
+void require_positive(std::span<const double> values, const char* what) {
+    for (const double value : values) {
+        if (!std::isfinite(value) || value <= 0.0) {
+            throw std::invalid_argument(std::string(what) + " must be positive and finite");
+        }
+    }
+}
+
+} // namespace
+
+std::vector<std::uint64_t> split_shares(std::uint64_t total, std::span<const std::uint64_t> allowed,
+                                        std::span<const double> weights) {
+    const std::size_t ranks = weights.size();
+    if (ranks == 0) { throw std::invalid_argument("a split needs at least one rank"); }
+    require_positive(weights, "tensor-split weights");
+    for (std::size_t i = 0; i < allowed.size(); ++i) {
+        if (allowed[i] == 0 || allowed[i] >= total || (i > 0 && allowed[i] <= allowed[i - 1])) {
+            throw std::invalid_argument("share ends must ascend strictly inside the dimension");
+        }
+    }
+    if (allowed.size() + 1 < ranks) {
+        throw std::invalid_argument("a dimension of " + std::to_string(total) + " divides into " +
+                                    std::to_string(allowed.size() + 1) +
+                                    " shares at most, fewer than the " + std::to_string(ranks) +
+                                    " ranks");
+    }
+    const double sum = std::accumulate(weights.begin(), weights.end(), 0.0);
+    std::vector<std::uint64_t> out{0};
+    out.reserve(ranks + 1);
+    double cumulative  = 0.0;
+    std::size_t lowest = 0; // the first position the next end may take
+    for (std::size_t rank = 0; rank + 1 < ranks; ++rank) {
+        cumulative += weights[rank];
+        const double target = static_cast<double>(total) * (cumulative / sum);
+        // Leave one position for each later inner end.
+        const std::size_t highest = allowed.size() - (ranks - 1 - rank);
+        const auto first          = allowed.begin() + static_cast<std::ptrdiff_t>(lowest);
+        const auto last           = allowed.begin() + static_cast<std::ptrdiff_t>(highest) + 1;
+        auto above                = std::lower_bound(first, last, target, [](std::uint64_t a, double t) {
+            return static_cast<double>(a) < t;
+        });
+        auto pick = above;
+        if (above == last) {
+            pick = above - 1;
+        } else if (above != first) {
+            const auto below = above - 1;
+            if (target - static_cast<double>(*below) <= static_cast<double>(*above) - target) {
+                pick = below;
+            }
+        }
+        out.push_back(*pick);
+        lowest = static_cast<std::size_t>(pick - allowed.begin()) + 1;
+    }
+    out.push_back(total);
+    return out;
+}
+
+std::vector<std::uint64_t> unit_positions(std::uint64_t total, std::uint64_t unit) {
+    if (unit == 0) { throw std::invalid_argument("a share unit must be positive"); }
+    std::vector<std::uint64_t> out;
+    for (std::uint64_t position = unit; position < total; position += unit) {
+        out.push_back(position);
+    }
+    return out;
+}
+
+std::vector<double> fill_shares(std::span<const double> speed, std::span<const double> capacity,
+                                bool shrinks) {
+    const std::size_t ranks = speed.size();
+    if (ranks == 0 || capacity.size() != ranks) {
+        throw std::invalid_argument("shares need one speed and one capacity per rank");
+    }
+    require_positive(speed, "rank speeds");
+    for (const double room : capacity) {
+        if (!std::isfinite(room) || room < 0.0) {
+            throw std::invalid_argument("rank capacities must be finite and not negative");
+        }
+    }
+    const double speed_sum = std::accumulate(speed.begin(), speed.end(), 0.0);
+    const double room      = std::accumulate(capacity.begin(), capacity.end(), 0.0);
+    std::vector<double> out(ranks);
+    if (room < 1.0) {
+        const bool every_rank_has_room =
+            std::all_of(capacity.begin(), capacity.end(), [](double c) { return c > 0.0; });
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            out[rank] =
+                shrinks && every_rank_has_room ? capacity[rank] / room : speed[rank] / speed_sum;
+        }
+        return out;
+    }
+    std::vector<bool> full(ranks, false);
+    for (;;) {
+        double remaining  = 1.0;
+        double open_speed = 0.0;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            if (full[rank]) {
+                remaining -= out[rank];
+            } else {
+                open_speed += speed[rank];
+            }
+        }
+        bool capped = false;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            if (full[rank]) { continue; }
+            out[rank] = remaining * speed[rank] / open_speed;
+            if (out[rank] > capacity[rank]) {
+                out[rank]  = capacity[rank];
+                full[rank] = true;
+                capped     = true;
+            }
+        }
+        if (!capped) { return out; }
+    }
+}
+
+} // namespace ninfer

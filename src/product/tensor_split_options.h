@@ -1,0 +1,74 @@
+#pragma once
+
+#include "ninfer/model_enums.h"
+
+#include <charconv>
+#include <cmath>
+#include <cstddef>
+#include <stdexcept>
+#include <string_view>
+#include <system_error>
+#include <vector>
+
+namespace ninfer::product {
+
+// "3,2": the relative size of each tensor-parallel device's share, one positive weight per device in
+// --devices. Whether there is one per device is checked against the parsed --devices.
+inline std::vector<double> parse_tensor_split(std::string_view text) {
+    std::vector<double> weights;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::string_view piece =
+            text.substr(start, comma == std::string_view::npos ? std::string_view::npos
+                                                               : comma - start);
+        double value            = 0.0;
+        const auto [end, error] = std::from_chars(piece.data(), piece.data() + piece.size(), value);
+        if (piece.empty() || error != std::errc{} || end != piece.data() + piece.size() ||
+            !std::isfinite(value) || value <= 0.0) {
+            throw std::invalid_argument("--tensor-split entries must be positive numbers");
+        }
+        weights.push_back(value);
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    return weights;
+}
+
+// "heads" or "positions" (--tensor-attention).
+inline TensorAttention parse_tensor_attention(std::string_view text) {
+    if (text == "heads") { return TensorAttention::Heads; }
+    if (text == "positions") { return TensorAttention::Positions; }
+    throw std::invalid_argument("--tensor-attention must be heads or positions");
+}
+
+inline constexpr std::string_view kTensorAttentionHelp =
+    "  --tensor-attention heads|positions  with --tensor-parallel, divide each\n"
+    "                                attention layer by KV heads (default; devices\n"
+    "                                past the KV heads hold none), or by cache pages:\n"
+    "                                every device holds every head of its pages and\n"
+    "                                the devices merge their partial outputs\n";
+
+inline constexpr std::string_view kInvariantAttentionHelp =
+    "  --invariant-attention         attention outputs independent of decode width,\n"
+    "                                verification window and batch (Qwen3.5-core)\n";
+
+// The checks --tensor-split needs once --devices and --tensor-parallel are known.
+inline void check_tensor_split(const std::vector<double>& weights, std::size_t devices,
+                               bool tensor_parallel) {
+    if (weights.empty()) { return; }
+    if (!tensor_parallel) {
+        throw std::invalid_argument("--tensor-split needs --tensor-parallel");
+    }
+    if (weights.size() != devices) {
+        throw std::invalid_argument("--tensor-split needs one weight per device in --devices");
+    }
+}
+
+inline void check_tensor_attention(TensorAttention mode, bool tensor_parallel) {
+    if (mode == TensorAttention::Positions && !tensor_parallel) {
+        throw std::invalid_argument("--tensor-attention needs --tensor-parallel");
+    }
+}
+
+} // namespace ninfer::product

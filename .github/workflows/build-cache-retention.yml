@@ -1,0 +1,61 @@
+name: Build cache retention
+
+# Keeps the private HF bucket to the caches and Linux artifact backups that a current build reads.
+# A merge into master or a branch deletion removes that branch's state at once; the daily run
+# removes idle branches, superseded families and earlier layouts (hf-build-cache.py prune).
+on:
+  push:
+    branches: [master]
+  delete:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what would be deleted without deleting it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-cache-retention
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install HF bucket client
+        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: List branches with commits that master lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" --jq '.[].name' > branches.txt
+          : > live-refs.txt
+          while read -r branch; do
+            [[ "$branch" != master ]] || continue
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/master...$branch?per_page=1" --jq .status)"
+            # "behind" and "identical" mean that master already contains the branch.
+            if [[ "$status" == ahead || "$status" == diverged ]]; then
+              echo "refs/heads/$branch" >> live-refs.txt
+            fi
+          done < branches.txt
+          cat live-refs.txt
+      - name: Delete state that no current build reads
+        env:
+          HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          args=(prune --live-refs live-refs.txt)
+          [[ "$DRY_RUN" != true ]] || args+=(--dry-run)
+          python3.11 .github/scripts/hf-build-cache.py "${args[@]}"

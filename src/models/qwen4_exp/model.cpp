@@ -1,0 +1,844 @@
+#include "models/qwen4_exp/model.h"
+
+#include "artifact/binder.h"
+#include "artifact/reader.h"
+#include "artifact/views.h"
+#include "core/tensor_split.h"
+#include "models/expert_parallel.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/load/bindings.h"
+
+#include <algorithm>
+#include <numeric>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace ninfer::models::qwen4_exp {
+namespace {
+
+using qwen3_5::loading::Bindings;
+using Shape = artifact::Shape;
+
+FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config,
+                                 bool vision) {
+    const auto resource = [&](std::string_view role, const char* component = "text") {
+        const auto bytes = binder.host_object(binder.resource(component, role));
+        return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    FrontendResources out;
+    out.tokenizer_json         = resource("tokenizer.json");
+    out.tokenizer_config_json  = resource("tokenizer_config.json");
+    out.chat_template_jinja    = resource("chat_template.jinja");
+    out.generation_config_json = resource("generation_config.json");
+    if (vision) {
+        out.preprocessor_config_json       = resource("preprocessor_config.json", "vision");
+        out.video_preprocessor_config_json = resource("video_preprocessor_config.json", "vision");
+    }
+    out.tokenizer =
+        std::make_shared<const qwen3_5::frontend::Tokenizer>(qwen3_5::frontend::TokenizerResources{
+            out.tokenizer_json, out.tokenizer_config_json, out.generation_config_json});
+    const auto count = out.tokenizer->vocab_size();
+    if (!count || count > config.vocab_size || !out.tokenizer->has_exact_token_domain(count)) {
+        throw artifact::ArtifactError(
+            "tokenizer must expose a contiguous public domain within embedding rows");
+    }
+    out.public_token_count = static_cast<std::uint32_t>(count);
+    for (const auto token : out.tokenizer->default_stop_token_ids()) {
+        if (!out.tokenizer->is_valid_token(token)) {
+            throw artifact::ArtifactError("stop token is outside the public token domain");
+        }
+    }
+    return out;
+}
+
+HyperConnectionWeights bind_hc(Bindings& b, const TextConfig& c, const std::string& p,
+                               bool inject) {
+    const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
+    HyperConnectionWeights out;
+    out.norm = b.direct(p + "norm", {width});
+    out.down = b.parameter(p + "down", {c.hc_lowrank, width}, {p + "normalized"});
+    out.up   = b.parameter(p + "up", {width, c.hc_lowrank}, {p + "low"});
+    if (inject) { out.inject = b.parameter(p + "inject", {c.hc_count, width}, {p + "normalized"}); }
+    return out;
+}
+
+GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& p) {
+    const std::uint64_t h  = c.hidden_size;
+    const std::uint64_t kd = std::uint64_t(c.linear_num_key_heads) * c.linear_key_head_dim;
+    const std::uint64_t vd = std::uint64_t(c.linear_num_value_heads) * c.linear_value_head_dim;
+    const std::string g = p + "gdn/", input = p + "mixer_input";
+    GdnWeights out;
+    out.a_log        = b.direct(g + "a_log", {c.linear_num_value_heads}, QType::FP32);
+    out.dt_bias      = b.direct(g + "dt_bias", {c.linear_num_value_heads}, QType::FP32);
+    out.convolution  = b.direct(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd});
+    out.a_projection = b.parameter(g + "a_projection", {c.linear_num_value_heads, h}, {input});
+    out.b_projection = b.parameter(g + "b_projection", {c.linear_num_value_heads, h}, {input});
+    out.query        = b.parameter(g + "query", {kd, h}, {input});
+    out.key          = b.parameter(g + "key", {kd, h}, {input});
+    out.value        = b.parameter(g + "value", {vd, h}, {input});
+    out.z            = b.parameter(g + "z", {vd, h}, {input});
+    out.norm         = b.direct(g + "norm", {c.linear_value_head_dim});
+    out.output       = b.parameter(g + "output", {h, vd}, {g + "gated_output"});
+    return out;
+}
+
+SparseAttentionWeights bind_attention(Bindings& b, const TextConfig& c, const std::string& p) {
+    const std::uint64_t h  = c.hidden_size;
+    const std::uint64_t q  = std::uint64_t(c.num_attention_heads) * c.head_dim;
+    const std::uint64_t kv = std::uint64_t(c.num_key_value_heads) * c.head_dim;
+    const std::string a = p + "attention/", i = p + "indexer/", input = p + "mixer_input";
+    SparseAttentionWeights out;
+    out.query       = b.parameter(a + "query", {q, h}, {input});
+    out.gate        = b.parameter(a + "gate", {q, h}, {input});
+    out.key         = b.parameter(a + "key", {kv, h}, {input});
+    out.value       = b.parameter(a + "value", {kv, h}, {input});
+    out.query_norm  = b.direct(a + "query_norm", {c.head_dim});
+    out.key_norm    = b.direct(a + "key_norm", {c.head_dim});
+    out.output      = b.parameter(a + "output", {h, q}, {a + "gated_output"});
+    out.index_query = b.parameter(
+        i + "query", {std::uint64_t(c.indexer_n_heads) * c.indexer_head_dim, h}, {input});
+    out.index_key        = b.parameter(i + "key", {c.indexer_head_dim, h}, {input});
+    out.index_query_norm = b.direct(i + "query_norm", {c.indexer_head_dim});
+    out.index_key_norm   = b.direct(i + "key_norm", {c.indexer_head_dim});
+    return out;
+}
+
+using Piece = qwen3_5::loading::ParameterPiece;
+using Range = std::pair<std::uint64_t, std::uint64_t>;
+
+Piece row_piece(Range range) { return {Piece::Cut::Rows, {range}}; }
+
+Piece column_piece(std::vector<Range> ranges) { return {Piece::Cut::Columns, std::move(ranges)}; }
+
+Range scaled(std::uint64_t begin, std::uint64_t end, std::uint64_t unit) {
+    return {begin * unit, end * unit};
+}
+
+Range shifted(Range range, std::uint64_t by) { return {range.first + by, range.second + by}; }
+
+// Tensor parallelism: a parameter a rank after the first holds whole, as a piece of its own; a
+// matrix by its rows, a vector by its elements.
+WeightId replica(Bindings& b, const std::string& name, const Shape& shape,
+                 const std::vector<std::string>& inputs, std::optional<QType> format,
+                 std::size_t rank) {
+    return b.piece(name, shape, inputs, format, rank,
+                   shape.size() == 2 ? row_piece({0, shape[0]}) : column_piece({{0, shape[0]}}));
+}
+
+HyperConnectionWeights bind_hc_replica(Bindings& b, const TextConfig& c, const std::string& p,
+                                       bool inject, std::size_t rank) {
+    const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
+    HyperConnectionWeights out;
+    out.norm = replica(b, p + "norm", {width}, {}, QType::BF16, rank);
+    out.down = replica(b, p + "down", {c.hc_lowrank, width}, {p + "normalized"}, {}, rank);
+    out.up   = replica(b, p + "up", {width, c.hc_lowrank}, {p + "low"}, {}, rank);
+    if (inject) {
+        out.inject = replica(b, p + "inject", {c.hc_count, width}, {p + "normalized"}, {}, rank);
+    }
+    return out;
+}
+
+// A rank's share of a Gated DeltaNet mixer: its key heads with the value heads that read them, the
+// rows of every projection and gate of those heads, their convolution channels and the matching
+// input columns of the output projection. The gated norm is per head dimension: a replica.
+GdnWeights bind_gdn_share(Bindings& b, const TextConfig& c, const std::string& p,
+                          const TensorShare& share, std::size_t rank) {
+    const std::uint64_t h     = c.hidden_size;
+    const std::uint64_t kd    = std::uint64_t(c.linear_num_key_heads) * c.linear_key_head_dim;
+    const std::uint64_t vd    = std::uint64_t(c.linear_num_value_heads) * c.linear_value_head_dim;
+    const std::uint64_t ratio = c.linear_num_value_heads / c.linear_num_key_heads;
+    const Range key   = scaled(share.key_head_begin, share.key_head_end, c.linear_key_head_dim);
+    const Range heads = scaled(share.key_head_begin, share.key_head_end, ratio);
+    const Range value = scaled(heads.first, heads.second, c.linear_value_head_dim);
+    const std::string g = p + "gdn/";
+    const std::vector<std::string> input{p + "mixer_input"};
+    const std::uint64_t nv = c.linear_num_value_heads;
+    GdnWeights out;
+    out.query        = b.piece(g + "query", {kd, h}, input, {}, rank, row_piece(key));
+    out.key          = b.piece(g + "key", {kd, h}, input, {}, rank, row_piece(key));
+    out.value        = b.piece(g + "value", {vd, h}, input, {}, rank, row_piece(value));
+    out.z            = b.piece(g + "z", {vd, h}, input, {}, rank, row_piece(value));
+    out.a_projection = b.piece(g + "a_projection", {nv, h}, input, {}, rank, row_piece(heads));
+    out.b_projection = b.piece(g + "b_projection", {nv, h}, input, {}, rank, row_piece(heads));
+    out.a_log   = b.piece(g + "a_log", {nv}, {}, QType::FP32, rank, column_piece({heads}));
+    out.dt_bias = b.piece(g + "dt_bias", {nv}, {}, QType::FP32, rank, column_piece({heads}));
+    out.convolution =
+        b.piece(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd}, {}, QType::BF16, rank,
+                column_piece({key, shifted(key, kd), shifted(value, 2 * kd)}));
+    out.norm   = rank == 0 ? b.direct(g + "norm", {c.linear_value_head_dim})
+                           : replica(b, g + "norm", {c.linear_value_head_dim}, {}, QType::BF16, rank);
+    out.output = b.piece(g + "output", {h, vd}, {g + "gated_output"}, {}, rank, column_piece({value}));
+    return out;
+}
+
+// A rank's share of a sparse-attention mixer: the query and gate rows of the query heads that read
+// its KV heads, the key and value rows of those heads and the matching input columns of the output
+// projection. The norms and the indexer, which every rank holding heads runs whole: replicas.
+SparseAttentionWeights bind_attention_share(Bindings& b, const TextConfig& c, const std::string& p,
+                                            const TensorShare& share, std::size_t rank) {
+    if (rank == 0 && share.kv_head_begin == 0 && share.kv_head_end == c.num_key_value_heads) {
+        return bind_attention(b, c, p);
+    }
+    const std::uint64_t h     = c.hidden_size;
+    const std::uint64_t q     = std::uint64_t(c.num_attention_heads) * c.head_dim;
+    const std::uint64_t kv    = std::uint64_t(c.num_key_value_heads) * c.head_dim;
+    const std::uint64_t group = c.num_attention_heads / c.num_key_value_heads;
+    const Range query = scaled(share.kv_head_begin * group, share.kv_head_end * group, c.head_dim);
+    const Range heads = scaled(share.kv_head_begin, share.kv_head_end, c.head_dim);
+    const std::string a = p + "attention/", i = p + "indexer/";
+    const std::vector<std::string> input{p + "mixer_input"};
+    const std::uint64_t iq = std::uint64_t(c.indexer_n_heads) * c.indexer_head_dim;
+    const auto whole = [&](const std::string& name, const Shape& shape,
+                           const std::vector<std::string>& inputs,
+                           std::optional<QType> format) {
+        if (rank != 0) { return replica(b, name, shape, inputs, format, rank); }
+        return shape.size() == 1 ? b.direct(name, shape) : b.parameter(name, shape, inputs);
+    };
+    SparseAttentionWeights out;
+    out.query      = b.piece(a + "query", {q, h}, input, {}, rank, row_piece(query));
+    out.gate       = b.piece(a + "gate", {q, h}, input, {}, rank, row_piece(query));
+    out.key        = b.piece(a + "key", {kv, h}, input, {}, rank, row_piece(heads));
+    out.value      = b.piece(a + "value", {kv, h}, input, {}, rank, row_piece(heads));
+    out.output     = b.piece(a + "output", {h, q}, {a + "gated_output"}, {}, rank,
+                             column_piece({query}));
+    out.query_norm = whole(a + "query_norm", {c.head_dim}, {}, QType::BF16);
+    out.key_norm   = whole(a + "key_norm", {c.head_dim}, {}, QType::BF16);
+    out.index_query      = whole(i + "query", {iq, h}, input, {});
+    out.index_key        = whole(i + "key", {c.indexer_head_dim, h}, input, {});
+    out.index_query_norm = whole(i + "query_norm", {c.indexer_head_dim}, {}, QType::BF16);
+    out.index_key_norm   = whole(i + "key_norm", {c.indexer_head_dim}, {}, QType::BF16);
+    return out;
+}
+
+PleWeights bind_ple_replica(Bindings& b, const TextConfig& c, const std::string& p,
+                            std::size_t rank) {
+    const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
+    const std::string q = p + "ple/", input = p + "ple/embedding";
+    PleWeights out;
+    out.key         = replica(b, q + "key", {width, c.ple_embed_dim}, {input}, {}, rank);
+    out.value       = replica(b, q + "value", {c.hidden_size, c.ple_embed_dim}, {input}, {}, rank);
+    out.norm_key    = replica(b, q + "norm_key", {width}, {}, QType::BF16, rank);
+    out.norm_query  = replica(b, q + "norm_query", {width}, {}, QType::BF16, rank);
+    out.norm_conv   = replica(b, q + "norm_conv", {width}, {}, QType::BF16, rank);
+    out.convolution =
+        replica(b, q + "convolution", {width, c.ple_conv_kernel_size}, {}, QType::BF16, rank);
+    return out;
+}
+
+// The positions in (0, count) where every layer `allowed` lists cuts whole stored runs.
+template <class Allowed>
+std::vector<std::uint64_t> common_ends(std::uint64_t count, const TextConfig& c, MixerKind kind,
+                                       const Allowed& allowed) {
+    std::vector<std::uint64_t> out;
+    for (std::uint64_t position = 1; position < count; ++position) {
+        bool ok = true;
+        for (std::uint32_t layer = 0; ok && layer < c.num_hidden_layers; ++layer) {
+            if (c.layer_types[layer] == kind) {
+                ok = allowed("text/layers/" + std::to_string(layer) + "/", position);
+            }
+        }
+        if (ok) { out.push_back(position); }
+    }
+    return out;
+}
+
+// Each rank's runs of every layer, by `split`: its Gated DeltaNet key heads and routed experts, and
+// its sparse-attention KV heads, which go to as many of the first ranks as the two heads allow, in
+// proportion to their weights. A run ends only where every layer's projections cut whole stored
+// runs: the key, value and gate rows, the convolution channels and the output projection's columns.
+std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
+                                            std::span<const double> split) {
+    const std::uint64_t h     = c.hidden_size;
+    const std::uint64_t kd    = std::uint64_t(c.linear_num_key_heads) * c.linear_key_head_dim;
+    const std::uint64_t vd    = std::uint64_t(c.linear_num_value_heads) * c.linear_value_head_dim;
+    const std::uint64_t ratio = c.linear_num_value_heads / c.linear_num_key_heads;
+    const std::uint64_t q     = std::uint64_t(c.num_attention_heads) * c.head_dim;
+    const std::uint64_t kv    = std::uint64_t(c.num_key_value_heads) * c.head_dim;
+    const std::uint64_t group = c.num_attention_heads / c.num_key_value_heads;
+    const std::uint64_t nv    = c.linear_num_value_heads;
+    const auto key_ends = common_ends(
+        c.linear_num_key_heads, c, MixerKind::GatedDeltaNet,
+        [&](const std::string& p, std::uint64_t heads) {
+            const std::string g  = p + "gdn/";
+            const std::vector<std::string> input{p + "mixer_input"};
+            const std::uint64_t k = heads * c.linear_key_head_dim;
+            const std::uint64_t v = heads * ratio * c.linear_value_head_dim;
+            return b.row_ends(g + "query", {kd, h})[k] && b.row_ends(g + "key", {kd, h})[k] &&
+                   b.row_ends(g + "value", {vd, h})[v] && b.row_ends(g + "z", {vd, h})[v] &&
+                   b.row_ends(g + "a_projection", {nv, h})[heads * ratio] &&
+                   b.row_ends(g + "b_projection", {nv, h})[heads * ratio] &&
+                   b.column_ends(g + "output", {h, vd}, {g + "gated_output"})[v];
+        });
+    const auto kv_ends = common_ends(
+        c.num_key_value_heads, c, MixerKind::SparseAttention,
+        [&](const std::string& p, std::uint64_t heads) {
+            const std::string a = p + "attention/";
+            const std::uint64_t rows = heads * group * c.head_dim;
+            return b.row_ends(a + "query", {q, h})[rows] && b.row_ends(a + "gate", {q, h})[rows] &&
+                   b.row_ends(a + "key", {kv, h})[heads * c.head_dim] &&
+                   b.row_ends(a + "value", {kv, h})[heads * c.head_dim] &&
+                   b.column_ends(a + "output", {h, q}, {a + "gated_output"})[rows];
+        });
+    const std::size_t ranks    = split.size();
+    const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
+    const auto experts         = expert_ends(c.num_experts, split);
+    const std::size_t kv_ranks = std::min(ranks, kv_ends.size() + 1);
+    const auto kv_heads        = split_shares(c.num_key_value_heads, kv_ends, split.first(kv_ranks));
+    std::vector<TensorShare> out(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) {
+        out[r].key_head_begin = static_cast<std::uint32_t>(key_heads[r]);
+        out[r].key_head_end   = static_cast<std::uint32_t>(key_heads[r + 1]);
+        out[r].expert_begin   = static_cast<std::uint32_t>(experts[r]);
+        out[r].expert_end     = static_cast<std::uint32_t>(experts[r + 1]);
+        if (r < kv_ranks) {
+            out[r].kv_head_begin = static_cast<std::uint32_t>(kv_heads[r]);
+            out[r].kv_head_end   = static_cast<std::uint32_t>(kv_heads[r + 1]);
+        } else {
+            out[r].kv_head_begin = out[r].kv_head_end = c.num_key_value_heads;
+        }
+    }
+    return out;
+}
+
+// Where a parameter's rows sit in the artifact's files, without demanding its object.
+ExpertLocation locate(const artifact::Reader& reader, const std::string& name, std::uint64_t rows,
+                      std::uint64_t k) {
+    const auto& bindings = reader.directory().bindings;
+    const auto found     = bindings.find(name);
+    if (found == bindings.end() || found->second.parts.size() != 1) {
+        throw artifact::ArtifactError(name + ": a disk-resident expert must be one stored region");
+    }
+    const auto& part     = found->second.parts.front();
+    const auto& geometry = reader.geometry(part.object);
+    if (!is_gguf(geometry.format) || geometry.shape.size() != 2 || geometry.shape[1] != k ||
+        part.end - part.begin != rows * k || part.begin % k != 0) {
+        throw artifact::ArtifactError(name + ": disk-resident experts must be GGUF block rows");
+    }
+    const auto block              = gguf_block_shape(geometry.format);
+    const std::uint64_t row_bytes = k / block.elements * block.bytes;
+    const std::uint64_t logical =
+        reader.directory().tensor(part.object).offset + part.begin / k * row_bytes;
+    const auto segments = reader.segments(logical, rows * row_bytes);
+    if (segments.empty() || segments.size() > 2) {
+        throw artifact::ArtifactError(name + ": a disk-resident expert spans more than two files");
+    }
+    ExpertLocation out{.runs      = {},
+                       .bytes     = rows * row_bytes,
+                       .format    = geometry.format,
+                       .row_bytes = static_cast<std::int64_t>(row_bytes),
+                       .rows      = static_cast<std::int32_t>(rows)};
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        out.runs[i] = {segments[i].file_index, segments[i].file_offset, segments[i].bytes};
+    }
+    return out;
+}
+
+// Zero bytes after each down bank; see bind_moe.
+constexpr std::uint64_t kExpertTail = 256;
+
+// Whether two parameters are stored in one object.
+bool one_object(const artifact::Reader& reader, const std::string& a, const std::string& b) {
+    const auto& bindings = reader.directory().bindings;
+    const auto first = bindings.find(a), second = bindings.find(b);
+    if (first == bindings.end() || second == bindings.end()) {
+        throw artifact::ArtifactError("missing logical parameter " +
+                                      (first == bindings.end() ? a : b));
+    }
+    return !first->second.parts.empty() && !second->second.parts.empty() &&
+           first->second.parts.front().object.index == second->second.parts.front().object.index;
+}
+
+// Expert parallelism: rank r's experts [ends[r], ends[r + 1]) of one MoE layer as one device
+// selection per stored bank (a [gate; up] bank, or a gate and an up bank, and a down bank), each
+// expert's projections views into it. Fills every expert's gate, up and down.
+void bind_expert_shares(Bindings& b, const TextConfig& c, const std::string& m,
+                        const std::string& input, std::span<const std::uint64_t> ends,
+                        MoeWeights& out) {
+    const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
+    out.gate.resize(c.num_experts);
+    out.up.resize(c.num_experts);
+    out.down.resize(c.num_experts);
+    const auto expert = [&](std::uint64_t e) { return m + "experts/" + std::to_string(e) + "/"; };
+    const bool joint  = one_object(b.binder.reader(), expert(0) + "gate", expert(0) + "up");
+    for (std::size_t rank = 0; rank + 1 < ends.size(); ++rank) {
+        std::vector<Bindings::JointPart> gate_up, gates, ups, downs;
+        for (std::uint64_t e = ends[rank]; e < ends[rank + 1]; ++e) {
+            const std::string x = expert(e);
+            Bindings::JointPart gate{x + "gate", {w, h}, {input}};
+            Bindings::JointPart up{x + "up", {w, h}, {input}};
+            if (joint) {
+                gate_up.push_back(std::move(gate));
+                gate_up.push_back(std::move(up));
+            } else {
+                gates.push_back(std::move(gate));
+                ups.push_back(std::move(up));
+            }
+            downs.push_back({x + "down", {h, w}, {x + "product"}});
+        }
+        if (joint) {
+            const auto ids = b.joint_piece(gate_up, rank);
+            for (std::size_t i = 0; i < ids.size() / 2; ++i) {
+                out.gate[ends[rank] + i] = ids[2 * i];
+                out.up[ends[rank] + i]   = ids[2 * i + 1];
+            }
+        } else {
+            const auto gate_ids = b.joint_piece(gates, rank);
+            const auto up_ids   = b.joint_piece(ups, rank);
+            std::copy(gate_ids.begin(), gate_ids.end(), out.gate.begin() + ends[rank]);
+            std::copy(up_ids.begin(), up_ids.end(), out.up.begin() + ends[rank]);
+        }
+        const auto down_ids = b.joint_piece(downs, rank);
+        std::copy(down_ids.begin(), down_ids.end(), out.down.begin() + ends[rank]);
+    }
+}
+
+// `split` divides the routed experts over the ranks (expert parallelism; device residency only).
+MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
+                    ExpertResidency residency, std::span<const double> split = {}) {
+    const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
+    const std::string m = p + "moe/", input = p + "ffn_input";
+    MoeWeights out;
+    out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
+    out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
+    if (!split.empty()) {
+        bind_expert_shares(b, c, m, input, expert_ends(c.num_experts, split), out);
+    }
+    for (std::uint32_t e = 0; e < c.num_experts && split.empty(); ++e) {
+        const std::string x = m + "experts/" + std::to_string(e) + "/";
+        if (residency == ExpertResidency::Disk) {
+            const auto& reader = b.binder.reader();
+            out.located_gate.push_back(locate(reader, x + "gate", w, h));
+            out.located_up.push_back(locate(reader, x + "up", w, h));
+            out.located_down.push_back(locate(reader, x + "down", h, w));
+            continue;
+        }
+        const auto storage = [&](const char* role) {
+            if (residency != ExpertResidency::Host) { return artifact::Residency::Device; }
+            const auto& reader = b.binder.reader();
+            const auto found = reader.directory().bindings.find(x + role);
+            if (found == reader.directory().bindings.end()) {
+                throw artifact::ArtifactError("missing logical parameter " + x + role);
+            }
+            const auto& parts = found->second.parts;
+            const bool blocks = std::all_of(parts.begin(), parts.end(), [&](const auto& part) {
+                return is_gguf(reader.geometry(part.object).format);
+            });
+            if (blocks) { return artifact::Residency::Pinned; }
+            // Native banks are registered independently, so each layer's objects stay within
+            // one registration. Windows keeps pageable banks and uses bounded copy staging.
+#if defined(__linux__)
+            return artifact::Residency::Registered;
+#else
+            return artifact::Residency::Host;
+#endif
+        };
+        out.gate.push_back(b.parameter(x + "gate", {w, h}, {input}, {}, storage("gate")));
+        out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, storage("up")));
+        out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, storage("down")));
+    }
+    const std::uint64_t s = c.shared_expert_intermediate_size;
+    out.shared_gate       = b.parameter(m + "shared/gate", {s, h}, {input});
+    out.shared_up         = b.parameter(m + "shared/up", {s, h}, {input});
+    out.shared_down       = b.parameter(m + "shared/down", {h, s}, {m + "shared/product"});
+    // The expert matrix kernel reads a down row's 640 values in three 256-value steps, past the end
+    // of each bank's last row: zeros follow every down bank in device memory.
+    std::vector<WeightId> downs{out.shared_down};
+    if (residency == ExpertResidency::Device) {
+        downs.insert(downs.end(), out.down.begin(), out.down.end());
+    }
+    for (const WeightId id : downs) {
+        for (const auto& part : b.at(id).reference.binding.parts) {
+            if (is_gguf(b.binder.geometry(part.object).format)) {
+                b.binder.device_tail(part.object, kExpertTail);
+            }
+        }
+    }
+    return out;
+}
+
+PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& p) {
+    const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
+    const std::string q = p + "ple/", input = p + "ple/embedding";
+    PleWeights out;
+    out.key         = b.parameter(q + "key", {width, c.ple_embed_dim}, {input});
+    out.value       = b.parameter(q + "value", {c.hidden_size, c.ple_embed_dim}, {input});
+    out.norm_key    = b.direct(q + "norm_key", {width});
+    out.norm_query  = b.direct(q + "norm_query", {width});
+    out.norm_conv   = b.direct(q + "norm_conv", {width});
+    out.convolution = b.direct(q + "convolution", {width, c.ple_conv_kernel_size});
+    return out;
+}
+
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
+                    ExpertResidency residency, std::span<const double> split) {
+    const std::uint64_t h = c.hidden_size, width = std::uint64_t(c.hc_count) * h;
+    MtpWeights out;
+    out.embedding_norm  = b.direct("mtp/embedding_norm", {h});
+    out.hidden_norm     = b.direct("mtp/hidden_norm", {width});
+    out.fc_embedding    = b.parameter("mtp/fc_embedding", {h, h}, {"mtp/embedding_normalized"});
+    out.fc_hidden       = b.parameter("mtp/fc_hidden", {h, h}, {"mtp/hidden_normalized"});
+    const std::string p = "mtp/layer/";
+    out.layer.attn_hc   = bind_hc(b, c, p + "attn_hc/", true);
+    out.layer.mlp_hc    = bind_hc(b, c, p + "mlp_hc/", true);
+    out.layer.mixer     = bind_attention(b, c, p);
+    TextConfig experts  = c;
+    experts.num_experts = mtp.num_experts;
+    out.layer.moe       = bind_moe(b, experts, p, residency, split);
+    out.final_mixer     = bind_hc(b, c, "mtp/final_mixer/", false);
+    return out;
+}
+
+// Every parameter a layer owns, which moves with it to its stage.
+std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts) {
+    std::vector<WeightId> out;
+    for (const HyperConnectionWeights* hc : {&layer.attn_hc, &layer.mlp_hc}) {
+        out.insert(out.end(), {hc->norm, hc->down, hc->up});
+        if (hc->inject) { out.push_back(*hc->inject); }
+    }
+    if (const auto* gdn = std::get_if<GdnWeights>(&layer.mixer)) {
+        out.insert(out.end(),
+                   {gdn->query, gdn->key, gdn->value, gdn->z, gdn->a_projection, gdn->b_projection,
+                    gdn->a_log, gdn->dt_bias, gdn->convolution, gdn->norm, gdn->output});
+    } else if (const auto* a = std::get_if<SparseAttentionWeights>(&layer.mixer)) {
+        out.insert(out.end(), {a->query, a->gate, a->key, a->value, a->output, a->query_norm,
+                               a->key_norm, a->index_query, a->index_key, a->index_query_norm,
+                               a->index_key_norm});
+    }
+    const MoeWeights& m = layer.moe;
+    out.insert(out.end(), {m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
+    if (with_experts) {
+        out.insert(out.end(), m.gate.begin(), m.gate.end());
+        out.insert(out.end(), m.up.begin(), m.up.end());
+        out.insert(out.end(), m.down.begin(), m.down.end());
+    }
+    if (layer.ple) {
+        const PleWeights& p = *layer.ple;
+        out.insert(out.end(),
+                   {p.key, p.value, p.norm_key, p.norm_query, p.norm_conv, p.convolution});
+    }
+    return out;
+}
+
+std::vector<WeightId> mtp_parameters(const MtpWeights& mtp, bool with_experts) {
+    std::vector<WeightId> out = layer_weights(mtp.layer, with_experts);
+    out.insert(out.end(), {mtp.embedding_norm, mtp.hidden_norm, mtp.fc_embedding, mtp.fc_hidden,
+                           mtp.final_mixer.norm, mtp.final_mixer.down, mtp.final_mixer.up});
+    return out;
+}
+
+// Stored bytes behind `ids`, each object counted once.
+std::uint64_t stored_bytes(const Bindings& b, std::span<const WeightId> ids,
+                           std::set<std::size_t>& seen) {
+    std::uint64_t bytes = 0;
+    for (const WeightId id : ids) {
+        for (const auto& part : b.at(id).reference.binding.parts) {
+            if (seen.insert(part.object.index).second) {
+                bytes += artifact::object_bytes(b.binder.reader().directory().object(part.object));
+            }
+        }
+    }
+    return bytes;
+}
+
+// Contiguous layer ranges whose stored bytes are as even as the layer granularity allows; the
+// first stage also carries the embedding and the last the final mixer and the head.
+StagePlan balanced_stages(std::span<const std::uint64_t> layer_bytes, std::uint64_t first_extra,
+                          std::uint64_t last_extra, std::size_t ranks) {
+    const auto layers = static_cast<std::uint32_t>(layer_bytes.size());
+    std::vector<std::uint64_t> prefix(layers + 1, 0);
+    for (std::uint32_t i = 0; i < layers; ++i) { prefix[i + 1] = prefix[i] + layer_bytes[i]; }
+    const double total  = double(prefix[layers] + first_extra + last_extra);
+    const double target = total / double(ranks);
+    std::vector<std::uint32_t> boundaries;
+    std::uint32_t begin = 0;
+    for (std::size_t stage = 0; stage + 1 < ranks; ++stage) {
+        // The end whose cumulative bytes come closest to (stage + 1) shares, leaving at least one
+        // layer for each later stage.
+        const std::uint32_t last_end = layers - static_cast<std::uint32_t>(ranks - stage - 1);
+        std::uint32_t best           = begin + 1;
+        double best_gap              = 1e300;
+        for (std::uint32_t end = begin + 1; end <= last_end; ++end) {
+            const double cumulative = double(prefix[end] + first_extra);
+            const double gap        = std::abs(cumulative - target * double(stage + 1));
+            if (gap < best_gap) {
+                best_gap = gap;
+                best     = end;
+            }
+        }
+        boundaries.push_back(best);
+        begin = best;
+    }
+    boundaries.push_back(layers);
+    return StagePlan(layers, std::move(boundaries));
+}
+
+} // namespace
+
+Model::Model(TextConfig config, LoadOptions options, TextWeights weights, StagePlan stages,
+             std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+             artifact::MaterializedArtifact backing)
+    : backing_(std::move(backing)), config_(std::move(config)), options_(std::move(options)),
+      weights_(std::move(weights)), stages_(std::move(stages)), bound_(std::move(bound)),
+      resources_(std::move(resources)), info_(std::move(info)) {}
+
+Model::~Model() = default;
+
+std::size_t Model::attention_ranks() const noexcept {
+    std::size_t out = 0;
+    while (out < shares_.size() && shares_[out].kv_head_end > shares_[out].kv_head_begin) { ++out; }
+    return out;
+}
+
+const LayerWeights& Model::layer_weights(std::size_t rank, std::size_t layer) const {
+    return rank == 0 ? weights_.layers.at(layer) : weights_.rank_layers.at(rank - 1).at(layer);
+}
+
+WeightId Model::embedding(std::size_t rank) const {
+    return rank == 0 ? weights_.token_embedding : weights_.rank_embeddings.at(rank - 1);
+}
+
+std::vector<std::uint64_t> expert_ends(std::uint32_t experts, std::span<const double> split) {
+    return split_shares(experts, unit_positions(experts, 1), split);
+}
+
+std::vector<double> default_tensor_split(const artifact::Reader& reader, const LoadOptions& options,
+                                         std::span<const std::uint64_t> free_bytes,
+                                         std::span<const double> speed) {
+    // The MTP block's experts stay whole on rank 0 with the rest of the block.
+    return models::default_expert_split(
+        reader,
+        [&](std::string_view name) {
+            return name.starts_with("text/") || (options.mtp && name.starts_with("mtp/")) ||
+                   (options.vision && name.starts_with("vision/"));
+        },
+        [](std::string_view name) {
+            return name.starts_with("text/") && name.find("/moe/experts/") != std::string_view::npos;
+        },
+        free_bytes, speed);
+}
+
+ops::WeightInput Model::input(WeightId id) const {
+    const auto& parameter = weight(id);
+    if (parameter.uses.size() != 1) {
+        throw std::invalid_argument(parameter.name + ": a weight input needs exactly one use");
+    }
+    return input(id, parameter.uses.front().input);
+}
+
+ops::WeightInput Model::input(WeightId id, std::string_view use_name) const {
+    const auto& parameter = weight(id);
+    const auto use        = std::find_if(parameter.uses.begin(), parameter.uses.end(),
+                                         [&](const auto& u) { return u.input == use_name; });
+    if (use == parameter.uses.end()) {
+        throw std::invalid_argument(parameter.name + ": no use " + std::string(use_name));
+    }
+    if (use->hadamard_signs) {
+        throw std::invalid_argument(parameter.name +
+                                    ": Hadamard-rotated matrices are not supported");
+    }
+    ops::WeightInput result{parameter.view, use->policy, use->activation_input_divisor};
+    if (use->input_columns) {
+        result.input_columns = replicas_.on_rank(bound_, *use->input_columns, parameter.rank);
+    }
+    return result;
+}
+
+bool is_qwen4_exp(const artifact::Reader& reader) {
+    const auto& components = reader.directory().components;
+    const auto text        = components.find("text");
+    if (text == components.end()) { return false; }
+    const auto& config = text->second.config;
+    return config.is_object() && config.contains("architectures") &&
+           config.at("architectures").is_array() && config.at("architectures").size() == 1 &&
+           config.at("architectures")[0] == "Qwen4ExpForCausalLM";
+}
+
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOptions& options,
+                                  DeviceContext& device, const StartupObserver* observer) {
+    if (!is_qwen4_exp(reader)) {
+        throw artifact::ArtifactError("the artifact's text component is not Qwen4ExpForCausalLM");
+    }
+    if (options.ranks == 0 || options.ranks != device.size()) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next stages must match the device ranks");
+    }
+    const bool tensor_parallel = !options.tensor_split.empty();
+    if (tensor_parallel) {
+        if (options.tensor_split.size() != options.ranks || options.ranks < 2) {
+            throw std::invalid_argument(
+                "tensor parallelism needs one share per device rank and at least two ranks");
+        }
+        if (options.experts != ExpertResidency::Device) {
+            throw std::invalid_argument(
+                "--tensor-parallel divides Qwen3.8-Flash-Next's layers over "
+                "the devices: it needs --expert-residency device");
+        }
+        if (!options.stage_layers.empty()) {
+            throw std::invalid_argument("--tensor-parallel and --stage-layers exclude each other");
+        }
+    }
+    TextConfig config = parse_text_config(reader.directory().component("text").config);
+    artifact::Binder binder(reader);
+    std::optional<qwen3_5::VisionConfig> vision_config;
+    if (options.vision) {
+        const auto& components = reader.directory().components;
+        if (!components.contains("vision")) {
+            throw std::invalid_argument("Vision needs an artifact converted with its tower "
+                                        "(--components text,vision)");
+        }
+        vision_config = qwen3_5::parse_vision_config(reader.directory());
+    }
+    std::optional<MtpConfig> mtp_config;
+    if (options.mtp) {
+        const auto& components = reader.directory().components;
+        if (!components.contains("mtp")) {
+            throw std::invalid_argument("MTP needs an artifact converted with its MTP block "
+                                        "(--components text,mtp)");
+        }
+        mtp_config = parse_mtp_config(reader.directory().component("mtp").config, config);
+    }
+    FrontendResources resources = bind_resources(binder, config, options.vision);
+    Bindings b(binder);
+
+    TextWeights weights;
+    weights.token_embedding =
+        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    std::vector<std::string> head_uses{"text/final_hidden"};
+    if (mtp_config) { head_uses.emplace_back("mtp/final_hidden"); }
+    weights.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
+                                      std::move(head_uses));
+    weights.final_mixer = bind_hc(b, config, "text/final_mixer/", false);
+    std::vector<TensorShare> shares;
+    if (tensor_parallel) { shares = plan_tensor_shares(b, config, options.tensor_split); }
+    const auto ple_layer = [&](std::uint32_t i) {
+        return std::find(config.ple_layers.begin(), config.ple_layers.end(), i) !=
+               config.ple_layers.end();
+    };
+    for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+        const std::string p = "text/layers/" + std::to_string(i) + "/";
+        LayerWeights layer{.attn_hc = bind_hc(b, config, p + "attn_hc/", true),
+                           .mlp_hc  = bind_hc(b, config, p + "mlp_hc/", true),
+                           .mixer   = GdnWeights{},
+                           .moe     = {},
+                           .ple     = std::nullopt};
+        if (config.layer_types[i] == MixerKind::GatedDeltaNet) {
+            layer.mixer = tensor_parallel ? bind_gdn_share(b, config, p, shares[0], 0)
+                                          : bind_gdn(b, config, p);
+        } else {
+            layer.mixer = tensor_parallel ? bind_attention_share(b, config, p, shares[0], 0)
+                                          : bind_attention(b, config, p);
+        }
+        layer.moe = bind_moe(b, config, p, options.experts, options.tensor_split);
+        if (ple_layer(i)) { layer.ple = bind_ple(b, config, p); }
+        weights.layers.push_back(std::move(layer));
+    }
+    // Every other rank's replicas and runs of each layer.
+    for (std::size_t rank = 1; tensor_parallel && rank < options.ranks; ++rank) {
+        const TensorShare& share = shares[rank];
+        weights.rank_embeddings.push_back(
+            replica(b, "text/token_embedding", {config.vocab_size, config.hidden_size}, {}, {}, rank));
+        std::vector<LayerWeights> layers;
+        for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+            const std::string p = "text/layers/" + std::to_string(i) + "/";
+            const std::string m = p + "moe/", input = p + "ffn_input";
+            LayerWeights layer{.attn_hc = bind_hc_replica(b, config, p + "attn_hc/", true, rank),
+                               .mlp_hc  = bind_hc_replica(b, config, p + "mlp_hc/", true, rank),
+                               .mixer   = std::monostate{},
+                               .moe     = {},
+                               .ple     = std::nullopt};
+            if (config.layer_types[i] == MixerKind::GatedDeltaNet) {
+                layer.mixer = bind_gdn_share(b, config, p, share, rank);
+            } else if (share.kv_head_end > share.kv_head_begin) {
+                layer.mixer = bind_attention_share(b, config, p, share, rank);
+            }
+            layer.moe.router =
+                replica(b, m + "router", {config.num_experts, config.hidden_size}, {input}, {}, rank);
+            layer.moe.shared_score =
+                replica(b, m + "shared_score", {1, config.hidden_size}, {input}, {}, rank);
+            if (ple_layer(i)) { layer.ple = bind_ple_replica(b, config, p, rank); }
+            layers.push_back(std::move(layer));
+        }
+        weights.rank_layers.push_back(std::move(layers));
+    }
+    std::optional<MtpWeights> mtp_weights;
+    if (mtp_config) { mtp_weights = bind_mtp(b, config, *mtp_config, options.experts, {}); }
+    // The tower stays on rank 0, with the token embedding its output joins.
+    std::optional<qwen3_5::VisionWeights> vision_weights;
+    if (vision_config) {
+        vision_weights = qwen3_5::loading::bind_vision(b, *vision_config, config.hidden_size,
+                                                       artifact::Residency::Device);
+    }
+
+    // The stage split: what was asked, or the even split of the bytes each device would hold.
+    const bool device_experts = options.experts == ExpertResidency::Device;
+    StagePlan stages(config.num_hidden_layers);
+    if (options.ranks > 1 && !tensor_parallel) {
+        if (!options.stage_layers.empty()) {
+            if (options.stage_layers.size() != options.ranks) {
+                throw std::invalid_argument("--stage-layers must list one count per device");
+            }
+            stages = StagePlan::from_layer_counts(config.num_hidden_layers, options.stage_layers);
+        } else {
+            std::set<std::size_t> seen;
+            std::vector<std::uint64_t> layer_bytes;
+            for (const auto& layer : weights.layers) {
+                const auto ids = layer_weights(layer, device_experts);
+                layer_bytes.push_back(stored_bytes(b, ids, seen));
+            }
+            const std::vector<WeightId> first{weights.token_embedding};
+            std::vector<WeightId> last{weights.output_head, weights.final_mixer.norm,
+                                       weights.final_mixer.down, weights.final_mixer.up};
+            if (mtp_weights) {
+                const auto mtp = mtp_parameters(*mtp_weights, device_experts);
+                last.insert(last.end(), mtp.begin(), mtp.end());
+            }
+            stages = balanced_stages(layer_bytes, stored_bytes(b, first, seen),
+                                     stored_bytes(b, last, seen), options.ranks);
+        }
+        for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+            const std::size_t rank = stages.placement(i).stage;
+            for (const WeightId id : layer_weights(weights.layers[i], device_experts)) {
+                b.place(id, rank);
+            }
+        }
+        b.place(weights.token_embedding, 0);
+        std::vector<WeightId> head{weights.output_head, weights.final_mixer.norm,
+                                   weights.final_mixer.down, weights.final_mixer.up};
+        if (mtp_weights) {
+            const auto mtp = mtp_parameters(*mtp_weights, device_experts);
+            head.insert(head.end(), mtp.begin(), mtp.end());
+        }
+        for (const WeightId id : head) { b.place(id, stages.stages() - 1); }
+    } else if (options.ranks == 1 && !options.stage_layers.empty()) {
+        throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+    }
+
+    InstanceInfo info;
+    info.name = reader.directory().metadata.value("name", std::string("Qwen3.8-Flash-Next"));
+    info.metadata_json   = reader.directory().metadata.dump();
+    info.provenance_json = reader.directory().provenance.dump();
+    info.artifact_id     = reader.artifact_id();
+    std::vector<std::filesystem::path> files;
+    for (const auto& record : reader.directory().files) {
+        files.push_back(record.path ? options.artifact.parent_path() / *record.path
+                                    : options.artifact);
+    }
+    auto pending         = std::move(b.weights);
+    auto materialization = std::move(binder).finish();
+    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
+    auto model           = std::unique_ptr<Model>(
+        new Model(std::move(config), options, std::move(weights), std::move(stages),
+                  std::move(bound), std::move(resources), std::move(info), std::move(backing)));
+    model->files_          = std::move(files);
+    model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
+    model->vision_config_  = std::move(vision_config);
+    model->vision_weights_ = std::move(vision_weights);
+    model->mtp_config_     = std::move(mtp_config);
+    model->mtp_weights_    = std::move(mtp_weights);
+    model->shares_         = std::move(shares);
+    return model;
+}
+
+} // namespace ninfer::models::qwen4_exp
