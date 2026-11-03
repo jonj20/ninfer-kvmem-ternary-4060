@@ -78,6 +78,8 @@ public:
     // Tokens of the thinking-control suffix which may still be forced through the output budget.
     // Zero once this session can no longer apply one.
     [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept;
+    // A nonempty prefix of pending_control_tokens(); bounded chunks allow the
+    // engine to yield while preparing the next native KV window.
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
@@ -87,6 +89,9 @@ public:
     // block and its closing whitespace, including the markup of a tool call.
     [[nodiscard]] std::vector<TokenLogprob> take_content_logprobs() noexcept;
     [[nodiscard]] std::shared_ptr<text::GrammarState> grammar_state() const;
+    // The single <tool_call> vocabulary id forbidden for default tool_choice none.
+    // Empty when that spelling is missing or ambiguous, or when a grammar is active.
+    [[nodiscard]] std::optional<TokenId> suppressed_tool_open() const;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
@@ -104,7 +109,8 @@ private:
                   std::shared_ptr<text::GrammarState> grammar               = {},
                   std::shared_ptr<const frontend::GemmaMarkers> gemma       = {},
                   std::shared_ptr<const frontend::FlintMarkers> flint       = {},
-                  std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {});
+                  std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {},
+                  std::optional<TokenId> suppressed_tool_open = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

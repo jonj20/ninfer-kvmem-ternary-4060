@@ -19,12 +19,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
 #include <new>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -82,7 +84,8 @@ struct Cache {
     Cache& operator=(const Cache&) = delete;
 };
 
-void build_cache(Cache& cache, const ninfer::KVPageGeometry& geometry, std::size_t ranks) {
+void build_cache(Cache& cache, const ninfer::KVPageGeometry& geometry, std::size_t ranks,
+                 const ninfer::DeviceContext& context) {
     const ninfer::DeviceKVPagePoolSpec spec{.page_group_count = kPages, .geometry = geometry};
     const std::vector<std::size_t> plane_rank = alternating_ranks(geometry.planes.size(), ranks);
     std::vector<ninfer::LayoutBuilder> builders(ranks);
@@ -97,7 +100,9 @@ void build_cache(Cache& cache, const ninfer::KVPageGeometry& geometry, std::size
     }
     std::vector<ninfer::DeviceSpan> backings;
     cache.arenas.reserve(ranks);
-    for (auto& builder : builders) {
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        auto& builder = builders[rank];
+        ninfer::DeviceBinding binding(context.rank(rank).device);
         cache.arenas.emplace_back(builder.finish(256));
         backings.push_back({cache.arenas.back().base(), cache.arenas.back().capacity()});
     }
@@ -106,6 +111,7 @@ void build_cache(Cache& cache, const ninfer::KVPageGeometry& geometry, std::size
 }
 
 std::vector<std::int32_t> read_row(const ninfer::Tensor& row, std::size_t count) {
+    ninfer::HoldingDeviceBinding binding(ninfer::memory_device(row.data));
     std::vector<std::int32_t> out(count);
     CUDA_CHECK(cudaMemcpy(out.data(), row.data, out.size() * sizeof(std::int32_t),
                           cudaMemcpyDeviceToHost));
@@ -133,6 +139,7 @@ std::vector<ninfer::DeviceKVPageHandle> handles(std::span<const ninfer::DeviceKV
 void fill(ninfer::DeviceKVPagePool& pool, ninfer::RankStreams streams) {
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
         const ninfer::Tensor& plane = pool.plane(plane_index);
+        ninfer::HoldingDeviceBinding binding(ninfer::memory_device(plane.data));
         std::vector<unsigned char> host(plane.bytes());
         for (std::size_t index = 0; index < host.size(); ++index) {
             host[index] =
@@ -187,8 +194,8 @@ int exercise(const ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder ord
     int failures                    = 0;
     const ninfer::KVPageGeometry g = make_geometry(order);
     Cache reference_cache, ranked_cache;
-    build_cache(reference_cache, g, 1);
-    build_cache(ranked_cache, g, 2);
+    build_cache(reference_cache, g, 1, context);
+    build_cache(ranked_cache, g, 2, context);
     ninfer::DeviceKVPagePool& reference = *reference_cache.pool;
     ninfer::DeviceKVPagePool& ranked    = *ranked_cache.pool;
     const ninfer::RankStreams one_stream(context.rank(0).stream);
@@ -268,7 +275,7 @@ int exercise(const ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder ord
 
     // 4. A round trip through the host restores a ranked pool page for page.
     Cache other_cache;
-    build_cache(other_cache, g, 2);
+    build_cache(other_cache, g, 2, context);
     ninfer::DeviceKVPagePool& other        = *other_cache.pool;
     std::vector<ninfer::DeviceKVPageLease> restored = materialize(other, 5);
     const auto restored_handles                     = handles(restored);
@@ -301,7 +308,7 @@ int exercise(const ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder ord
     return failures;
 }
 
-int exercise_layout_errors() {
+int exercise_layout_errors(const ninfer::DeviceContext& context) {
     int failures = 0;
     const ninfer::KVPageGeometry g = make_geometry(ninfer::PagedKVPlaneOrder::PageMajor);
     const ninfer::DeviceKVPagePoolSpec spec{.page_group_count = kPages, .geometry = g};
@@ -322,7 +329,7 @@ int exercise_layout_errors() {
 
     // A layout that names rank 1 needs two backings.
     Cache cache;
-    build_cache(cache, g, 2);
+    build_cache(cache, g, 2, context);
     ninfer::LayoutBuilder c, d;
     ninfer::LayoutBuilder* const two[] = {&c, &d};
     const auto layout = ninfer::plan_device_kv_page_pool(two, alternating_ranks(g.planes.size(), 2), spec);
@@ -347,13 +354,21 @@ int run() {
     CUDA_CHECK(count_err);
     CUDA_CHECK(cudaSetDevice(0));
 
-    const int device_ids[2] = {0, 0};
+    int device_ids[2] = {0, 0};
+    if (const auto* ids = std::getenv("NINFER_TEST_DEVICE_IDS")) {
+        std::istringstream list{std::string(ids)};
+        for (auto& id : device_ids) {
+            std::string item;
+            if (!std::getline(list, item, ',')) throw std::invalid_argument("expected two device ids");
+            id = std::stoi(item);
+        }
+    }
     ninfer::DeviceContext context(std::span<const int>(device_ids, 2));
 
     int failures = 0;
     failures += exercise(context, ninfer::PagedKVPlaneOrder::PageMajor, "page-major");
     failures += exercise(context, ninfer::PagedKVPlaneOrder::HeadMajor, "head-major");
-    failures += exercise_layout_errors();
+    failures += exercise_layout_errors(context);
     if (failures != 0) { return 1; }
     std::cout << "multi-rank kv pool matches the single-rank pool\n";
     return 0;

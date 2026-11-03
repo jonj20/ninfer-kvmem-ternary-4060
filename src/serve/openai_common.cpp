@@ -137,6 +137,19 @@ bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_
     return true;
 }
 
+void validate_openai_image_detail(const RequestJson& image, std::string_view field,
+                                  std::string_view param) {
+    if (!image.contains("detail") || image.at("detail").is_null()) { return; }
+    if (!image.at("detail").is_string()) {
+        bad_request(std::string(field) + " must be a string", std::string(param));
+    }
+    const std::string& detail = image.at("detail").get_ref<const std::string&>();
+    if (detail != "auto" && detail != "low" && detail != "high" && detail != "original") {
+        bad_request(std::string(field) + " must be 'auto', 'low', 'high', or 'original'",
+                    std::string(param), "invalid_value");
+    }
+}
+
 OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body) {
     auto require_string_hint = [&](const char* field, std::optional<std::size_t> maximum = {}) {
         if (!body.contains(field) || body.at(field).is_null()) { return; }

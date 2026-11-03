@@ -12,7 +12,9 @@ WeightView bind_view(const ParameterReference& reference,
     std::uint64_t covered = 0;
     for (const auto& part : reference.binding.parts) {
         const auto& parent = reference.residency == Residency::Device
-                                 ? materialized.device_parent(part.object)
+                                 ? (reference.device_replica
+                                        ? materialized.device_replica(part.object, *reference.device_replica)
+                                        : materialized.device_parent(part.object))
                              : reference.residency == Residency::Pinned
                                  ? materialized.pinned_parent(part.object)
                              : reference.residency == Residency::Mapped

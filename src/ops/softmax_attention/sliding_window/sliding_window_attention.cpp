@@ -112,7 +112,8 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
 
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& lanes, AttentionHeadGeometry geometry,
+                              const Tensor& lanes, const Tensor& min_positions,
+                              AttentionHeadGeometry geometry,
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
@@ -150,6 +151,15 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     require_contiguous_nonnull(valid_columns, op, "valid columns");
     require_contiguous_nonnull(lanes, op, "lanes");
     require_contiguous_nonnull(out, op, "out");
+    // Optional per-batch mask floor: committed context positions below min_positions[b] are
+    // invisible to row b. Null disables the floor (everything admitted by the window stays).
+    if (min_positions.data != nullptr) {
+        if (min_positions.dtype != DType::I32) {
+            throw std::invalid_argument("sliding_window_attention: min_positions must be I32");
+        }
+        require_shape(min_positions, batch, 1, 1, 1, op, "min positions");
+        require_contiguous_nonnull(min_positions, op, "min positions");
+    }
     validate_context(context, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
@@ -168,8 +178,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     }
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
-                                            scale, context, plan, partial.acc, partial.m, partial.l,
-                                            out, stream);
+                                            min_positions, scale, context, plan, partial.acc,
+                                            partial.m, partial.l, out, stream);
 }
 
 } // namespace ninfer::ops

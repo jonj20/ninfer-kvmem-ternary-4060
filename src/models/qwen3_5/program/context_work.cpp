@@ -308,10 +308,15 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
 }
 
 execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
-                                            std::uint32_t max_frontier) {
+                                            std::uint32_t max_frontier,
+                                            std::uint32_t local_absolute_max) {
     (void)min_frontier;
     return execution::DFlashEnvelopes{
-        .local = {0, max_frontier},
+        // The cyclic ring is addressed by absolute logical positions (`p mod S`), so the local
+        // sliding-window envelope's max_context bounds the query's absolute position, not the
+        // ring or the device window. A value below the logical frontier makes the attention
+        // kernel short-circuit every query past it, silently zeroing the draft.
+        .local = {0, local_absolute_max},
         .full  = {0, max_frontier},
     };
 }

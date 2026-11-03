@@ -781,3 +781,223 @@ Exact model state 和 backend mathematics 见
 [Qwen3.5 model](qwen3_5-model.md)与 [DFlash](dflash.md)；persistent KV codec 和 causal consumer
 numerical contract 由上表中的 growing-cache Ops 定义。路径用于定位当前实现，不把文件或类名本身提升为
 外部接口。
+
+
+## KVMem integration working set
+
+The optional `EngineOptions::kvmem` integration separates the logical context ceiling from
+native physical capacity. `selected_tokens` (B) and `reserve_tokens` (R) are independent
+64-token multiples; explicit Main capacity is C*(B+R), where C is the configured concurrency.
+Each request owns at most B+R tokens. A prefill chunk must fit R. `host_bytes`
+(H) bounds retained native packed records, including code and scale planes. State images,
+workspace and optional diagnostic readback buffers are accounted separately from H.
+Admission rejects a request whose maximum legal history can exceed H before publishing
+it Active. The same FIFO resource manager temporarily blocks admission when existing active
+reservations leave insufficient H; terminal retirement releases that reservation. Inactive
+histories are evicted before admitting a request, never at the expense of another active request.
+An explicit budget limit does not take the worker offline.
+
+Program remains the sole device allocator and reservation owner. At a safe execution
+boundary `WindowMemoryBackend` exposes the logical catalog to the portable KVMem
+`MemorySession`; preparation reserves host destinations, spill completes before pages are
+recycled, and publication advances the compact view only after restore completes. A failure
+after destructive page reuse invalidates that attempted sequence. Original RoPE positions
+are never derived from the compact table or rewritten during transfer.
+
+The initial bridge reconstructs the compact native address space and stages retained pages
+as well as evicted pages. Its preparation therefore accounts for those additional host
+records in H; current completed records are reused. `verify_transfers` additionally checks
+native payload and recurrent-state bytes and is disabled for ordinary product execution.
+
+RAM-only execution owns one bounded CPU preparation worker when H is nonzero.
+An admitted request with a Host payload reservation prepares missing records for its
+next prompt chunk before the current GPU chunk. The next safe boundary joins and
+publishes those records before use. Existing RAM records keep their original owner
+borrows and writes; lookahead neither adds copy-on-write capacity nor changes zero
+initialization or H accounting. Cancellation waits for an already-started preparation
+to drain. Requests with no Host reservation keep their original path. RAM bulk
+transfers and decode/control scheduling remain synchronous, with the same GPU
+executor, workspace and Graphs; this worker performs only Host preparation.
+RAM record preparation is capped at the request's admitted history pages. A speculative
+device mapping can extend beyond the output limit; those extra positions do not consume
+Host history capacity, including when active requests exactly fill H.
+
+Admission's service projection counts worker-visible prefill steps on KVMem's
+canonical chunk grid, including resumed suffixes and query replay. The final
+prompt chunk leaves room in R for the initial MTP proposal and may require an
+extra step. Reserve that allowance across the whole suffix, including captures
+inside its final chunk; storage waits consume no compute service units.
+
+Durable KVMem records use ordinary pageable RAM. Program owns one reusable pinned transfer
+buffer, bounded by B+R native page payload bytes, rather than registering every history page
+with CUDA. Spill synchronizes into that buffer before copying bytes to the archive; restore
+copies archive bytes into the same buffer before native H2D transfer. This avoids pinned
+allocation count/volume growing with logical history. The checkpoint state image and optional
+diagnostic readbacks remain separately bounded pinned allocations. This archive is separate
+from the native prefix cache's HostKVArena described above.
+
+The integration admits all nine native KV profiles: BF16, INT8, FP8, NVFP4, K8V4,
+RK8V4, RK4V4, RK4V4-E8 and RK2V4-E8. Ordinary and fixed/adaptive MTP1..15 support
+1..8 text or resident/CPU Vision lanes. Ngram requires MTP; C2..8 cap valid requested
+widths 16..63 to 15 at startup, while C1 preserves them. The disabled persistent
+KVMem snapshots have been replaced by process-local active/idle SSD tiering. Fast prompt
+Attention admits INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 text and resident/CPU Vision
+with the same C1..8 limits. Concurrent prefill remains rejected. The native prefix catalog is disabled.
+Legacy lookup drafting is disabled by policy: nonzero `--lookup-ngram` is rejected by
+serving and Engine validation with a pointer to `--ngram-draft-tokens` and
+`--ngram-min-match`. The Windows KVMem launcher also rejects explicit lookup flags.
+The additional profiles only register layout identities and relax admission; page
+transfers use the existing physical plane schemas without requantization. Representative
+functional qualification is recorded in the [additional KV report](../../../../docs/other-kv-admission-validation-20261006.md);
+unqualified combinations are not release capability claims. Post-RMS/pre-RoPE
+block sums feed the portable mean-K selector. The
+frontend supplies an exact last-user token span. When the input exceeds B+R, Program captures
+its complete native StateImage immediately before that query, probes Q once, restores the
+checkpoint and selected original-position KV, then replays the query before emitting the first
+token. Internal replay has its own scheduler service budget and does not duplicate prompt progress.
+
+NVFP4 is source-enabled. Focused codec, sparse Attention (including poisoned unwritten
+scale bytes), payload and option tests passed on the RTX 5050 Laptop. Bonsai at B128/R128
+passed ordinary execution, MTP1 eager and MTP4 CUDA Graph generation, Host restoration,
+reuse, output boundaries and cancellation recovery. The MTP runs used the existing
+D3D12/WDDM option and FP16 GDN with ngram disabled; default CUDA capacity rejected the
+Q8 MTP load. RTX 5060 Ti / IQ3S then passed the 229-case NVFP4 qualification: fixed
+MTP0..4 eager/Graph, Host sessions, C2/C4 text, resident vision, cold restart/faults
+and retrieval through the 128K target. Three B32768/R16384 MTP4 Graph cold starts
+and long-input HTTP reuse/cancellation passed with FP16 GDN and default CUDA
+allocation. Ngram and lookup stayed disabled. These results apply to the tested
+local source/model/build; performance and package release are separate. See the
+[qualification report](../../../../docs/nvfp4-kvmem-validation-20261004.md).
+It uses the existing
+native group-16 e2m1 codec for both Main and MTP K/V; each D256 head has two 128-byte
+code planes and two 16-byte raw E4M3 scale planes per token. The bridge advertises
+`ninfer.nvfp4-g16.page.v1` and preserves all four planes byte-for-byte through spill,
+compact restore, retained sessions and cold snapshots. The existing execution identity
+includes the KV storage enum, so INT8/RK8V4 snapshots cannot seed an NVFP4 execution.
+BF16 pre-RoPE mean-K/Q statistics and accepted-prefix folding are unchanged. NVFP4
+uses INT8's ordinary/fixed-MTP, text-concurrency and resident-vision restrictions;
+it does not enable adaptive MTP, concurrent images or a separate MTP attention window.
+
+K8V4 uses the existing `Fp8KeyNvfp4Value` codec for both Main and MTP. K has
+256 FP8_E4M3FN code bytes and one FP16 row scale (2 bytes); V has 128 packed
+NVFP4 code bytes and sixteen raw E4M3 group-16 scales. The 402-byte D256 payload
+has asymmetric scale extents and dtypes, so page transfers derive each plane
+independently. Both K and V use the native normalized D256 Hadamard. Its layout
+identity is `ninfer.k8v4-fp8-nvfp4.page.v1`; the existing execution identity
+also records the storage enum, isolating cold records from NVFP4 and INT8.
+It follows the same ordinary/fixed-MTP, concurrency and resident-vision gates
+as INT8. The compact 26-run IQ3S/5060 Ti qualification covers MTP0 eager/Graph,
+MTP1..3 Graph, MTP4 eager/Graph, C4 pressure, vision, cold faults/format isolation,
+8K/32K retrieval and one B32768/R16384 MTP4 Graph serving start. Ngram/lookup
+were disabled; this is functional qualification, not a complete Cartesian
+matrix or performance comparison. See the
+[K8V4 report](../../../../docs/k8v4-kvmem-validation-20261004.md).
+
+An input that fits B+R instead captures a reusable prefix immediately before its final input token
+when history reuse is enabled. This capture does not trigger Q probing or replay. Keeping one
+suffix token lets ordinary sampling and the MTP boundary bridge run normally on a repeated input.
+Its native KV payload is included in admission's Host reservation even without device page pressure.
+A short-prefix checkpoint past the incoming last-user boundary cannot seed a long-input query
+probe with a different query; that transition uses an earlier legal checkpoint or recomputes.
+
+Each retained session shares one native Host archive among at most three complete checkpoints:
+the pre-query/input fallback, the normal finished execution endpoint, and one exact Frontend
+reconstruction boundary (generation opener or canonical thinking close). Each owns its StateImage,
+exact input identity, compact resident view and partial-page mean snapshot. The endpoint excludes
+the last output token when that token has not executed. MTP/recurrent state and persistent
+statistics cover the same frontier; unlicensed verification columns never enter a checkpoint.
+Speculative thinking-close capture folds only the licensed prefix, saves that complete state,
+then restores the base before the normal accepted-prefix fold. No output-text scanning is used.
+
+Reuse chooses the furthest exact token/position/execution-identity match. For a long same-query
+tool continuation, a complete matching last-user span also proves the frozen query attachment;
+restore retains Q and the captured selected view and appends only the new suffix. Ordinary B/R
+pressure may reselect with that Q. A changed query cannot reuse a post-query checkpoint and instead
+uses the pre-query probe/replay route. Restoring an earlier checkpoint revokes all later checkpoints
+before shared archive rows can be overwritten. Optional endpoint/reconstruction capture failure
+preserves the earlier complete fallback. Host admission reserves the entire legal execution
+history when endpoint reuse is enabled, including short inputs.
+
+The bounded Host directory (`retained_sessions`, default 4, maximum 16) can restore a checkpoint
+only when its session key, exact token prefix, backend/layout identity and execution stamp match.
+It restores the captured KV view and
+uses original-position chunk boundaries. A mismatching edited history discards that cache
+and prefills from the beginning. Named histories use Engine publication order, including a
+high-water mark for active updates, so an older late finish cannot replace a newer update.
+A request with `update_session_index=false` does not consume or replace its named retained source.
+Cancellation may retain the earlier trusted checkpoint,
+never the partially generated endpoint. These histories are process-local, including when
+their records spill to SSD; restarting an Engine or process does not import them. The generic
+MemoryBackend descriptor does not advertise a portable checkpoint codec.
+
+MTP native records contain both Main and MTP packed planes. They transfer only when their
+committed frontiers agree. Verification captures one represented key per candidate column;
+only the final Frontend-accepted prefix is merged into the request's mean-K. Batched rows never
+share a logical frontier. RNG and RoPE use logical positions independently of compact KV addresses.
+Restoring a checkpoint rebuilds the final MTP row with the new suffix token, because exact prefix
+identity alone does not prove the next-token embedding used by that row. The rebuilt row becomes
+durable before a later query rewind can restore the same boundary.
+
+`MemorySummary::kvmem` reports current payload, mean-statistics, checkpoint-image and transfer-staging bytes
+separately. Engine copies these host-only gauges into its ordinary published runtime snapshot,
+so service status polling acquires no execution lock and performs no device queries. History
+transfer counts follow the live/retained histories; they are not process-lifetime counters.
+Directory hit/miss/eviction counts are monotonic. Active Host reservation bytes are reported
+separately from materialized payload bytes. Native page/state accounting remains in the resource manager.
+
+Ngram copy proposals are available with fixed or adaptive MTP on 1..8 active text or
+resident/CPU Vision requests across all nine admitted KV profiles. They index the committed
+logical token ledger, never compact slots or rejected drafts. Candidate storage covers
+max(neural, ngram)+1 verification columns, and R must fit max(neural, ngram)+neural native
+append rows. Both neural and copy graph families use B+R attention capacity while retaining
+logical RoPE and RNG positions. Only the final Frontend-accepted prefix contributes persistent
+mean-K statistics. Valid ngram widths 16..63 are capped to 15 at startup for C2..8 because the
+native concurrent GDN workspace has 16 verification columns. C1 preserves the requested width.
+Representative image/copy/concurrency qualification is linked from the parent
+[capability reference](../../../../docs/multi-backend.md). The earlier K8V4 CPU-image/C1/adaptive15/
+ngram63 cold/restored newline difference remains unresolved; admission does not claim that
+observation is fixed.
+
+Resident or CPU vision supports 1..8 active requests. CPU image encoding remains serialized. Complete image pages are mandatory alongside
+the sink and append tail; admission rejects images that cannot fit B. Prefix identity includes
+media content, token types and all MRoPE axes. Query replay rewinds use of the retained encoded
+payload (CPU replay joins an outstanding encoder and re-encodes retained media), and MTP
+boundary rebuilding consumes the same multimodal bridge. Host staging includes the shifted
+MTP column even when Main has zero visual columns. Video and overlay vision remain outside
+the supported KVMem combinations.
+
+Paired Engine `disk_path`/`disk_bytes` (or serving `--kvmem-disk-path`/`--kvmem-disk-mib`)
+enable the common ephemeral SSD tier. H bounds native RAM records, D bounds native cold
+records plus idle checkpoint attachments. Active and retained histories move the same record
+owners. Main/MTP planes and scales remain native; active mean/query statistics stay in RAM.
+Admission reserves transition headroom for every lane. Queue jobs own only CPU data; Program
+publishes completed bytes at its existing engine boundary. Disk-waiting and cancelling lanes
+yield while peers run. A failed physical write retains its RAM source and surfaces a
+request-local storage error; optional history restoration can replay the quoted prefix.
+Pinned state images remain engine-owned, including while an idle writer borrows their bytes.
+These files are not imported across process starts. The replaced KVMem snapshot serializer is
+removed; the independent native non-KVMem prefix-cache disk implementation remains intact.
+Windows and WSL library evidence, GPU scope and pending performance gates are tracked in the
+parent [active tiering plan](../../../../docs/active-kv-tiering-plan.md).
+
+
+The parameter-extension qualification used 12 configurations and three native diagnostic
+launches (18 model launches total, including three qualification retries) on RTX 5060 Ti
+with the IQ3S artifact. Fixed MTP5/15, adaptive eager/Graph,
+RK8V4 C2/C4 and resident images, INT8/RK8V4 fast text prefill, and CPU Vision ordinary/MTP15
+passed. CPU query replay joins a prefetched worker before dropping its old cursor association,
+then re-encodes retained query payloads through the existing host bridge. An inherited zero-Main,
+one-shifted-MTP Host staging defect was reproduced in native mode and fixed with user approval;
+the aligned native boundary and remaining KVMem CPU/MTP query cases passed. CPU/MTP admission
+overflow was not rerun; it is covered by CPU ordinary in this campaign. Overlay remains rejected.
+That historical qualification used the then-enabled text/C1/profile-off cold-snapshot contract;
+those historical persistent snapshot entry points do not describe the current ephemeral tier.
+See the parent [qualification report](../../../../docs/parameter-admission-validation-20261004.md).
+
+The fast-prompt admission extension changes only Engine/serving/launcher gates.
+The existing INT8-family prompt kernels support all five key/value profiles above;
+BF16/FP8/NVFP4/K8V4 do not select that fast kernel. `ninfer_p1_sparse <format> fast`
+requires the actual prompt/fast route before comparing T65/127/128/129 sparse and
+page-boundary outputs to the maintained independent oracle. Real-model image,
+MTP/ngram, restoration and cancellation evidence is in the
+[fast-prefill report](../../../../docs/fast-prefill-admission-validation-20261006.md).

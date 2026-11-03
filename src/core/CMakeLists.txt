@@ -1,5 +1,7 @@
 add_library(ninfer_core STATIC
   arena.cu
+  resident_memory.cpp
+  resident_scan.cu
   device.cu
   device_launch.cpp
   peer_preflight.cpp
@@ -38,6 +40,7 @@ add_library(ninfer_core STATIC
   device_snapshot.cu
 )
 ninfer_internal_includes(ninfer_core)
+target_compile_definitions(ninfer_core PRIVATE NINFER_RESIDENT_MEMORY=1)
 # The architectures this build carries, for the message that refuses a device it cannot run. A
 # list's semicolons would split the property into several definitions.
 string(REPLACE ";" " " _ninfer_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
@@ -53,6 +56,9 @@ if(MSVC)
 endif()
 # gpu_clock_floor.cpp loads NVML at run time.
 target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
+if(WIN32)
+  target_link_libraries(ninfer_core PUBLIC pdh dxgi)
+endif()
 if(WIN32 AND NINFER_DIRECTSTORAGE)
   target_link_libraries(ninfer_core PUBLIC ninfer_directstorage)
 endif()

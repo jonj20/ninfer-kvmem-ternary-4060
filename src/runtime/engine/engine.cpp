@@ -202,6 +202,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.speculative_drafting    = options.execution.speculative_drafting;
     resolved.stop                            = std::move(options.stop);
     resolved.output                            = options.output;
+    resolved.tool_choice                       = std::move(options.tool_choice);
     resolved.ngram_session                      = std::move(options.ngram_session);
     return resolved;
 }
@@ -209,6 +210,23 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
     return "prepared prompt has " + std::to_string(prompt_tokens) +
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
+}
+
+CudaResidencySummary residency_summary(const runtime::ModelInstance& instance) {
+    if (!instance.residency) { return {}; }
+    // stats() reads the session's cached snapshot. HTTP threads never enter CUDA or PDH.
+    const auto stats = instance.residency->stats();
+    return {.enabled = true,
+            .verified = stats.verified,
+            .cuda_free_bytes = stats.cuda_free_bytes,
+            .cuda_total_bytes = stats.cuda_total_bytes,
+            .dedicated_bytes = stats.dedicated_bytes,
+            .shared_bytes = stats.shared_bytes,
+            .shared_baseline_bytes = stats.shared_baseline_bytes,
+            .device_allocated_bytes = stats.device_allocated_bytes,
+            .host_pool_bytes = stats.host_pool_bytes,
+            .host_used_bytes = stats.host_used_bytes,
+            .verified_reserve_bytes = stats.verified_reserve_bytes};
 }
 
 } // namespace
@@ -397,6 +415,12 @@ public:
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
+            if (options.kvmem.selected_tokens != 0) {
+                throw std::invalid_argument("KVMem is not supported for gemma4");
+            }
+            if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+                throw std::invalid_argument("mixed/strict CUDA memory is not supported for gemma4");
+            }
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -436,6 +460,12 @@ public:
             return;
         }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+            if (options.kvmem.selected_tokens != 0) {
+                throw std::invalid_argument("KVMem is not supported for qwen4_exp");
+            }
+            if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+                throw std::invalid_argument("mixed/strict CUDA memory is not supported for qwen4_exp");
+            }
             auto constructed    = runtime::construct_qwen4_exp(options, device);
             flash               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -504,6 +534,7 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        core::ResidentMemoryBinding resident_binding(active ? active->residency : nullptr);
         const bool persists = persists_prefix_cache();
         stop();
         // Joins the generation core's orderly stop, which saves the Host tier before dropping it.
@@ -513,6 +544,7 @@ public:
             device.synchronize();
         } catch (...) {}
         if (persists) { report_prefix_cache_save(); }
+        active.reset();
     }
 
     void stop() noexcept {
@@ -1132,7 +1164,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    MemorySummary summary = std::visit(
         [](const auto& core) -> MemorySummary {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -1142,6 +1174,8 @@ MemorySummary Engine::memory_summary() const {
             }
         },
         impl_->core);
+    if (impl_->active) { summary.cuda_residency = residency_summary(*impl_->active); }
+    return summary;
 }
 
 SlotSaveResult Engine::save_slot(std::uint32_t slot, const std::string& path,
@@ -1216,7 +1250,7 @@ MediaCacheSummary Engine::media_cache_summary() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    RuntimeStats summary = std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -1226,6 +1260,8 @@ RuntimeStats Engine::runtime_stats() const {
             }
         },
         impl_->core);
+    if (impl_->active) { summary.cuda_residency = residency_summary(*impl_->active); }
+    return summary;
 }
 
 bool Engine::is_available() const {

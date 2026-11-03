@@ -224,6 +224,7 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
         return 4;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
         return 2;
+    case Bf16GdnGatingScheduleId::SimtGeneral:
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
@@ -265,6 +266,9 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem,
                         std::int32_t sm_count) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
+    if (schedule == Bf16GdnGatingScheduleId::SimtGeneral)
+        return !is_27(problem) && !is_35(problem);
+    if (!is_27(problem) && !is_35(problem)) return false;
     if (is_27(problem)) {
         switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
@@ -345,6 +349,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     };
 
     switch (plan.schedule) {
+    case Bf16GdnGatingScheduleId::SimtGeneral:
+        bf16_gdn_gating_proj_general_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta, execution.stream);
+        return;
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                          execution.stream);
@@ -430,6 +437,8 @@ std::size_t plan_capacity(const Bf16GdnGatingProblem& base, std::int32_t min_col
 
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
+    case Bf16GdnGatingScheduleId::SimtGeneral:
+        return "gdn_gating_proj.bf16.simt.general";
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         return "gdn_gating_proj.bf16.gemv.paired_rows";
     case Bf16GdnGatingScheduleId::SmallTSplit10:
@@ -468,7 +477,8 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return problem.heads > 0 && problem.heads % 16 == 0 &&
+           problem.input_rows > 0 && problem.input_rows % 128 == 0;
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -525,6 +535,8 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
+    if (!is_27(problem) && !is_35(problem))
+        return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::SimtGeneral, problem, sm_count);
     return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count)
                           : resolve_from_routes(k35Routes, problem, sm_count);
 }

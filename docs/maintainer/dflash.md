@@ -80,6 +80,17 @@ observable BF16 cast between projection and head normalization. This complete co
 exceeds the local ring capacity, only its final live window needs storage; the context frontier
 still advances by the complete chunk.
 
+With KVMem, DFlash2's cyclic cache retains logical positions even when the target's paged KV
+window is compacted. Target verification uses compact cache positions and logical RoPE positions;
+draft conditioning, proposal positions and cyclic slot addressing remain logical. CUDA Graph
+attention envelopes therefore bound the logical capacity, independently of the ring capacity and
+the target's compact graph profiles.
+
+A KVMem reselection retains a continuous recent suffix. Each DFlash2 row carries the lower bound
+of that suffix to local attention; older ring entries are masked. Checkpoint restoration publishes
+the restored conditioning frontier and suffix bound. Decode prepares the complete verification
+width before binding the target window, including rounds that fill the generation reserve.
+
 ## Query block and attention masks
 
 The draft input is the target embedding of:

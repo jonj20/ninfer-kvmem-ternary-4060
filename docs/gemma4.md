@@ -400,10 +400,10 @@ grammar here. The mask of its next token is computed on a thread of its own from
 after the last accepted token, while the GPU runs the decode step that produces the token's
 logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
 sampled once the mask is ready, while the other requests go on. With `--spec mtp` such a request
-also drafts while its masks take at most 4 ms: a speculative round fills one mask per draft
-position in parallel while the verification runs. A request whose masks cost more decodes without
-drafts, its next mask starting as soon as a token is accepted, and drafts again once they are
-cheap. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
+also drafts when the usual context, output-budget and assistant-state checks allow it: a speculative
+round fills one mask per draft position in parallel while the verification runs. Mask duration
+does not disable drafts; slow masks can extend the speculative round's sampling wait.
+A single mask over 5 s, or a grammar with no admissible token, fails the request with an
 explicit error.
 
 String length bounds (`minLength`, `maxLength`) compile to a counted repetition whose masks do

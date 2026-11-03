@@ -5,6 +5,7 @@
 
 #include "ninfer/engine.h"
 #include "serve/branch_memo.h"
+#include <nlohmann/json.hpp>
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -120,6 +121,7 @@ struct HeldBranches {
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::function<void(const nlohmann::json&)> monitor_update;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;

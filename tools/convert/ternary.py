@@ -157,7 +157,10 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if info.shape != shape or info.type_name != kind:
+        # Both Prism encodings decode to the same explicit ternary rows. Their
+        # different block widths are validated and decoded by GGUFFile.
+        type_matches = info.type_name in ("PQ2_0", "PTQ1_0") if kind == "PQ2_0" else info.type_name == kind
+        if info.shape != shape or not type_matches:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
@@ -437,7 +440,35 @@ def bonsai2_27b_ternary(model, recipe, sources):
             )
 
 
-RECIPES = {"bonsai2_27b_ternary": bonsai2_27b_ternary}
+def bonsai2_27b_ternary_gguf_mtp(model, recipe, sources):
+    """Ternary text plus byte-preserving GGUF MTP from --source gguf=PATH.
+
+    The MTP GGUF uses the dense exporter's +1-stored norms, as the Bonsai r3
+    exports do. The regular companion still supplies the model's MTP geometry.
+    """
+    from .gguf_blocks import mtp_sources, _group_same_format
+
+    if "mtp" not in model.components:
+        raise ValueError("the GGUF MTP recipe requires --components text,mtp")
+    bonsai2_27b_ternary(model, recipe, sources)
+    from .dense_geometry import DenseGeometry
+    encoded, direct = mtp_sources(sources["gguf"], DenseGeometry.from_config(model.config))
+    formats = {}
+    for name, source in encoded.items():
+        formats[name] = source.read_encoded(0, 1).format
+        recipe.assign(name, format=formats[name], method=import_encoded,
+                      source=source, activation_policy="AllowA8")
+    for name, source in direct.items():
+        recipe.assign(name, format=model.parameters[name].direct_format,
+                      method=cast_direct, source=source)
+    p = "mtp/layers/0/"
+    _group_same_format(recipe, [p + "attention/" + role
+                               for role in ("query", "key", "gate", "value")], formats)
+    _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
+
+
+RECIPES = {"bonsai2_27b_ternary": bonsai2_27b_ternary,
+           "bonsai2_27b_ternary_gguf_mtp": bonsai2_27b_ternary_gguf_mtp}
 
 __all__ = [
     "EXPECTED_HEADER",

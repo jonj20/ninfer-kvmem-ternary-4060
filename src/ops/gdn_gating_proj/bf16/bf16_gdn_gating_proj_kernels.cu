@@ -683,4 +683,46 @@ std::int32_t bf16_gdn_gating_proj_mma_resident_ctas_per_sm(bool geometry35,
     }
 }
 
+
+namespace {
+// One warp computes both FP32 control reductions for a (token, value-head) pair.
+__global__ void gdn_control_general(const __nv_bfloat16* x, const __nv_bfloat16* a,
+    const __nv_bfloat16* b, const float* alog, const float* bias, float* g, float* beta,
+    int hidden, int heads, int tokens) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x) * 8 + threadIdx.x / 32;
+    if (row >= static_cast<std::int64_t>(heads) * tokens) return;
+    const int lane = threadIdx.x % 32, head = row % heads;
+    const auto input = x + (row / heads) * hidden;
+    const auto wa = a + static_cast<std::int64_t>(head) * hidden;
+    const auto wb = b + static_cast<std::int64_t>(head) * hidden;
+    float sum_a = 0, sum_b = 0;
+    for (int k = lane; k < hidden; k += 32) {
+        const float value = __bfloat162float(input[k]);
+        sum_a = fmaf(value, __bfloat162float(wa[k]), sum_a);
+        sum_b = fmaf(value, __bfloat162float(wb[k]), sum_b);
+    }
+    for (int delta = 16; delta; delta /= 2) {
+        sum_a += __shfl_down_sync(0xffffffff, sum_a, delta);
+        sum_b += __shfl_down_sync(0xffffffff, sum_b, delta);
+    }
+    if (lane == 0) {
+        g[row] = -expf(alog[head]) * softplus(sum_a + bias[head]);
+        beta[row] = sigmoid(sum_b);
+    }
+}
+} // namespace
+
+void bf16_gdn_gating_proj_general_launch(const Tensor& x, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& alog, const Tensor& bias,
+    Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const auto blocks = (static_cast<std::int64_t>(g.ne[0]) * x.ne[1] + 7) / 8;
+    if (blocks > 2147483647) throw std::invalid_argument("GDN control grid exceeds CUDA limit");
+    gdn_control_general<<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(alog.data),
+        static_cast<const float*>(bias.data), static_cast<float*>(g.data), static_cast<float*>(beta.data),
+        x.ne[0], g.ne[0], x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

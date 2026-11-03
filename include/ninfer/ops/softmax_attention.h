@@ -153,7 +153,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 /**
  * Append K/V for B independent rows and compute causal grouped-query attention.
  *
- * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
+ * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6), [256,16,2] (group 8),
+ * [256,8,2] and [256,16,4] (group 4), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
  * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is

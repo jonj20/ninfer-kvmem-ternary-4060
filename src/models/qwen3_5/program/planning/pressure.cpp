@@ -2658,6 +2658,21 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
     return fits(base.impl_->root_demand.physical_peak_additional, capacity) &&
            fits(base.impl_->root_demand.final_added, capacity);
 }
+bool ProgramImpl::temporary_request_feasible(const RequestBasePlan& base) const noexcept {
+    if (!base.impl_) return false;
+    if (!kvmem_window_tokens) return true;
+    std::uint64_t available = memory_retained_budget;
+    if (memory_idle_transfer) {
+        const auto pending = memory_idle_transfer->work->destination.size();
+        if (pending > available) return false;
+        available -= pending;
+    }
+    for (const auto& request : requests) {
+        if (request.memory_payload_reservation > available) return false;
+        available -= request.memory_payload_reservation;
+    }
+    return base.impl_->memory_payload_reservation <= available;
+}
 
 bool ProgramImpl::persistent_backfill_safe(
     const RequestBasePlan& blocked_head, const AdmissionCandidate& candidate,

@@ -85,6 +85,12 @@ flowchart LR
 
 ---
 
+CPU Vision 的 Host 权重驻留由 Qwen Model 拥有：启动只验证绑定和格式，实际编码的 CPU worker
+取得不可变权重读租约时才读取并解码；多个编码器共享一次加载。最后一个租约释放后开始空闲计时，
+独立的 Host 回收线程在超时后释放权重，即使没有后续请求也会运行。该线程不调用 CUDA、不修改
+Program 或请求状态；活动租约阻止卸载，失败加载不发布部分权重。模型卸载停止并等待回收线程，
+已有租约独立拥有不可变数据直到最后一个读者释放。编码结果只保留 embedding，不继续持有权重。
+
 ## 2. 四个执行边界
 
 请求路径只有四层：
@@ -599,7 +605,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域；
-- 多 GPU 时（`--devices A,B,...`，Linux）模型按层切成 pipeline stage，每个 stage 整层拥有自己的权重、
+- 多 GPU 时（`--devices A,B,...`，Linux 或本分支原生 Windows）模型按层切成 pipeline stage，每个 stage 整层拥有自己的权重、
   KV plane、GDN state、replay records 和 workspace，位于各自设备上；仍然是一个 Program、一个 KV page
   allocator（每个 plane 绑定一个 rank）、一个 Scheduler 和一个 commit 序列。embedding、head、round state、
   sampling 和 MTP 留在 rank 0，residual 经 `StageLink` 逐 stage 传递并由最后一个 stage 送回。KV 容量取各设备
@@ -722,12 +728,13 @@ captures D2H draft transfer and a host function that starts the lanes' jobs from
 verification, then a host function that collects the jobs and the H2D mask transfer before the
 acceptance. Host functions call no CUDA API; they capture exceptions for rethrow after stream
 synchronization and before any token can be published. All node addresses belong to Program and
-outlive graph replay. A structured lane whose last masks took over 4 ms verifies no drafts (its
-extent is zero) until they are cheap again. Its next mask then computes ahead: the Engine asks
-`Program::structured_readiness` for every decode-ready lane before a round, which starts the
-lane's job at its committed ledger frontier and leaves the lane out of rounds until the job is
-ready; the round adopts the finished job instead of starting one. A job that fails, or runs over
-5 s, ends that request with an explicit error.
+outlive graph replay. Mask duration never clips the speculative extent. Draft availability,
+the configured speculative policy, output budget and context capacity still bound it. Slow masks
+can hold the speculative round at sampling. For ordinary decoding, the Engine asks
+`Program::structured_readiness` for every decode-ready lane before a round; its job starts at
+the committed ledger frontier, and the lane sits out rounds until that job is ready. The ordinary
+round adopts the finished job. A failed or over-budget ordinary readiness job ends its request
+with an explicit error.
 
 Draft frames are compact at each round's actual proposal width, which may be narrower than the
 maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar

@@ -34,6 +34,8 @@ std::optional<std::string> parse_graft_field(const RequestJson& body);
 // not think. Anthropic Messages carries the same cap as `thinking.budget_tokens`.
 std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body);
 
+void parse_tool_constraints(const RequestJson& body, GenerationRequest& request);
+
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 
 // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,

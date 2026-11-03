@@ -22,6 +22,9 @@ struct CausalAttentionGeometry {
     static constexpr int SmallTMaximumSplits = 85 * SmallTSplitScale;
 };
 
+using CausalD256H8Kv2 = CausalAttentionGeometry<4, 2, 2>;
+using CausalD256H16Kv4 = CausalAttentionGeometry<4, 4, 1>;
+
 using CausalD256H24Kv4 = CausalAttentionGeometry<6, 4, 1>;
 using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
 
@@ -31,7 +34,8 @@ using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
     if (kv_heads <= 0 || query_heads % kv_heads != 0) { return false; }
     const std::int32_t group = query_heads / kv_heads;
     return (group == CausalD256H24Kv4::GroupSize && kv_heads <= CausalD256H24Kv4::ModelKVHeads) ||
-           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads);
+           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads) ||
+           (group == 4 && kv_heads <= 4);
 }
 
 // Calls `f.template operator()<Geometry>()` with the geometry of `query_heads` over `kv_heads`.
@@ -43,6 +47,10 @@ decltype(auto) with_causal_geometry(std::int32_t query_heads, std::int32_t kv_he
     }
     if (query_heads / kv_heads == CausalD256H24Kv4::GroupSize) {
         return f.template operator()<CausalD256H24Kv4>();
+    }
+    if (query_heads / kv_heads == 4) {
+        if (kv_heads <= 2) return f.template operator()<CausalD256H8Kv2>();
+        return f.template operator()<CausalD256H16Kv4>();
     }
     return f.template operator()<CausalD256H16Kv2>();
 }

@@ -217,20 +217,8 @@ std::optional<GenerationRequest> drop_unavailable_constraints(const GenerationRe
         dropped.emplace(request);
         dropped->structured_output = {};
     }
-    const bool strict_tools =
-        request.uses_tools() && std::any_of(request.tools.begin(), request.tools.end(),
-                                            [](const ToolDefinition& tool) { return tool.strict; });
-    if (strict_tools) {
-        if (!request.strict_tools_advisory && !unconstrained_response_format) {
-            throw ApiException(ApiError{
-                .message =
-                    "strict tool arguments require the server to start with --structured-output",
-                .param = "tools",
-                .code  = "strict_tools_not_supported"});
-        }
-        if (!dropped) { dropped.emplace(request); }
-        for (ToolDefinition& tool : dropped->tools) { tool.strict = false; }
-    }
+    // Native tool constraints always have mask storage in this integration. The server flag
+    // gates final response formats only; strict tool intent must never be silently dropped.
     return dropped;
 }
 } // namespace ninfer::serve

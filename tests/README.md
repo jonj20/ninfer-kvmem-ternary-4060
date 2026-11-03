@@ -22,6 +22,12 @@ benchmark-report, and external protocol behavior. Repository verification princi
   consumer.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
+The standalone `ninfer_memory_frontend --tool-output-only` checks explicit basic tool publication,
+default auto parsing without a grammar, default none text-only publication, none with JSON,
+continuation/truncation and unconstrained quoted-marker handling.
+`ninfer_tool_constraints_test` covers grammar selection, strict codecs, non-strict normalization
+and protocol translation. `ninfer_tool_call_parser_test` retains the supported free-generation
+decoder checks used by `tool_constraints:"auto"` when no explicit constraint requires the grammar.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
 and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
 executables and CTest working directories under `build/tests/`.
@@ -409,6 +415,155 @@ boundary preservation. `--concurrency 8 --draft-tokens 15 --modes dflash2` exerc
 the largest draft and batch dimensions. A separate DFlash-capable artifact can use `--modes dflash`.
 The server is terminated on success or failure. An occupied test port causes the test to stop.
 
+
+The old/new Qwen3.8 binding matrix uses `out/qwen3_8_27b_old.ninfer` and
+`out/qwen3_8_27b_nvfp4_old.ninfer` for the legacy inventories, and the canonical filenames above
+for the companion artifacts. The legacy paths may be overridden with
+`NINFER_QWEN3_8_27B_OLD_WEIGHTS` and `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`.
+
+## KVMem canonical-input fallback
+
+`ninfer_p4_history` accepts the `input-fallback` mode with the usual artifact,
+KV format, execution mode, output file and MTP width arguments:
+
+```powershell
+./build/tests/ninfer_p4_history.exe C:/models/model.ninfer rk8v4 graph C:/work/fallback.tokens 4 input-fallback
+```
+
+The fixture exceeds the physical window, crosses a controlled thinking-close
+boundary, then discards generated answers and appends synthetic tool records.
+It checks input-prefix reuse on successive turns, repeated input and cancellation
+recovery, with exact native transfers and bounded Host/device occupancy. Width 0
+checks ordinary generation; width 4 also enables ngram proposals.
+
+The generic history fixture also cancels during prefill and retries. Cancellation may retain an
+earlier complete LCP checkpoint: reuse must not exceed the completed input frontier, and the
+transfer verifier must confirm its prefix identity and native KV/GDN state. Zero reuse is not
+required. Mode `stochastic` uses temperature 0.7 and seed 42 for restored/recovered MTP sampling
+after physical KV compaction; it exercises logical sampling positions independently of cache slots.
+
+The old `input-fallback-disk-*` modes are retired: KVMem SSD records are
+process-local and are not imported after restart. These mode names now fail
+before model loading instead of asserting obsolete persistent-snapshot behavior.
+
+## KVMem process-local SSD lifecycle
+
+Build `ninfer_memory_disk`, then run the parent repository's two-process runner:
+
+```powershell
+python tests/ninfer_memory_disk.py --binary build/tests/ninfer_memory_disk.exe --model C:/models/model-mtp.ninfer --output-dir C:/work/ssd-lifecycle --drafts 4 --kv int8 --execution graph
+```
+
+Paths in this command are relative to the parent KVMem repository. The executable
+also accepts `artifact drafts kv-format cache-dir eager|graph [ngram-width] [fixed|adaptive]`
+for one process. The obsolete `cold`/`hit` CLI and duplicate `ninfer_memory_disk_final`
+target are removed. Each run sizes H from the artifact's native KV records, then
+requires live SSD reads and writes; an entirely RAM-resident run cannot pass.
+Native transfer verification checks KV/state bytes. The fixture checks cold start,
+same-process reuse, cancellation recovery, explicit clear, H/D limits, active
+resource release and spill-file cleanup. The runner starts two separate processes
+in the same directory: both must begin with zero imported history. Unrelated files
+must survive unchanged. Logs from both processes remain in the output directory.
+
+This is lifecycle coverage, not a model-answer-quality or performance benchmark.
+`ninfer_active_kv_ssd` retains the RAM/SSD token comparison; `ninfer_ssd_failure`
+and the common storage tests cover actual I/O failures. Persistent snapshot
+corruption and format-mismatch restart assertions no longer apply to KVMem.
+
+## KVMem NVFP4 integration
+
+The source accepts `nvfp4` with KVMem and fixed MTP1..4. On 2026-10-04 the focused
+codec, Attention, page payload, options and MTP graph-profile tests passed on the
+RTX 5050 Laptop. Sparse/reordered/cross-page cases passed for eager and graph.
+Bonsai ordinary, MTP1 eager and MTP4 CUDA Graph execution also passed at B128/R128,
+including Host restoration/reuse, 129-token reserve crossing, output limits 1..5
+and HTTP cancellation/recovery. MTP used the existing D3D12/WDDM build/runtime option,
+FP16 GDN and disabled ngram; the default CUDA budget rejected the Q8 MTP load.
+On the same date, RTX 5060 Ti / IQ3S completed 229 numerical, functional, quality
+and fault-injection cases: ordinary/MTP1..4 eager/Graph, retained sessions, C2/C4
+text, resident vision, cold snapshots and 8K/32K/64K/128K NVFP4 retrieval. Three
+independent B32768/R16384 MTP4 Graph service starts and long-input HTTP reuse,
+output limits and cancellation also passed under the default CUDA policy. Exact
+commands, failed attempts and test corrections are in the local integration
+[qualification report](../../../docs/nvfp4-kvmem-validation-20261004.md).
+This qualifies the tested source/build/model combination, not an existing package.
+Use an explicit text+MTP artifact and a free GPU selected by UUID. Functional
+tests can use either local card; performance comparisons use the RTX 5060 Ti.
+Keep ngram and lookup-ngram disabled for this qualification.
+
+`ninfer_attention_page_mass` also qualifies the NVFP4 page-feedback specialization
+against a dense FP64 oracle from public BF16 Q and independently decoded stored K.
+Its G16 scales vary across groups, heads and tokens, including zero, subnormals and
+the largest finite positive E4M3 scale. Cases cover 64 sampled rows, both 24/4 and
+8/2 query/KV head layouts, reordered pages, partial/hidden page tails, and a
+577-page single-query context. Pair decoding and shared scales retain FP32
+accumulation; numerical agreement is required, not bitwise agreement with the
+previous reduction order. The other eight KV formats remain in the same oracle.
+
+Build the affected targets with eight jobs. The existing
+`ninfer_p1_options`, serve-options and Windows launcher tests cover NVFP4
+ordinary/MTP1..4, 1..4 text lanes, resident vision, cold snapshots and rejected
+combinations. `ninfer_p1_payload` adds an independent four-layer Main/MTP byte
+layout in both device plane orders; `ninfer_p1_sparse nvfp4` checks fragmented,
+reordered compact mappings against FP64 attention over independently decoded
+stored codes/scales, including widths 1..5, 13, 53 and 63..65 in eager/graph execution.
+NVFP4 future unwritten K/V scales contain NaNs, so the 90 cases also check that
+masked tile tails cannot contaminate valid outputs.
+The 8K quality fixture checks same-seed token equality separately for cold
+prefill and cached short-suffix execution, then changes the seed on the cached
+route. Cold-versus-cached equality is reported, not required: IQ3S INT8 MTP4
+produces two different but individually repeatable sampled outputs. Native
+payload/state transfers and greedy access-code recovery remain exact checks;
+numerical route changes do not promise identical stochastic token choices.
+`ninfer_kvmem_nvfp4_tests` bundles the native append, Attention, MTP graph-profile
+and serve-options tests for focused runs. Pass each program name to this executable;
+the codec and Attention programs accept `--nvfp4-only`.
+
+Real-model fixture commands below show parameter syntax; the report records
+the executed paths, commands and outcomes:
+
+```powershell
+# Repeat fixed drafts 0..4 and both execution modes; the last argument keeps ngram off.
+./build/tests/ninfer_p4_history.exe C:/models/model-mtp.ninfer nvfp4 graph C:/work/history.tokens 4 input-fallback 0
+# Optional final "wddm" uses the existing NINFER_D3D12_RESIDENCY build capability.
+./build/tests/ninfer_p4_history.exe C:/models/model-mtp.ninfer nvfp4 eager C:/work/history.tokens 1 input-fallback 0 wddm
+./build/tests/ninfer_memory_sessions.exe C:/models/model-mtp.ninfer 4 nvfp4 eager
+# RAM admission boundary: artifact drafts KV execution concurrency (1 or 2).
+./build/tests/ninfer_memory_ram_budget.exe C:/models/model-mtp.ninfer 4 int8 graph 2
+./build/tests/ninfer_memory_concurrency.exe C:/models/model-mtp.ninfer 4 4 512 nvfp4 graph
+./build/tests/ninfer_memory_concurrency.exe C:/models/model-mtp.ninfer 4 2 52 nvfp4 eager
+# Eight mixed text/image requests: independent archives, colors, cancellation, reuse and image replacement.
+./build/tests/ninfer_memory_concurrency.exe C:/models/model-vision-mtp.ninfer 3 8 1024 int8 graph adaptive C:/work/red.png C:/work/blue.png cpu 1024
+./build/tests/ninfer_memory_disk.exe C:/models/model-mtp.ninfer 4 nvfp4 C:/work/nvfp4-disk graph 0 fixed
+# Requires an artifact with resident vision and the existing red/blue image fixtures.
+./build/tests/ninfer_memory_vision.exe C:/models/model-vision-mtp.ninfer 4 kvmem C:/work/red.png C:/work/blue.png nvfp4 graph
+```
+
+History covers repeated requests, edits, cancellation, endpoint/input-fallback
+rewinds and output truncation. Sessions scale their existing INT8 Host-pressure
+quota by native payload size; concurrency keeps an explicit actual MiB quota and
+uses a format-adjusted pressure threshold. For the IQ3S fixture, 96 MiB queues
+the INT8 requests, while NVFP4 needs 52 MiB to keep the same pressure: 96 MiB can
+admit two NVFP4 requests. Check native Main/MTP payload and GDN
+state equality with `verify_transfers`, committed mean-K/frontiers, no active page
+leaks and bounded Host usage. `ninfer_memory_ram_budget` sizes H from the artifact's
+native page reservation and exactly fills it with one or two active requests. It
+checks output limits around a 64-token page boundary, compares greedy output with
+the same execution under a roomy budget, verifies native transfers, and reuses the
+Engine after each batch to detect failures or leaked reservations. In particular,
+MTP must not allocate Host pages for speculative positions beyond the output limit.
+The same regression includes 129/257-token concurrent outputs and MTP prefill tails
+that require an extra worker step. Both must finish within the admitted service
+projection. `ninfer_prefill_service_work_test` independently enumerates prefill
+steps across chunk, reuse, capture, reserve and initial-proposal boundaries.
+The historical cold-snapshot qualification included
+cancellation, explicit clear, corruption/truncation and format-mismatch restart.
+Those persistence checks are superseded by the process-local SSD lifecycle above;
+the historical reports remain evidence for their original versions. Capacity was
+separately verified with IQ3S MTP4 at 32K/16K on the 5060 Ti; Bonsai without MTP
+was verified at 20K/10K on the 5050. Bonsai Q8 MTP under the default CUDA budget
+does not fit that 8GB card, so the low-memory WDDM passes are recorded separately.
+
 ## Container build cache
 
 Check the Dockerfile's incremental-build and configuration-invalidation behavior without compiling
@@ -525,3 +680,147 @@ The physical selection disables device-profile calibration (`device_profile=off`
 correctness gate. It does not qualify device-profile performance. The runner must record distinct
 GPU UUIDs for CUDA devices 0 and 1. A `0,0` result does not qualify two physical GPUs. On `sm_75`,
 use the pinned groupwise Qwen3.6 artifact; NVFP4 expert banks are not supported.
+## KVMem K8V4 compact qualification
+
+K8V4 reuses native FP8 K / NVFP4 V CUDA kernels. The independent payload oracle
+checks three Main layers plus one MTP layer in both page orders, including the
+FP16 row K scale and raw E4M3 group V scales. Sparse Attention uses FP8-quantized
+rotated Q, represented K/V cast boundaries and inverse Hadamard; future K FP16
+and V E4M3 scales are poisoned with NaNs under causal/tile masks.
+
+The existing focused bundle supports `ninfer_kv_cache_append_test --k8v4-only`
+and `ninfer_softmax_attention_test --k8v4-only`; use `ninfer_p1_sparse k8v4` for
+fragmented/reordered pages, widths 1..5, 13, 53, 63..65 and eager/Graph masking.
+The options and Windows launcher checks cover ordinary/MTP1..4, lane budgets,
+vision/cold settings and rejected combinations for both NVFP4 and K8V4.
+
+The 2026-10-04 real IQ3S/5060 Ti qualification deliberately uses 26 processes:
+12 history, sessions, C4 normal/pressure, resident vision, five cold-disk runs
+(including an NVFP4 mismatch seed), two fallback cold runs, 8K/32K quality and
+one 32K/16K MTP4 Graph serving start. All ngram/lookup paths are disabled. Each
+process can issue several requests; foundational numerical cases are counted
+separately and no unrelated suite is repeated. Commands, scope and timings are
+in the [report](../../../docs/k8v4-kvmem-validation-20261004.md).
+
+
+## KVMem parameter-extension qualification
+
+The 2026-10-04 follow-up reused the existing fixtures with 12 configurations, three native
+diagnostic launches and 18 model launches total, retaining all four failed attempts.
+`ninfer_p4_history` accepts a final `adaptive` or
+`fast` argument in its existing feature slot. `ninfer_memory_concurrency` accepts optional
+`fast`; `ninfer_memory_vision` accepts `resident|cpu`, then optional `query-only|native-boundary`.
+The query slice checks replay, repeated reuse, multiple query images, cancellation and recovery;
+the boundary slice checks one native request whose first visual column starts at the unit boundary.
+The focused Attention bundle
+supports `--rk8v4-only`; `NINFER_PROMPT_FAST=1` qualifies its existing fast prompt route
+against the independent represented-input oracle. `--int8-prompt-only` covers both routes.
+
+The chat endpoint fixture honors model stop tokens and compares reuse with the actual
+generated prefix, allowing its bounded template closure. Forcing a visible assistant response
+past EOS into new role tokens does not create a reconstructible chat prefix. Other history
+checks retain their exact output-budget assertions. Details and supported bounds are in the
+parent [report](../../../docs/parameter-admission-validation-20261004.md).
+
+## KVMem adaptive-combination follow-up
+
+The focused follow-up uses ten model processes on IQ3S/RTX 5060 Ti, reusing
+existing numerical evidence. The final feature slot in `ninfer_p4_history` and
+`ninfer_memory_concurrency` accepts `adaptive-fast`; concurrency also accepts
+`adaptive`. The ngram fixture accepts a final `adaptive` after its MTP draft
+width. Vision accepts `adaptive` after `resident|cpu` and `query-only`;
+disk accepts it after `ngram-width short|long eager|graph`.
+Each fixture checks the adaptive observation and records its window histogram;
+existing reuse, isolation, exact ngram greedy comparisons, cancellation,
+resource retirement and transfer assertions remain active. Disk cold and hit
+are separate processes sharing one dedicated directory. Fast prefill remains
+INT8/RK8V4 text-only without cold disk. Ngram supports one text or INT8/NVFP4 resident/CPU Vision lane, max63;
+That follow-up qualified one resident/CPU image lane; cold snapshots require profile off.
+The new bounds and measured configurations are recorded in the parent
+[report](../../../docs/adaptive-combinations-validation-20261005.md).
+
+## KVMem images with ngram
+
+`ninfer_memory_vision` accepts `all|query-only|native-boundary`, then
+`fixed|adaptive`, then an optional ngram width. `copy-compare` runs only the
+cold/restored copy pair, including ngram-off or native controls. A nonzero width adds real image
+and text copy requests with positive wide-draft acceptance, exact cold/restored
+greedy and seeded-sampling comparisons, cancellation/recovery, output limits
+and edited-prefix rejection. Copy requests honor model stop tokens; the existing
+fixed-length color fixtures keep their original termination policy. Transfer
+verification logs must prove query replay, not merely a long input or an enabled
+flag. The parent [qualification report](../../../docs/vision-ngram-validation-20261005.md)
+records the initial two admitted configurations, the K8V4 observation and controls.
+The current [all-KV qualification](../../../docs/vision-ngram-all-kv-validation-20261006.md)
+records the subsequent admission of all five KV formats and concurrent checks.
+
+## KVMem image concurrency (2026-10-06)
+
+The Engine, serving CLI and Windows launcher now admit 1..8 text or resident/CPU
+image lanes. Ngram widths 1..15 also admit 1..8 lanes with MTP. Valid requested
+widths 16..63 automatically reduce to 15 at startup with C2..8, with a warning;
+C1 preserves those widths. Image ngram admits all nine native KV profiles (including FP8, RK4V4,
+RK4V4-E8 and RK2V4-E8). CPU image encoding remains
+serialized; active image and text requests share the native compact decode batch.
+The launcher's default image limit is 1024 merged tokens.
+
+`ninfer_memory_concurrency` accepts the optional four final arguments
+`red.png blue.png resident|cpu vision-tokens [selected-tokens]`, after the KV, Graph and feature
+arguments. The feature can be `fixed` for ordinary or fixed-MTP execution.
+Image fixtures use B1536/R128 by default; two actual 1024-token images require
+a larger selection budget, for example a final `2560`. Preparation logs record
+the actual vision-token count separately from the configured per-image limit.
+The fixture mixes red images, blue images and text, with distinct access codes,
+then checks lane isolation, cancellation, restored peers, image replacement
+under the same source name, compact batching, configured active lanes, global
+Host admission and resource retirement. The current build and validation limits
+are recorded in the parent [report](../../../docs/vision-concurrency-validation-20261006.md).
+
+For text SSD pressure checks, the optional final `disk-MiB` argument creates a process-local spill
+directory. Cold asynchronous reads may prevent short replies from overlapping; the cold phase
+checks output isolation, quotas, exact transfers and successful writes. Restored phases still
+require real compact batches, cancellation isolation and SSD reads. Every phase must retire active
+Main/MTP pages and reservations; engine shutdown must remove its spill files.
+
+`ninfer_memory_ngram` now accepts `fixed|adaptive` after the MTP draft count,
+then an optional concurrency in 2..8, then optional `red.png blue.png resident|cpu`.
+Its concurrent route mixes distinct exact Python copies with a free-form neural
+lane, requires positive copy acceptance and compact batching, and checks full
+configured overlap after restore, exact cold/restored/recovered copy tokens,
+cancellation isolation, global Host bounds and retirement of Main/MTP pages.
+The image route uses a 1024-token limit with 512x512 color fixtures.
+Text copies use B768/R128 so the complete copy query survives selection of
+the longer history. Image copies use B1536/R128. The optional environment
+`NINFER_NGRAM_TEST_COLORS_ONLY=1` runs only the color diagnostic and prints
+`MEMORY_NGRAM_COLORS_ONLY PASS`; it does not qualify concurrent copying.
+MTP/ngram Graph families now eagerly warm every batch shape before capture,
+including GGUF linear routes that first need cuBLAS above 64 verify columns.
+
+## Additional KVMem KV profiles (2026-10-06)
+
+`ninfer_p1_payload` covers the independently specified FP8, RK4V4, RK4V4-E8 and
+RK2V4-E8 Main/MTP plane schemas in page-major and head-major order.
+`ninfer_p1_sparse <format>` checks each against the existing independent represented-value
+attention oracle across 90 sparse/page-boundary/eager/Graph cases. RK4V4 selects the
+maintained packed-key `CachePlan` fixture. E8 profiles additionally require exact
+fused/standalone append byte parity; numerical criteria are unchanged.
+The Engine/serving/launcher tests admit all nine profiles, retain unknown-format
+rejection and preserve disabled cold snapshots and the fast-prefill restrictions.
+Representative real-model history, concurrent image/ngram and cancellation evidence
+is in the [additional KV report](../../../docs/other-kv-admission-validation-20261006.md).
+
+## KVMem fast-prefill admission (2026-10-06)
+
+`ninfer_p1_sparse <format> fast` selects INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8
+and checks 36 cases per format (T65/127/128/129, sparse/permuted pages, offset0/63,
+eager/Graph). It asserts that the native route selects prompt Attention and the fast
+kernel, then applies the existing independent represented-value oracle and cache/guard checks.
+`NINFER_TEST_FAST_PREFILL=1` explicitly sets `EngineOptions.fast_prefill_kernel`
+in `ninfer_memory_vision` and `ninfer_memory_ngram`; 0 disables it and other values reject.
+The fixtures publish the setting as `MEMORY_FEATURE fast_prefill=1`. Normal test defaults
+remain off. Parameter tests admit the five fast profiles with C1..8 resident/CPU images
+and MTP/ngram while preserving rejection of unsupported KV, concurrent prefill and cold disk.
+Cold prefills are serialized, so `ninfer_memory_ngram` records their actual overlap without
+requiring it. Each of the three restored phases still requires full configured concurrency
+and more decode row-rounds than decode rounds; exact token/byte/resource checks remain unchanged.
+See the [fast-prefill report](../../../docs/fast-prefill-admission-validation-20261006.md).

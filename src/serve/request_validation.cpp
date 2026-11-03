@@ -23,15 +23,25 @@ void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& lim
                           const std::string& param, const std::string& field) {
     for (ChatTurn& turn : turns) {
         for (ContentPart& part : turn.content) {
-            if (part.unknown_image_detail.empty()) { continue; }
-            if (!limits.lenient_image_detail) {
-                bad_request(field + "='" + part.unknown_image_detail +
+            if (!part.unknown_image_detail) { continue; }
+            // KVMem's documented compatibility value retains its old auto preprocessing.
+            if (*part.unknown_image_detail != "original" && !limits.lenient_image_detail) {
+                bad_request(field + "='" + *part.unknown_image_detail +
                                 "' is not one of 'auto', 'low' or 'high'",
                             param, "image_detail_not_supported");
             }
-            part.unknown_image_detail.clear();
+            part.image_detail = ninfer::ImageDetail::Auto;
+            part.unknown_image_detail.reset();
         }
     }
+}
+
+void parse_tool_constraints(const RequestJson& body, GenerationRequest& request) {
+    if (!body.contains("tool_constraints") || body.at("tool_constraints").is_null()) return;
+    const auto& mode = body.at("tool_constraints");
+    if (mode == "basic") request.tool_choice.constraints = ToolConstraintMode::Basic;
+    else if (mode == "auto") request.tool_choice.constraints = ToolConstraintMode::Automatic;
+    else bad_request("tool_constraints must be 'basic' or 'auto'", "tool_constraints");
 }
 
 std::optional<int> optional_int(const RequestJson& object, const char* key) {

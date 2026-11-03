@@ -234,7 +234,7 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
             PreparedRequest& prepared = *branched;
             const std::shared_ptr<RequestLifecycle> lifecycle =
                 begin_request(make_request_log_context(++request_seq_, "rerank", judgements.front(),
-                                                       metadata, prepared));
+                                                       metadata, prepared), prepared);
             GenerationOutcome outcome;
             try {
                 outcome = service.run(prepared, nullptr, cancelled);
@@ -271,7 +271,7 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
                 for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                     lifecycles.push_back(begin_request(make_request_log_context(
                         ++request_seq_, "rerank", judgements[begin + offset], metadata,
-                        batch[offset])));
+                        batch[offset]), batch[offset]));
                 }
                 for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                     GenerationOutcome outcome;
@@ -367,7 +367,7 @@ void HttpServer::handle_text_completion(const httplib::Request& req, httplib::Re
     TextCompletionContext context =
         make_text_completion_context(request, std::move(prompt), prepared);
     auto lifecycle = begin_request(
-        make_request_log_context(req_id, protocol, request.generation, metadata, prepared));
+        make_request_log_context(req_id, protocol, request.generation, metadata, prepared), prepared);
 
     if (!request.response.stream) {
         GenerationOutcome outcome;

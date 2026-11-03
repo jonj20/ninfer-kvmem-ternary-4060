@@ -40,6 +40,7 @@ add_library(ninfer_serve STATIC
   model_registry.cpp
 )
 ninfer_internal_includes(ninfer_serve)
+target_link_libraries(ninfer_serve PUBLIC kvmem PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(ninfer_serve
   PUBLIC ninfer_engine ninfer_model_catalog Threads::Threads ninfer::json ninfer::httplib
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_product_prompt_input

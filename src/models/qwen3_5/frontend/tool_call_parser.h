@@ -37,7 +37,9 @@ struct ToolCallOutputContract {
         DeclaredTypes,
     };
 
+    enum class Encoding : std::uint8_t { NonStrict, RawString, Json };
     struct Parameter {
+        Encoding encoding = Encoding::NonStrict;
         std::string name;
         NormalizationPolicy policy = NormalizationPolicy::Legacy;
         TypeSet types;
@@ -51,16 +53,22 @@ struct ToolCallOutputContract {
         // (schema_json) rather than as free text.
         bool strict = false;
         std::string schema_json;
+        std::size_t declaration_index = 0;
     };
 
     std::vector<Tool> tools;
+    bool constrained = false;
+    bool required = false;
+    bool parallel = true;
     bool enforce_declared_names = false;
+    bool duplicate_names = false;
     // Function whose call opener the rendered prompt already carries, empty when the model chooses
     // freely. It lives here because the prompt that carries the opener is the only thing that knows
     // it: a second, independently supplied copy could name a different tool and the continuation
     // would be attributed to that one. The Qwen decoder and, for a Gemma 4 request, the Gemma
     // decoder both start inside that call; the syntax of the opener is the model's own.
     std::string forced_tool_name;
+    std::string continuation;
 };
 
 // Markdown code state of a text read so far: an open fence (a run of three or more backticks or
@@ -82,6 +90,9 @@ private:
     std::uint32_t fence_len_ = 0;    // the open fence's opening run length
     std::uint32_t ticks_     = 0;    // backticks of the current paragraph's finished lines
 };
+[[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
+select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,
+                          const ToolChoice& choice);
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;

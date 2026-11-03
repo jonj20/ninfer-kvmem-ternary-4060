@@ -56,7 +56,8 @@ struct SpeculativeOptions {
     std::uint32_t lookup_ngram = 0;
     // MTP only; Adaptive verifies 1..draft_tokens drafts per round.
     MtpDraftPolicy mtp_policy = MtpDraftPolicy::Fixed;
-    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2.
+    // Engine clamps valid widths above 15 to 15 when max_concurrency > 1, at construction.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
@@ -410,6 +411,47 @@ struct NgramTableOptions {
     bool disabled = false;
 };
 
+enum class CudaMemoryPolicy : std::uint8_t {
+    DriverDefault,
+    StrictVram,
+    Mixed,
+};
+
+// Optional sparse KV working set. B and R are independent whole-page budgets;
+// Host retains native page records, including quantization scale planes.
+struct KvmemOptions {
+    std::uint32_t query_replay_max_tokens = 2048;
+    std::uint32_t query_max_tokens = 512; // tail of the actual last-user span, matching llama.cpp
+    bool lrfu = false;
+    double lrfu_lambda = 0.5;
+    double lrfu_top_fraction = 0.9;
+    bool score_agg_max = false;
+    bool query_meanq_cosine = false;
+    double graph_alpha = 0.2;
+    std::uint32_t selected_tokens = 0; // B; zero disables KVMem
+    std::uint32_t reserve_tokens = 0;  // R; also covers each prefill chunk
+    // Whole-page rounding uses this backend's fixed 64-token page.
+    // Sink 0 keeps one page; a positive value rounds down and stays at least one page.
+    // Recent rounds down and must retain at least one page for the partial append tail.
+    // Values below 64 are rejected when KVMem is enabled; the default keeps one page.
+    std::uint32_t sink_tokens = 0;
+    std::uint32_t recent_tokens = 64;
+    std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
+    [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
+        return sink_tokens < 64 ? 1U : sink_tokens / 64U;
+    }
+    [[nodiscard]] std::uint32_t recent_blocks() const noexcept { return recent_tokens / 64U; }
+    std::uint32_t retained_sessions = 4; // bounded inactive Host histories, 1..16
+    bool verify_transfers = false;    // correctness diagnostics, off in product runs
+    // Process-local active/idle native KV tier. H bounds resident payload; D
+    // bounds reserved disk extents. No restart persistence or DirectStorage.
+    std::filesystem::path disk_path;
+    std::uint64_t disk_bytes = 0;
+    [[nodiscard]] std::uint64_t device_tokens() const noexcept {
+        return static_cast<std::uint64_t>(selected_tokens) + reserve_tokens;
+    }
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -467,6 +509,8 @@ struct EngineOptions {
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
     // max_context / native (ops::RopeYarn).
+    // Per-request bounded working sets; RoPE positions stay logical.
+    KvmemOptions kvmem;
     bool rope_yarn = false;
     // A fixed YaRN factor in (1,4] for every position of the text and MTP layers, whatever
     // max_context is: Qwen documents one factor per deployment rather than one per window. 1 leaves
@@ -479,8 +523,8 @@ struct EngineOptions {
     float rope_scaling_factor = 1.0F;
     // The interpolation threshold; 0 is the model's native window.
     std::uint32_t rope_scaling_original_context = 0;
-    // Reserves the grammar mask planes that JSON and JSON Schema constrained requests sample
-    // through. Off, those requests are refused and a DFlash round carries no grammar stage.
+    // Enables JSON/JSON Schema request formats. Native tool constraints are available by default
+    // and share the per-lane mask planes even when JSON request formats are disabled.
     bool structured_output = false;
     // Admit waiting requests to free lanes while other requests prefill, instead of holding
     // admission until the staged prefill finishes.
@@ -496,6 +540,17 @@ struct EngineOptions {
     // generation until the memory comes back. Not for a GPU that drives the desktop, whose
     // allocations are often not evictable.
     bool wddm_evictable_budget         = false;
+    // StrictVram is a Windows single-device residency guard and selects the Hybrid prefix cache.
+    // Mixed is Windows single-device text generation using ordinary cudaMalloc: it attempts the
+    // requested capacity even above reported CUDA free and accepts driver paging to Shared memory.
+    // Mixed automatic capacity covers at most max_concurrency full max_context windows, without
+    // expanding an idle prefix cache or probing system RAM. Normalization sets its automatic
+    // headroom to zero; StrictVram sets it to cuda_vram_reserve_bytes. Only DriverDefault uses
+    // the independently configured automatic KV headroom.
+    // StrictVram probes may exceed reported free, but only a verified resident layout is admitted.
+    CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
     ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -521,6 +576,7 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0 retains lazily loaded Qwen CPU Vision weights
     // Speed-for-quality trades, opt-in and off by default. Measured in
     // docs/maintainer/quality-trade-experiments.md: lm_head_q4 costs +0.69% perplexity for a
     // C8 decode gain (~3%, real chat prompts); gdn_state_fp16 is free within measurement noise

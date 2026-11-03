@@ -52,6 +52,8 @@ enum class SuspendWeightSource : std::uint8_t;
 struct ModelSuspendOptions;
 struct HybridExpertOptions;
 struct NgramTableOptions;
+enum class CudaMemoryPolicy : std::uint8_t;
+struct KvmemOptions;
 struct EngineOptions;
 
 // ninfer/request.h
@@ -70,6 +72,9 @@ struct StructuredOutputOptions;
 struct ExecutionOptions;
 struct OutputOptions;
 struct NgramSessionHints;
+enum class ToolChoiceMode : std::uint8_t;
+enum class ToolConstraintMode : std::uint8_t;
+struct ToolChoice;
 struct RequestOptions;
 enum class MediaKind : std::uint8_t;
 enum class ImageResizePolicy : std::uint8_t;
@@ -128,6 +133,8 @@ struct MediaCacheSummary;
 struct ArenaMemorySummary;
 struct VisionWorkspaceMemorySummary;
 struct DeviceMemorySummary;
+struct KvmemMemorySummary;
+struct CudaResidencySummary;
 struct MemorySummary;
 struct RuntimeHostWorkStats;
 struct NgramTableStats;

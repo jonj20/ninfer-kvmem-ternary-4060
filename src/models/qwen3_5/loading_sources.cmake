@@ -14,6 +14,7 @@ target_sources(ninfer_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/load/storage_trades.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/vision_overlay.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/vision_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/load/vision_cpu_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/resources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tokenizer.cpp"
 )

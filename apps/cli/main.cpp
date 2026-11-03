@@ -392,6 +392,7 @@ int main(int argc, char** argv) {
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_residency         = cli.vision_residency;
+        engine_options.cpu_vision_idle_seconds   = cli.cpu_vision_idle_seconds;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
         engine_options.gpu_clock_floor_mhz      = cli.gpu_clock_floor_mhz;
@@ -409,6 +410,9 @@ int main(int argc, char** argv) {
         engine_options.structured_output =
             cli.structured_output.kind != ninfer::StructuredOutputKind::None;
         engine_options.wddm_evictable_budget    = cli.wddm_evictable_budget;
+        engine_options.cuda_memory_policy = cli.cuda_memory_policy;
+        engine_options.cuda_vram_reserve_bytes = cli.cuda_vram_reserve_bytes;
+        engine_options.cuda_memory_probe_step_bytes = cli.cuda_memory_probe_step_bytes;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
         engine_options.prefill_cublas           = cli.prefill_cublas;
@@ -418,6 +422,11 @@ int main(int argc, char** argv) {
         engine_options.context_cache.enabled                = false;
         engine_options.context_cache.host_state_slots       = 0;
         engine_options.context_cache.host_kv_capacity_bytes = 0;
+        if (cli.use_alt_prefix_caching) {
+            engine_options.context_cache.enabled = true;
+            engine_options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+            engine_options.context_cache.host_cache_budget_bytes = 0;
+        }
         engine_options.startup_observer                     = startup_log.observer();
         engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
 

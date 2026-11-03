@@ -56,6 +56,9 @@ struct ResidencyStatus {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    KvmemMemorySummary kvmem;
+    // Worker-published: monitoring must not query CUDA/PDH or take the execution lock.
+    CudaResidencySummary cuda_residency;
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;

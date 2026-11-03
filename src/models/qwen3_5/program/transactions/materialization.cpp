@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/planning/prefill_service_work.h"
 #include "models/qwen3_5/program/context.h"
 
 #include <algorithm>
@@ -324,14 +325,9 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         materialization_identity_.assign(prompt);
         materialization_prefix_digests_.assign(prompt);
 
-        const std::uint32_t initial_mtp_extent =
-            speculative_backend == SpeculativeBackend::Mtp
-                ? std::min({draft_window,
-                            request_plan.summary.effective_output_tokens > 1
-                                ? request_plan.summary.effective_output_tokens - 2
-                                : 0U,
-                            capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
-                : 0U;
+        const auto initial_mtp_extent = initial_mtp_prefill_extent(
+            speculative_backend == SpeculativeBackend::Mtp ? draft_window : 0U,
+            request_plan.summary.effective_output_tokens, capacity, prompt_tokens);
         const std::uint32_t prefill_base =
             request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base;
         // Without drafting, the drafter covers the prompt up to its deepest capture only.
@@ -352,12 +348,15 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             .base                  = prefill_base,
             .cursor                = prefill_base,
             .disk_restore_frontier = request_plan.disk_restore_frontier,
+            .memory_restore_frontier = request_plan.memory_restore_frontier,
+            .memory_restore_generation = request_plan.memory_restore_generation,
             .prompt_tokens      = prompt_tokens,
             .initial_mtp_extent = initial_mtp_extent,
             .drafter_frontier   = drafter_frontier,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
+            .reported_reuse_path = request_plan.summary.prefix_reuse_path,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
@@ -2283,6 +2282,10 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
     // This is the unique physical publication point. ResourceManager still owns the logical
     // catalog capabilities and adopts them only after validating this terminal result.
+    if (!prepare_memory_materialization(transaction)) {
+        out.status = runtime::ContextTransactionStatus::InProgress;
+        return out;
+    }
     try {
         out.published.emplace(start_request(transaction));
         materialization_ledger_.clear();
@@ -2388,6 +2391,11 @@ bool ProgramImpl::vision_pending(SequenceHandle sequence) const noexcept {
 }
 
 bool ProgramImpl::wait_context_transfer() noexcept {
+    if (memory_io && memory_io->pending_jobs()) {
+        const auto epoch = memory_io->completion_epoch();
+        memory_io->wait_for_completion(epoch, std::chrono::milliseconds(1));
+        return true;
+    }
     bool submitted = false;
     if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
         submitted = transaction->transfer_submitted;

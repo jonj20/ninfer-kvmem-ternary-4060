@@ -608,8 +608,10 @@ int test_tools() {
     body["parallel_tool_calls"]  = false;
     const OpenAIChatRequest none = parse(body);
     failures +=
-        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
-              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+        check(!none.generation.uses_tools() &&
+                  options(none.generation).tool_choice.mode == ninfer::ToolChoiceMode::None &&
+                  prompt(none.generation).options.tool_jsons.size() == 1,
+              "tool_choice none blocks calls while retaining declarations for prompt reuse");
     failures += check(!options(none.generation).execution.sampling.presence_penalty,
                       "tool_choice none did not restore the preset's presence penalty");
 
@@ -617,9 +619,10 @@ int test_tools() {
     body["enable_thinking"]                 = false;
     body["tool_choice"]                     = "required";
     const GenerationRequest required_single = parse(body).generation;
-    failures += check(required_single.tool_choice.forced_name == "weather" &&
-                          prompt(required_single).options.forced_tool_name == "weather",
-                      "required over a single callable tool forces that function");
+    failures += check(required_single.tool_choice.mode == ToolChoiceMode::Required &&
+                          options(required_single).tool_choice.mode == ninfer::ToolChoiceMode::Required &&
+                          prompt(required_single).options.forced_tool_name.empty(),
+                      "required over a single tool is enforced without a forced prompt opener");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
     failures += check(parse(body).generation.tool_choice.forced_name == "weather",
                       "named tool choice forces that function");
@@ -628,30 +631,36 @@ int test_tools() {
                       "named tool choice rejects a function absent from tools");
     body["enable_thinking"] = true;
     body["tool_choice"]     = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)prompt(parse(body).generation); }).code ==
-                          "tool_choice_not_supported",
-                      "a forced choice with reasoning enabled is rejected");
+    const GenerationRequest thinking_named = parse(body).generation;
+    failures += check(prompt(thinking_named).options.enable_thinking == true &&
+                          prompt(thinking_named).options.forced_tool_name.empty() &&
+                          options(thinking_named).tool_choice.mode == ninfer::ToolChoiceMode::Required &&
+                          options(thinking_named).tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"} &&
+                          !options(thinking_named).tool_choice.parallel,
+                      "named choice supports thinking and constrains the selected tool");
     body.erase("enable_thinking");
     const GenerationRequest default_reasoning = parse(body).generation;
-    failures += check(semantics(default_reasoning).enable_thinking == false &&
-                          prompt(default_reasoning).options.enable_thinking == false &&
-                          prompt(default_reasoning).options.forced_tool_name == "weather",
-                      "a forced choice turns off reasoning that only a default enabled");
+    failures += check(semantics(default_reasoning).enable_thinking ==
+                              semantics(parse(base_request()).generation).enable_thinking &&
+                          prompt(default_reasoning).options.forced_tool_name.empty(),
+                      "named choice retains template-default thinking without a forced opener");
     ServeOptions thinking_server;
     thinking_server.enable_thinking = true;
     failures +=
-        check(resolve_prompt_semantics(default_reasoning, thinking_server).enable_thinking == false,
-              "a forced choice turns off reasoning that the server default enables");
+        check(resolve_prompt_semantics(default_reasoning, thinking_server).enable_thinking == true,
+              "named choice preserves server-default thinking");
     ServeOptions effort_server;
     effort_server.default_reasoning_effort = RequestedReasoningEffort::Low;
     const ResolvedPromptSemantics forced_effort =
         resolve_prompt_semantics(default_reasoning, effort_server);
-    failures += check(forced_effort.enable_thinking == false && !forced_effort.reasoning_effort,
-                      "a forced choice turns off reasoning that the server default effort enables");
+    failures += check(forced_effort.enable_thinking == true &&
+                          forced_effort.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "named choice preserves server-default reasoning effort");
     body["reasoning_effort"] = "high";
-    failures += check(api_error([&] { (void)prompt(parse(body).generation); }).code ==
-                          "tool_choice_not_supported",
-                      "a forced choice with a requested reasoning effort is rejected");
+    failures += check(prompt(parse(body).generation).options.reasoning_effort ==
+                          ninfer::ReasoningEffort::High,
+                      "named choice preserves explicitly requested reasoning effort");
     body.erase("reasoning_effort");
 
     {
@@ -677,10 +686,12 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool(), function_tool("search")});
     body["tool_choice"]         = "required";
-    const ApiError over_several = api_error([&] { (void)parse(body); });
-    failures += check(over_several.code == "tool_choice_not_supported" &&
-                          over_several.message.find("several tools") != std::string::npos,
-                      "required over several tools stays rejected");
+    const GenerationRequest over_several = parse(body).generation;
+    failures += check(over_several.tool_choice.mode == ToolChoiceMode::Required &&
+                          over_several.tools.size() == 2 &&
+                          options(over_several).tool_choice.mode == ninfer::ToolChoiceMode::Required &&
+                          prompt(over_several).options.tool_jsons.size() == 2,
+                      "required over several tools retains declarations and enforces a call");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -690,25 +701,34 @@ int test_tools() {
               Json{{"mode", "auto"},
                    {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
     const GenerationRequest allowed = parse(body).generation;
-    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
-                          prompt(allowed).options.tool_jsons.size() == 1,
-                      "allowed_tools auto narrows the executable function set");
+    failures += check(allowed.tools.size() == 2 &&
+                          options(allowed).tool_choice.allowed_names ==
+                              std::vector<std::string>{"search"} &&
+                          prompt(allowed).options.tool_jsons.size() == 2,
+                      "allowed_tools narrows sampling without changing prompt declarations");
     body["tool_choice"]["allowed_tools"]["tools"][0] =
         Json{{"type", "function"}, {"function", Json{{"name", "search"}}}};
     const GenerationRequest chat_form = parse(body).generation;
-    failures += check(chat_form.tools.size() == 1 && chat_form.tools[0].name == "search",
-                      "allowed_tools entries in the Chat form narrow the function set");
+    failures += check(chat_form.tools.size() == 2 &&
+                          options(chat_form).tool_choice.allowed_names ==
+                              std::vector<std::string>{"search"},
+                      "Chat-form allowed_tools retains declarations and narrows sampling");
 
     body["tool_choice"] =
         Json{{"type", "allowed_tools"},
              {"mode", "auto"},
              {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
     const GenerationRequest direct_allowed = parse(body).generation;
-    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
-                      "direct allowed_tools compatibility shape is accepted");
+    failures += check(direct_allowed.tools.size() == 2 &&
+                          options(direct_allowed).tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
+                      "direct allowed_tools shape preserves declarations and selects weather");
     body["tool_choice"]["mode"] = "required";
-    failures += check(parse(body).generation.tool_choice.forced_name == "weather",
-                      "allowed_tools narrowed to one function forces it");
+    const auto allowed_required = options(parse(body).generation);
+    failures += check(allowed_required.tool_choice.mode == ninfer::ToolChoiceMode::Required &&
+                          allowed_required.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
+                      "allowed_tools required enforces the selected function during decoding");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(
@@ -718,16 +738,11 @@ int test_tools() {
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
     const OpenAIChatRequest strict_tools = parse(body);
-    failures += check(
-        strict_tools.generation.tools.size() == 1 && strict_tools.generation.tools[0].strict &&
-            prompt(strict_tools.generation).options.tool_jsons[0].find("\"strict\":true") !=
-                std::string::npos,
-        "a strict tool did not reach the prompt as strict");
-    // Without grammar masks a Chat Completions strict flag is advisory: the tool runs non-strict.
-    const auto advisory = drop_unavailable_constraints(strict_tools.generation, false, false);
-    failures += check(advisory && prompt(*advisory).options.tool_jsons[0].find(
-                                      "\"strict\":false") != std::string::npos,
-                      "a strict tool was refused instead of advisory without grammar masks");
+    failures += check(strict_tools.generation.tools.size() == 1 &&
+                          strict_tools.generation.tools[0].strict &&
+                          prompt(strict_tools.generation).options.tool_jsons[0].find(
+                              "\"strict\":true") != std::string::npos,
+                      "strict tool schemas retain their enforcement intent through translation");
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},
@@ -757,8 +772,7 @@ int test_tools() {
     failures += check(!parse(body).generation.uses_tools(),
                       "a request whose only tool is hosted still parses, with no callable tools");
 
-    // parallel_tool_calls=false is honoured by trimming the response to one call rather than
-    // refused; the request must survive parsing for that to be possible.
+    // parallel_tool_calls=false constrains generation to at most one call.
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
@@ -851,7 +865,7 @@ int test_messages_and_media() {
         failures += check(parse(body).generation.messages[0].content[0].image_detail == detail,
                           "an OpenAI image detail was not carried to the media");
     }
-    body["messages"][0]["content"][0]["image_url"]["detail"] = "original";
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "unsupported";
     failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
                       "an unknown image detail was accepted");
     RequestLimits lenient        = limits();
@@ -859,8 +873,12 @@ int test_messages_and_media() {
     const auto lenient_media     = parse_chat_completion_request(body, lenient).generation;
     failures += check(lenient_media.messages[0].content[0].image_detail ==
                               ninfer::ImageDetail::Auto &&
-                          lenient_media.messages[0].content[0].unknown_image_detail.empty(),
+                          !lenient_media.messages[0].content[0].unknown_image_detail.has_value(),
                       "--lenient-image-detail did not read an unknown detail as auto");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "auto";
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "";
+    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
+                      "empty image detail was silently accepted as auto");
     body["messages"][0]["content"][0]["image_url"]["detail"] = "auto";
 
     auto content_rejected = [&](const char* role, const char* type) {
@@ -889,7 +907,7 @@ int test_messages_and_media() {
                Json::array({Json{{"type", "text"}, {"text", "captured"}},
                             Json{{"type", "image_url"},
                                  {"image_url", Json{{"url", "https://example.test/capture.png"},
-                                                    {"detail", "auto"}}}}})}}});
+                                                    {"detail", "original"}}}}})}}});
     const GenerationRequest tool_image = parse(body).generation;
     failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
                           tool_image.messages.back().tool_call_id == "call_capture" &&
@@ -1206,6 +1224,9 @@ GenerationOutcome sample_outcome() {
     outcome.metrics.prefix_cache_hit_tokens     = 12;
     outcome.metrics.prompt_wall_seconds         = 0.04;
     outcome.metrics.generation_wall_seconds     = 0.03;
+    outcome.metrics.engine_timing.decode_rounds = 3;
+    outcome.metrics.speculative_rounds = 2;
+    outcome.metrics.speculative_fallback_steps = 1;
     outcome.metrics.speculative_draft_tokens    = 9;
     outcome.metrics.speculative_accepted_tokens = 6;
     return outcome;
@@ -1219,6 +1240,11 @@ int test_aggregate_response() {
     int failures              = 0;
     GenerationOutcome outcome = sample_outcome();
     Json response             = Json::parse(make_chat_completion_response(identity(), outcome));
+    const auto& diagnostic = response["kvmem"]["speculative"];
+    failures += check(diagnostic["generation_rounds"] == 3 && diagnostic["output_tokens"] == 6 &&
+                          diagnostic["tokens_per_round"] == 2.0 && diagnostic["ms_per_round"] == 10.0 &&
+                          diagnostic["fallback_rounds"] == 1,
+                      "KVMem diagnostics retain explicit native round counts and first-token scope");
     failures += check(response["choices"][0]["message"]["content"] == "answer" &&
                           response["choices"][0]["message"]["reasoning_content"] == "thought" &&
                           response["choices"][0]["message"]["refusal"].is_null(),
@@ -1673,7 +1699,12 @@ int test_prompt_cache_key_grants_long_anchor() {
     return failures;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
+        const int failures = test_messages_and_media();
+        if (failures == 0) { std::cout << "OpenAI Chat image detail tests passed\n"; }
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += test_prompt_cache_key_grants_long_anchor();
     failures += test_graft_extension();

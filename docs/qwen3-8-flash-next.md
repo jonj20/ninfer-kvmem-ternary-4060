@@ -505,8 +505,9 @@ disk, which a later run finds there too.
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
 as for Gemma 4 ([Structured output](gemma4.md#structured-output)): the grammar's token mask applies
 to every sampled token, it is computed on a thread of its own while the step runs, a row whose mask
-is late samples once it is ready without holding the others, and a request drafts while its masks
-take at most 4 ms. So do
+is late samples once it is ready without holding the others during ordinary decoding. Draft
+eligibility does not depend on mask duration; a speculative round waits for all required masks
+before acceptance. So do
 [token log probabilities](serving.md#token-log-probabilities): a request that asks gathers each
 sampled token's top 20 from the same logits before sampling.
 

@@ -26,7 +26,7 @@ struct TextPrefillRoots {
     Tensor rope_positions;
     Tensor residual;
     Tensor scatter_indices;
-    // Overlay Vision residency only: the chunk's visual columns staged from the pinned item
+    // Host Vision staging (CPU or overlay): this chunk's columns from the pinned item
     // embeddings, plus the following column that a shifted MTP input may name.
     Tensor visual_embeddings;
 };
@@ -42,10 +42,12 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     out.residual = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
-        if (overlay_staging) {
-            out.visual_embeddings =
-                matrix(allocator, DType::BF16, dimension(config.hidden_size), scatter_tokens + 1);
-        }
+    }
+    // A unit ending at the first visual token has zero Main columns but one
+    // shifted MTP column. Host staging must still own that following column.
+    if (overlay_staging) {
+        out.visual_embeddings =
+            matrix(allocator, DType::BF16, dimension(config.hidden_size), scatter_tokens + 1);
     }
     return out;
 }

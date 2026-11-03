@@ -440,7 +440,6 @@ struct Gemma4Core::Request {
     // its own masks, one per column after its drafts.
     bool constrained = false;
     std::shared_ptr<runtime::GrammarMaskJob> mask;
-    runtime::GrammarMaskCost mask_cost;
     bool awaiting_sample           = false;
     std::int32_t awaiting_purpose  = 0;
     // The last prompt chunk or accepted token, which the progress watchdog measures from.
@@ -771,7 +770,7 @@ struct Gemma4Core::Impl {
     // now, a step ahead; one that speculates fills its round's columns during the verification.
     void next_mask(const std::shared_ptr<Request>& request) {
         Request& r = *request;
-        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+        if (r.constrained && active(request) && drafts == 0) {
             schedule_mask(r);
         } else {
             r.mask.reset();
@@ -785,7 +784,6 @@ struct Gemma4Core::Impl {
     bool mask_usable(const std::shared_ptr<Request>& request) {
         const auto& job = request->mask;
         if (!job) { return true; }
-        request->mask_cost.observe(job->seconds());
         const std::string problem = runtime::grammar_mask_problem(*job);
         if (problem.empty()) { return true; }
         fail(request, std::make_exception_ptr(RequestError(
@@ -1864,9 +1862,7 @@ struct Gemma4Core::Impl {
     // and no switch of sampling parameters pending (a reasoning block that has not closed yet when
     // the request samples its answer differently).
     [[nodiscard]] bool speculates(const Request& r) const {
-        // A structured row speculates while its masks are cheap enough for the round to fill its
-        // columns during the verification; otherwise it decodes plainly, a mask ahead.
-        return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
+        return drafts > 0 && r.feed.size() == 1 &&
                instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
@@ -2173,7 +2169,6 @@ struct Gemma4Core::Impl {
                                                   : nullptr;
             if (const auto& job = column_masks[j]) {
                 job->wait();
-                batch[j]->mask_cost.observe(job->seconds());
                 mask_failures[j] = runtime::grammar_mask_problem(*job);
                 if (mask_failures[j].empty()) {
                     // Columns past the row's own drafts are never taken; they stay unrestricted.

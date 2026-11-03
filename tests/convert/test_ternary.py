@@ -1,31 +1,36 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
 from tools.convert import ternary
-from tools.convert.sources.gguf import TYPE_PQ2_0, GGUFFile, encode_pq2_0, write_gguf
+from tools.convert.sources.gguf import (
+    TYPE_PQ2_0, TYPE_PTQ1_0, GGUFFile, encode_pq2_0, encode_ptq1_0, write_gguf,
+)
 
 
-def _pq2_0_file(tmp_path, rows: int, columns: int, seed: int):
+def _pq2_0_file(tmp_path, rows: int, columns: int, seed: int, type_id=TYPE_PQ2_0):
     generator = np.random.default_rng(seed)
     values = generator.integers(-1, 2, size=(rows, columns // 128, 128)).astype(np.int8)
     scales = generator.uniform(0.004, 0.03, size=(rows, columns // 128)).astype(
         np.float16
     )
-    blocks = encode_pq2_0(values, scales)
+    pack = encode_pq2_0 if type_id == TYPE_PQ2_0 else encode_ptq1_0
+    blocks = pack(values, scales)
     path = tmp_path / "sample.gguf"
     write_gguf(
         path,
         {"general.architecture": "qwen35"},
-        [("w", (rows, columns), TYPE_PQ2_0, blocks.tobytes())],
+        [("w", (rows, columns), type_id, blocks.tobytes())],
     )
     return path, values, scales
 
 
-def test_ternary_source_passes_codes_through_and_decodes_exact_values(tmp_path):
-    path, values, scales = _pq2_0_file(tmp_path, 12, 256, 3)
+@pytest.mark.parametrize("type_id", [TYPE_PQ2_0, TYPE_PTQ1_0])
+def test_ternary_source_passes_codes_through_and_decodes_exact_values(tmp_path, type_id):
+    path, values, scales = _pq2_0_file(tmp_path, 12, 256, 3, type_id)
     with GGUFFile(path) as gguf:
         source = ternary.ternary_source(gguf, "w", (12, 256), ternary.rows())
         words = source.read_encoded(2, 7)

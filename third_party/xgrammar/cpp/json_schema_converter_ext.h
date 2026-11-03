@@ -88,6 +88,8 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
 
  protected:
   // Override methods for XML format
+  int32_t GenerateInteger(const IntegerSpec&, const std::string&) override;
+  int32_t GenerateNumber(const NumberSpec&, const std::string&) override;
   int32_t GenerateString(const StringSpec& spec, const std::string& rule_name) override;
   int32_t GenerateObject(
       const ObjectSpec& spec, const std::string& rule_name, bool dummy_need_braces = false

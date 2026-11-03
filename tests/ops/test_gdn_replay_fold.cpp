@@ -663,6 +663,7 @@ int run_record_fold_rounds() {
                  device_destinations = to_device(destination_steps);
 
     int failures = 0;
+
     const std::vector<std::int32_t> commits =
         kWidth == 64   ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64}
         : kWidth == 32 ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32}
@@ -790,6 +791,16 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--dense-family-only") {
+        for (const FoldProfile profile : {FoldProfile{18, 16, 6144}, FoldProfile{24, 32, 8192}}) {
+            for (int commit = 0; commit <= 6; ++commit)
+                failures += run_case(profile, 6, 1, {commit}, 2400U + commit, true);
+            failures += run_case(profile, 6, 2, {0, 6}, 2410U, true);
+            failures += run_case(profile, 6, 2, {1, 3}, 2411U);
+        }
+        std::cout << (failures ? "FAIL" : "OK") << " dense-family gdn_replay_fold\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--wide-only") {
         for (const int width : {33, 48, 64}) {
             for (int commit = 0; commit <= width; ++commit) {
@@ -814,7 +825,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc != 1) {
-        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only]\n";
+        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only|--dense-family-only]\n";
         return 2;
     }
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);

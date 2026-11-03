@@ -161,7 +161,8 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
             PreparedRequest& prepared = *branched;
             const std::shared_ptr<RequestLifecycle> lifecycle =
                 begin_request(make_request_log_context(++request_seq_, protocol,
-                                                       *reads.front().request, metadata, prepared));
+                                                       *reads.front().request, metadata, prepared),
+                              prepared);
             GenerationOutcome outcome;
             try {
                 outcome = service.run(prepared, nullptr, cancelled);
@@ -196,7 +197,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
             for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 lifecycles.push_back(begin_request(make_request_log_context(
                     ++request_seq_, protocol, *reads[begin + offset].request, metadata,
-                    batch[offset])));
+                    batch[offset]), batch[offset]));
             }
             for (std::size_t offset = 0; offset < batch.size(); ++offset) {
                 GenerationOutcome outcome;

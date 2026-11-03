@@ -114,7 +114,8 @@ struct Observed {
 // constrained engine is first forced to evict the snapshot image and most of its blocks, so the
 // same snapshot comes back through the Host slabs. Both restores carry identical bytes and resume
 // at the same frontier with the same chunking, so greedy generation must match token for token.
-int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend backend) {
+int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend backend,
+                           bool fixed_fixture = true) {
     const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 1);
     std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
     const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 2);
@@ -124,6 +125,11 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     const std::vector<ninfer::TokenId> pressure = synthetic_tokens(3900, 3);
 
     const auto run = [&](ninfer::EngineOptions options, bool apply_pressure) {
+        // The general admission scenario accepts an ordinary full MTP head and
+        // measures the captured frontier instead of assuming a fixture's tap layout.
+        if (!fixed_fixture && backend == ninfer::SpeculativeBackend::Mtp) {
+            options.speculative.proposal_head = ninfer::ProposalHead::Full;
+        }
         ninfer::Engine engine(std::move(options));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         if (apply_pressure) { (void)engine.generate(engine.prepare_tokens(pressure), greedy(4)); }
@@ -139,9 +145,16 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     // flexible prompt-tail tap, realized at its start.
     constexpr std::uint32_t kExpectedReuse = 2 * kPrefillChunk;
     int failures                           = 0;
-    if (device.reused != kExpectedReuse || host.reused != kExpectedReuse) {
+    if (fixed_fixture && (device.reused != kExpectedReuse || host.reused != kExpectedReuse)) {
         std::cerr << "restore-exact: reused device=" << device.reused << " host=" << host.reused
                   << ", expected the prompt-tail snapshot at " << kExpectedReuse << '\n';
+        ++failures;
+    }
+    if (!fixed_fixture && (device.reused == 0 || device.reused > 1400 ||
+                           device.reused % kBlock != 0 || host.reused != device.reused)) {
+        std::cerr << "restore-admission: Device/Host frontier must match, be block-aligned, "
+                     "and remain inside the shared 1400-token prefix; device="
+                  << device.reused << " host=" << host.reused << '\n';
         ++failures;
     }
     if (device.stats.hybrid_host_image_restores != 0 ||
@@ -904,7 +917,8 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 15> kScenarios{"all",
+    constexpr std::array<std::string_view, 16> kScenarios{"all",
+                                                          "restore-admission",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -926,6 +940,10 @@ int main() {
     int failures = 0;
     try {
         const bool all = scenario == "all";
+        if (scenario == "restore-admission") {
+            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::None, false);
+            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::Mtp, false);
+        }
         if (all || scenario == "restore-exact") {
             failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::None);
         }

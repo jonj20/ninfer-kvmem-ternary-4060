@@ -343,6 +343,18 @@ public:
     // pinned allocation and within the device's maximum copy pitch: `record_groups` (empty, or
     // one id per record) names the allocation each record lies in, and records of different
     // groups, or further apart than the maximum pitch, are never joined into one run.
+    struct HostRecordCopyStats {
+        std::uint64_t runs = 0;
+        std::uint64_t copies = 0;
+        std::uint64_t payload_bytes = 0;
+    };
+    // Diagnostic-only description of the same run plan used by the record copies below.
+    // Counts cudaMemcpy2DAsync calls, including each head on head-major planes; padding is
+    // excluded from payload_bytes. This does not enqueue a copy or synchronize a stream.
+    [[nodiscard]] HostRecordCopyStats host_record_copy_stats(
+        std::span<const DeviceKVPageHandle> pages, std::span<const std::byte* const> records,
+        std::span<const std::uint32_t> record_groups, const HostKVPageLayout& layout) const;
+
     void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
                               std::span<std::byte* const> records,
                               std::span<const std::uint32_t> record_groups,

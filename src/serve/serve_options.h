@@ -23,6 +23,8 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
+    // Set only when a valid requested copy width was reduced for concurrent execution.
+    std::optional<std::uint32_t> requested_ngram_draft_tokens;
     bool help_requested = false;
     bool version_requested = false;
     // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
@@ -44,6 +46,7 @@ struct ServeOptions {
     std::uint32_t request_log_keep     = 4;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    KvmemOptions kvmem;
     std::optional<std::size_t> kv_headroom_mib;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -90,6 +93,7 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0: retain lazily loaded Qwen CPU Vision weights
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph     = true;
     std::uint32_t gpu_clock_floor_mhz = 0;
@@ -105,6 +109,9 @@ struct ServeOptions {
     float rope_scaling_factor                   = 1.0F;
     std::uint32_t rope_scaling_original_context = 0;
     bool wddm_evictable_budget = false;
+    CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
     // --model-suspend and its options: the residency API (suspend, resume) over fixed-address
     // device memory.
     ModelSuspendOptions suspend;

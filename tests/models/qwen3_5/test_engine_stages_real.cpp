@@ -108,6 +108,7 @@ bool flag(const char* name) {
 ninfer::EngineOptions engine_options(const char* artifact, const Configuration& configuration) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
+    options.device_profile = "off";
     options.max_context   = 2048;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk = 512;
@@ -124,6 +125,15 @@ ninfer::EngineOptions engine_options(const char* artifact, const Configuration& 
     options.stage_layers          = configuration.stage_layers;
     if (const char* graft = std::getenv("NINFER_TEST_GRAFT"); graft != nullptr && *graft != '\0') {
         options.grafts.push_back(ninfer::GraftSource{.name = "g", .path = graft});
+    }
+    // Heterogeneous memory sizes may need a different uneven split than the default 20/44 row.
+    if (!options.stage_layers.empty()) {
+        if (const auto* split = std::getenv("NINFER_TEST_STAGE_LAYERS")) {
+            options.stage_layers.clear();
+            std::istringstream list{std::string(split)};
+            for (std::string item; std::getline(list, item, ',');)
+                options.stage_layers.push_back(static_cast<std::uint32_t>(std::stoul(item)));
+        }
     }
     return options;
 }
@@ -238,6 +248,9 @@ Outputs generate(const char* artifact, const Configuration& configuration) {
         out.graft_run =
             engine.generate(engine.prepare(std::move(input)), greedy(24)).generated_token_ids;
     }
+    std::cout << "continuation: reused=" << out.reused_tokens << " tokens=";
+    for (const auto token : out.continued_run) { std::cout << token << ','; }
+    std::cout << std::endl;
     return out;
 }
 
@@ -249,6 +262,7 @@ int run() {
     }
 
     const bool split_invariance = flag("NINFER_TEST_SPLIT_INVARIANCE");
+    const bool same_placement = flag("NINFER_TEST_SAME_PLACEMENT_REFERENCE");
     const char* max_stages_text = std::getenv("NINFER_TEST_MAX_STAGES");
     const std::size_t max_stages =
         max_stages_text != nullptr ? static_cast<std::size_t>(std::atoi(max_stages_text)) : 64;
@@ -401,8 +415,8 @@ int run() {
             std::cerr << "  graft: first difference at token " << first << '\n';
         } else if (!short_ok || !long_ok || !cache_ok) {
             ++failures;
-            const auto& want = short_ok ? expected.long_run : expected.short_run;
-            const auto& got  = short_ok ? outputs.long_run : outputs.short_run;
+            const auto& want = !short_ok ? expected.short_run : !long_ok ? expected.long_run : expected.continued_run;
+            const auto& got  = !short_ok ? outputs.short_run : !long_ok ? outputs.long_run : outputs.continued_run;
             std::size_t first = 0;
             while (first < want.size() && first < got.size() && want[first] == got[first]) { ++first; }
             std::cerr << "  first difference at token " << first << '\n';

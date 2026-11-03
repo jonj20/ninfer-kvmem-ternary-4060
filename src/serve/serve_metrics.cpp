@@ -119,6 +119,15 @@ void ServeMetrics::record_done(const GenerationOutcome& outcome) {
     prefix_cache_hit_tokens_total_ += metrics.prefix_cache_hit_tokens;
     draft_tokens_total_ += metrics.speculative_draft_tokens;
     draft_accepted_tokens_total_ += metrics.speculative_accepted_tokens;
+    if (metrics.speculative_backend != SpeculativeBackend::None) {
+        kvmem::SpeculativeStatistics stats;
+        stats.requests = 1; stats.rounds = metrics.speculative_rounds;
+        stats.drafted_tokens = metrics.speculative_draft_tokens;
+        stats.accepted_tokens = metrics.speculative_accepted_tokens;
+        stats.generated_tokens = outcome.tokens.size();
+        stats.fallback_steps = metrics.speculative_fallback_steps;
+        speculative_statistics_.add(stats);
+    }
 }
 
 void ServeMetrics::record_failure() {

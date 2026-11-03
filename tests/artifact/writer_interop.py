@@ -10,6 +10,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.artifact.schema import TensorSpec
 from tools.artifact.writer import ArtifactWriter
+from tools.artifact.formats import GGUF_FORMATS
+from tools.artifact.layouts import encoded_size
+
+
+def gguf_roundtrip(executable: str, directory: Path) -> int:
+    specs = [TensorSpec(name, (3, 512), name, "gguf_blocks_v1")
+             for name in ("gguf_q2_0", "gguf_q4_0", "gguf_q5_0")]
+    path = directory / "gguf-blocks.ninfer"
+    with ArtifactWriter(path, specs, components={"text": {"config": {}}},
+                        bindings={spec.id: {"object": spec.id} for spec in specs}) as writer:
+        for spec in specs:
+            size = encoded_size(spec.layout, GGUF_FORMATS[spec.format], spec.shape)
+            writer.write_object(spec.id, bytes((index * 37 + 11) % 251 for index in range(size)))
+    return subprocess.run([executable, "--writer-fixture", str(path)]).returncode
 
 
 def main() -> int:
@@ -46,7 +60,7 @@ def main() -> int:
             result = subprocess.run([executable, "--writer-fixture", str(path)])
             if result.returncode:
                 return result.returncode
-    return 0
+        return gguf_roundtrip(executable, Path(temporary))
 
 
 if __name__ == "__main__":

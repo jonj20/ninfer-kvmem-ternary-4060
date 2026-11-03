@@ -16,10 +16,9 @@ StructuredOutputOptions parse_structured_output(const RequestJson& format, bool 
 // structured_output and the field that carried it.
 void parse_constrained_decoding_extensions(const RequestJson& body, GenerationRequest& request);
 
-// A server started without --structured-output reserves no grammar masks. There, a request's
-// response format and strict tools are refused, unless --unconstrained-response-format lets them go
-// unenforced; a Chat Completions strict flag is advisory and always does. Returns the request with
-// the dropped constraints, or nothing when the request runs as given.
+// --structured-output gates final response formats. Without it, those formats are refused unless
+// --unconstrained-response-format explicitly allows dropping them. Native tool constraints remain
+// available and strict tool intent is retained. Returns the changed request, or nothing.
 std::optional<GenerationRequest> drop_unavailable_constraints(const GenerationRequest& request,
                                                               bool structured_output,
                                                               bool unconstrained_response_format);

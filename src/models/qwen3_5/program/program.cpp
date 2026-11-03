@@ -440,6 +440,15 @@ DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
 bool Program::vision_pending(SequenceHandle sequence) const noexcept {
     return impl_->vision_pending(sequence);
 }
+bool Program::memory_pending(SequenceHandle sequence) const noexcept { return impl_->memory_pending(sequence); }
+bool Program::prepare_decode_memory(SequenceHandle sequence) { return impl_->prepare_decode_memory(sequence); }
+std::uint32_t Program::memory_control_chunk() const noexcept { return impl_->memory_control_chunk(); }
+bool Program::prepare_control_memory(SequenceHandle sequence, std::uint32_t tokens) {
+    return impl_->prepare_control_memory(sequence, tokens);
+}
+bool Program::cancel_memory_ready(SequenceHandle sequence) noexcept { return impl_->cancel_memory_ready(sequence); }
+bool Program::memory_maintenance_pending() const noexcept { return impl_->memory_maintenance_pending(); }
+bool Program::progress_memory_storage() { return impl_->progress_memory_storage(); }
 
 void Program::update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling) {
     impl_->update_sampling(sequence, sampling);
@@ -471,7 +480,7 @@ std::uint32_t Program::prefill_batch_segments() const noexcept {
 }
 
 bool Program::runs_branched_reads() const noexcept {
-    return !impl_->stage_runtime && impl_->prefill_hidden.data != nullptr &&
+    return !impl_->kvmem_window_tokens && !impl_->stage_runtime && impl_->prefill_hidden.data != nullptr &&
            impl_->round_host.has_value();
 }
 
@@ -666,6 +675,9 @@ std::optional<PhysicalUsageSnapshot> Program::shutdown_cleanup() noexcept {
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);
+}
+bool Program::temporary_request_feasible(const RequestBasePlan& base) const noexcept {
+    return impl_->temporary_request_feasible(base);
 }
 
 bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix_cache(); }

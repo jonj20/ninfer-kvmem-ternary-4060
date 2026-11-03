@@ -2,6 +2,7 @@
 #include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
+#include "product/cuda_memory_options.h"
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
@@ -203,8 +204,8 @@ std::string usage_text(const char* argv0) {
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          KV capacity in tokens (default --max-context);\n"
-           "                                auto sizes the pool from free memory\n"
-           "  --kv-headroom-mib N           memory --kv-capacity auto leaves free (default\n"
+           "                                auto follows --cuda-memory-policy\n"
+           "  --kv-headroom-mib N           default policy only: auto KV leaves free (default\n"
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
@@ -276,6 +277,25 @@ std::string usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
+           "  --cuda-memory-policy MODE    behavior when dedicated GPU memory is insufficient:\n"
+           "    default                     plan against CUDA-reported free memory; ordinary\n"
+           "                                driver behavior, no dedicated-residency guarantee\n"
+           "    mixed                       attempt requested allocations beyond CUDA free;\n"
+           "                                allow Windows to borrow system RAM for device data.\n"
+           "                                Placement is driver-managed, not forced to Shared;\n"
+           "                                inference may become much slower. Auto KV is capped\n"
+           "                                at one page-rounded context window per concurrent\n"
+           "                                request; allocation failure is reported, not retried\n"
+           "    strict                      require observed dedicated-VRAM residency; equals\n"
+           "                                strict-64-128 (64 MiB reserve, 128 MiB probe step)\n"
+           "    strict-RESERVE-STEP          customize both values in MiB; RESERVE >= 0,\n"
+           "                                STEP 1..16384. Example: strict-128-64. Reserve is\n"
+           "                                verified at startup, not permanently locked; step\n"
+           "                                controls probes, final device arenas stay contiguous\n"
+           "                                strict selects its required cache automatically.\n"
+           "                                mixed/strict: Windows single-GPU text, no WDDM mode.\n"
+           "  --use-alt-prefix-caching     hybrid device context cache\n"
+           "                                CLI uses no persistent Host retention tier\n"
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
@@ -327,6 +347,7 @@ std::string usage_text(const char* argv0) {
            "                                with no device Vision memory, and caps\n"
            "                                --vision-max-merged at 256 unless given\n"
            "  --vision-cpu                  --vision with --vision-residency cpu\n"
+           "  --cpu-vision-idle-seconds N    Qwen CPU Vision unload after N idle seconds (300; 0 retains)\n"
            "  --vision-max-merged N         merged tokens of one media item (default 16384);\n"
            "                                larger media is downscaled\n"
            "\n"
@@ -360,6 +381,7 @@ Options parse_options(int argc, char** argv) {
     bool spec_explicit              = false;
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
+    const char* unsupported_prefix_flag = nullptr;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -482,6 +504,15 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--rope-scaling-original-context") {
             options.rope_scaling_original_context =
                 product::parse_rope_scaling_original_context(value(arg));
+        } else if (arg == "--use-alt-prefix-caching") {
+            options.use_alt_prefix_caching = true;
+        } else if (arg == "--use-original-prefix-caching" || arg == "--no-prefix-reuse") {
+            unsupported_prefix_flag = argv[i];
+        } else if (arg == "--cuda-memory-policy") {
+            const auto policy = product::parse_cuda_memory_options(value(arg));
+            options.cuda_memory_policy = policy.policy;
+            options.cuda_vram_reserve_bytes = policy.reserve_bytes;
+            options.cuda_memory_probe_step_bytes = policy.probe_step_bytes;
         } else if (arg == "--wddm-evictable-budget") {
             options.wddm_evictable_budget = true;
         } else if (arg == "--mlp-a8-decode") {
@@ -531,6 +562,8 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cpu-vision-idle-seconds") {
+            options.cpu_vision_idle_seconds = parse_u32(value(arg), "cpu-vision-idle-seconds", true);
         } else if (arg == "--vision-residency") {
             const std::string_view mode = value(arg);
             if (mode == "resident") {
@@ -629,6 +662,28 @@ Options parse_options(int argc, char** argv) {
     if (!options.devices.empty() && device_explicit) {
         throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
+    if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault &&
+        (options.wddm_evictable_budget || options.enable_vision || options.devices.size() > 1)) {
+        throw std::invalid_argument(
+            "--cuda-memory-policy mixed/strict requires one GPU, text-only inference and "
+            "ordinary CUDA allocation (no --wddm-evictable-budget)");
+    }
+    if (unsupported_prefix_flag != nullptr) {
+        throw std::invalid_argument(
+            std::string(unsupported_prefix_flag) +
+            (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                 ? " conflicts with --cuda-memory-policy strict, which enables hybrid prefix caching"
+                 : " is not supported by ninfer CLI"));
+    }
+    if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        options.use_alt_prefix_caching = true;
+    } else {
+        options.cuda_vram_reserve_bytes = 0;
+        options.cuda_memory_probe_step_bytes = 0;
+    }
+    if (options.use_alt_prefix_caching && options.devices.size() > 1) {
+        throw std::invalid_argument("--use-alt-prefix-caching requires one GPU");
+    }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
     }
@@ -639,10 +694,16 @@ Options parse_options(int argc, char** argv) {
                                         options.tensor_parallel);
     ninfer::product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
+        if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+            throw std::invalid_argument("--kv-headroom-mib is available only with --cuda-memory-policy default");
+        }
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
+    } else if (options.kv_capacity.mode == KvCapacityMode::Automatic &&
+               options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+        options.kv_capacity = KvCapacityPolicy::automatic(options.cuda_vram_reserve_bytes);
     }
 
     const bool has_prompt   = !options.prompt.empty();

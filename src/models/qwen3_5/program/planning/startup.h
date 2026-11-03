@@ -35,7 +35,22 @@ struct DFlashPersistentLayout {
     }
 };
 
+struct MemoryStatisticsLayout {
+    std::uint32_t first_layer = 0;
+    std::uint32_t layers = 0;
+    TensorLayout key_sums;
+    TensorLayout candidate_keys;
+    TensorLayout candidate_origin;
+    TensorLayout prefill_origin;
+    TensorLayout query_sums;
+    TensorLayout attention_queries;
+    TensorLayout attention_tokens;
+    TensorLayout attention_rows, attention_positions, attention_scratch, attention_norms, attention_output;
+    TensorLayout ranges;
+};
+
 struct PersistentLayout {
+    TensorLayout memory_query_workspace;
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.
@@ -44,6 +59,7 @@ struct PersistentLayout {
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
+    std::vector<MemoryStatisticsLayout> memory_statistics;
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
@@ -96,6 +112,8 @@ struct WorkspacePlan {
 struct SequencePlanningInputs {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t capacity                  = 0;
+    std::uint32_t kvmem_window_tokens = 0;
+    KvmemOptions kvmem;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
@@ -131,6 +149,8 @@ namespace ninfer::models::qwen3_5::detail {
 struct SequencePlanImpl {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t capacity                  = 0;
+    std::uint32_t kvmem_window_tokens = 0;
+    KvmemOptions kvmem;
     std::uint32_t kv_capacity               = 0;
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;

@@ -678,19 +678,12 @@ void parse_tools(const Json& body, GenerationRequest& output) {
     }
 }
 
-// A forced choice is executed by writing the call opener into the generation prompt, and that
-// opener carries the function name. One callable tool determines the name; several leave it to the
-// model, which is the part NInfer cannot constrain.
-void force_single_callable_tool(GenerationRequest& output, const std::string& request) {
+// Required choice leaves name selection to the request grammar.
+void require_callable_tools(GenerationRequest& output, const std::string& request) {
     if (output.tools.empty()) {
         bad_request(request + " requires at least one tool", "tool_choice");
     }
-    if (output.tools.size() != 1) {
-        bad_request(request + " over several tools leaves the function to the model, which NInfer "
-                              "cannot constrain; name the function instead",
-                    "tool_choice", "tool_choice_not_supported");
-    }
-    output.tool_choice.forced_name = output.tools.front().name;
+    output.tool_choice.mode = ToolChoiceMode::Required;
 }
 
 void apply_allowed_tools(const Json& config, GenerationRequest& output) {
@@ -745,13 +738,10 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         }
     }
 
-    std::erase_if(output.tools, [&](const ToolDefinition& tool) {
-        return std::find(allowed_names.begin(), allowed_names.end(), tool.name) ==
-               allowed_names.end();
-    });
+    output.tool_choice.allowed_names = std::move(allowed_names);
     output.tool_choice.mode = ToolChoiceMode::Auto;
     if (mode == "required") {
-        force_single_callable_tool(output, "tool_choice.allowed_tools mode='required'");
+        require_callable_tools(output, "tool_choice.allowed_tools mode='required'");
     }
 }
 
@@ -766,7 +756,7 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             output.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
             output.tool_choice.mode = ToolChoiceMode::Auto;
-            force_single_callable_tool(output, "tool_choice='required'");
+            require_callable_tools(output, "tool_choice='required'");
         } else {
             bad_request("tool_choice must be 'auto', 'none', 'required', or a function choice",
                         "tool_choice");
@@ -793,14 +783,18 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             }
             output.tool_choice.mode        = ToolChoiceMode::Auto;
             output.tool_choice.forced_name = name;
+            output.tool_choice.parallel = false;
         } else if (type == "custom") {
             if (!choice.contains("custom") || !choice.at("custom").is_object()) {
                 bad_request("custom tool_choice must contain a custom object", "tool_choice");
             }
             // Custom tools are served as functions with one string input, so a custom choice is
-            // validated and then handled like any other advisory named choice.
-            (void)require_function_name(choice.at("custom"), "tool_choice.custom.name");
-            output.tool_choice.mode = ToolChoiceMode::Auto;
+            // validated and constrained like a named function choice.
+            const auto name = require_function_name(choice.at("custom"), "tool_choice.custom.name");
+            if (std::none_of(output.tools.begin(), output.tools.end(), [&](const auto& tool) { return tool.name == name; }))
+                bad_request("tool_choice names an undeclared custom tool", "tool_choice");
+            output.tool_choice.forced_name = name;
+            output.tool_choice.parallel = false;
         } else {
             bad_request("unsupported tool_choice type: " + type, "tool_choice");
         }
@@ -816,10 +810,7 @@ void parse_parallel_tool_calls(const Json& body, GenerationRequest& output) {
     if (!body.at("parallel_tool_calls").is_boolean()) {
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
-    // Honoured by keeping the first tool call and dropping the rest, rather than refused. The
-    // guarantee a client depends on is what the response contains, and that much is enforceable
-    // even though decoding itself is not constrained. Refusing instead broke agent harnesses that
-    // send parallel_tool_calls=false whenever any tool is available.
+    // Limit the grammar to one call as well as the wire response.
     output.parallel_tool_calls = body.at("parallel_tool_calls").get<bool>();
 }
 
@@ -985,8 +976,8 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     parse_tools(body, output.generation);
-    output.generation.strict_tools_advisory = true;
     parse_tool_choice(body, output.generation);
+    parse_tool_constraints(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, limits.assistant_prefill, output.generation);
     settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");

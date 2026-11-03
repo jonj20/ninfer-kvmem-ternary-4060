@@ -294,6 +294,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     anchors = ingress_tensor(offsetof(MtpDecodeIngress, anchors), DType::I32, {batch});
     base_frontiers =
         ingress_tensor(offsetof(MtpDecodeIngress, base_frontiers), DType::I32, {batch});
+    logical_frontiers =
+        ingress_tensor(offsetof(MtpDecodeIngress, logical_frontiers), DType::I32, {batch});
     remaining_budgets =
         ingress_tensor(offsetof(MtpDecodeIngress, remaining_budgets), DType::I32, {batch});
     current_extents =
@@ -429,6 +431,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, execution_frontiers), DType::I32, {batch});
     context_frontiers =
         ingress_tensor(offsetof(DFlashDecodeIngress, context_frontiers), DType::I32, {batch});
+    draft_frontiers =
+        ingress_tensor(offsetof(DFlashDecodeIngress, draft_frontiers), DType::I32, {batch});
+    draft_floors = ingress_tensor(offsetof(DFlashDecodeIngress, draft_floors), DType::I32, {batch});
     proposal_extents =
         ingress_tensor(offsetof(DFlashDecodeIngress, proposal_extents), DType::I32, {batch});
     target_valid_columns =

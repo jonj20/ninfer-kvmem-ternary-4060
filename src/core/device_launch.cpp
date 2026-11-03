@@ -3,6 +3,9 @@
 // the rest of device.cu. Each copy calls its own module's CUDA runtime, which registered that
 // module's kernels.
 #include "core/device.h"
+#ifdef NINFER_RESIDENT_MEMORY
+#include "core/resident_memory.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +17,12 @@ namespace ninfer {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
+#ifdef NINFER_RESIDENT_MEMORY
+    if (core::current_resident_memory()) {
+        throw CudaError(err, std::string(file) + ":" + std::to_string(line) +
+            ": CUDA_CHECK(" + expr + ") failed: " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err));
+    }
+#endif
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
                  cudaGetErrorName(err), cudaGetErrorString(err));
     std::abort();

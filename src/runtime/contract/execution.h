@@ -5,8 +5,16 @@
 #include <array>
 #include <compare>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
+
+// A deferred request asset could not be loaded before its consumer executed. The Engine aborts
+// only that request; this is distinct from an execution invariant or a device-wide failure.
+class RequestResourceError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // Prefill units a prompt may be passed over for shorter ones before it runs ahead of them: each
 // unit goes to the shortest remaining prompt, so a short or prefix-cached request is not held

@@ -2,6 +2,9 @@
 #include "product/kv_resident_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
+#include "kvmem/cli_options.h"
+#include "runtime/speculative_limits.h"
+#include "product/cuda_memory_options.h"
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
@@ -113,6 +116,37 @@ std::string serve_usage_text(const char* argv0) {
            "  --version                     print the build version and exit\n"
            "\n"
            "MODEL & CONTEXT\n"
+           "  --kvmem / --no-kvmem          enable/disable KVMem (default off; positive B enables)\n"
+           "  --kvmem-budget N              positive selected history B (default 32768), aligned to 64\n"
+           "  --kvmem-query-replay-max-tokens N  bound complete Query replay (default 2048)\n"
+            "  --kvmem-query-scorer NAME    page-softmax (default) | meanq-cosine\n"
+            "  --kvmem-score-agg MODE       mean | max (default: page-softmax mean, cosine max)\n"
+            "  --kvmem-lrfu / --no-kvmem-lrfu  Query history (default on only for cosine)\n"
+            "  --kvmem-lrfu-lambda X        history decay in [0,1] (default 0.5)\n"
+            "  --kvmem-lrfu-top-frac X      history hit fraction in (0,1] (default 0.9)\n"
+            "  --kvmem-graph-alpha X        Query propagation in [0,1] (default: page-softmax 0.2; cosine 0)\n"
+            "  --kvmem-capabilities         Print model-free console capability JSON and exit\n"
+           "  --kvmem-query-max-tokens N  cap per-token Query capture to its tail (default 512)\n"
+            "  --kvmem-gen-reserve N         positive append workspace R (default 1024), aligned to 64\n"
+           "  --kvmem-host-mib N            positive Host native KV payload budget H, MiB (default 16384)\n"
+           "  --kvmem-sink-tokens N         always-kept prefix; default 0 = one 64-token\n"
+           "                                page; positive values round down, minimum one page\n"
+           "  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);\n"
+           "                                minimum 64; values round down to whole pages\n"
+           "  --kvmem-sessions N            inactive histories, 1..16 (default 4); active requests excluded\n"
+           "  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory\n"
+           "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB; 0 = off (default)\n"
+           "                                KVMem uses B+R device tokens and its own\n"
+           "                                verified history reuse; BF16/INT8/FP8/NVFP4/K8V4,\n"
+           "                                RK8V4/RK4V4/RK4V4-E8/RK2V4-E8,\n"
+           "                                1..8 text or resident/CPU-vision lanes,\n"
+           "                                ordinary/fixed/adaptive MTP1..15; DFlash2 1..15\n"
+           "                                on one sequence/GPU; ngram1..63,\n"
+           "                                C2..8 automatically cap ngram at 15;\n"
+           "                                ngram text/images use all nine KV formats,\n"
+           "                                SSD: process-local active/idle tiering; fast prefill supports\n"
+           "                                INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 text/images\n"
+           "  --kvmem-verify-transfers      check restored KV/GDN bytes (diagnostic)\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
@@ -129,8 +163,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                metadata.name\n"
            "  --chat-template FILE          replace the artifact's chat template at startup\n"
            "  --device N                    CUDA device index (default 0)\n"
-           "  --devices A,B,...             one pipeline stage per listed device, 2..8;\n"
-           "                                excludes --device\n"
+           "  --devices A,B,...             one pipeline stage per listed device, 2..8\n"
+           "                                (Linux/Windows); excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
            "  --tensor-parallel             the --devices share every layer: GDN heads, KV\n"
@@ -205,6 +239,26 @@ std::string serve_usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
+           "  --cuda-memory-policy MODE    behavior when dedicated GPU memory is insufficient:\n"
+           "    default                     plan against CUDA-reported free memory; ordinary\n"
+           "                                driver behavior, no dedicated-residency guarantee\n"
+           "    mixed                       attempt requested allocations beyond CUDA free;\n"
+           "                                allow Windows to borrow system RAM for device data.\n"
+           "                                Placement is driver-managed, not forced to Shared;\n"
+           "                                inference may become much slower. Auto KV is capped\n"
+           "                                at one page-rounded context window per concurrent\n"
+           "                                request; allocation failure is reported, not retried\n"
+           "    strict                      require observed dedicated-VRAM residency; equals\n"
+           "                                strict-64-128 (64 MiB reserve, 128 MiB probe step)\n"
+           "    strict-RESERVE-STEP          customize both values in MiB; RESERVE >= 0,\n"
+           "                                STEP 1..16384. Example: strict-128-64. Reserve is\n"
+           "                                verified at startup, not permanently locked; step\n"
+           "                                controls probes, final device arenas stay contiguous\n"
+           "                                strict selects its required cache automatically.\n"
+           "                                --host-cache-mib independently sizes CPU context\n"
+           "                                retention, not device-data system-RAM fallback.\n"
+           "                                mixed/strict: Windows single-GPU text, no WDDM mode;\n"
+           "                                no model suspend, router, grafts or qwen4_exp.\n"
            "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
            "                                memory, committing arenas at startup\n"
            "\n"
@@ -398,8 +452,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --ngram-draft-tokens N        copy up to N tokens (1..63) per round from\n"
            "                                earlier prompt, tool-result or output text,\n"
            "                                verified alongside --spec; on with 15 whenever\n"
-           "                                --spec is set, 0 disables it, above 15 needs\n"
-           "                                --max-concurrency 1\n"
+           "                                --spec is set, 0 disables it; widths above 15\n"
+           "                                automatically reduce to 15 with concurrency >1\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
            "  --ngram-archive-mib N         keep finished requests' copy sources in RAM for\n"
@@ -412,7 +466,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                which has no drafter, and DeepSeek-V4.1 without\n"
            "                                it): the last N tokens are matched against the\n"
            "                                sequence so far and what followed is proposed\n"
-           "                                (default 0: off)\n"
+           "                                (default 0: off; disabled with KVMem)\n"
            "\n"
            "VISION (off by default)\n"
            "  --vision                      accept images and video and load the Vision GPU\n"
@@ -424,6 +478,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                with no device Vision memory, and caps\n"
            "                                --vision-max-merged at 256 unless given\n"
            "  --vision-cpu                  --vision with --vision-residency cpu\n"
+           "  --cpu-vision-idle-seconds N    Qwen CPU Vision unload after N idle seconds (300; 0 retains)\n"
            "  --vision-max-merged N         merged tokens of one media item, 64..16384\n"
            "                                (default 16384); larger media is downscaled\n"
            "  --media-cache-mib N           retained prepared media (default 1024; 0\n"
@@ -479,10 +534,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                none; a request opts out with \"graft\": \"\"\n"
            "\n"
            "API BEHAVIOR\n"
-           "  --structured-output           enforce response formats (JSON, JSON Schema,\n"
-           "                                regex, choice, GBNF) and strict tool arguments;\n"
-           "                                reserves the grammar masks and adds a grammar\n"
-           "                                stage to every DFlash round\n"
+           "  --structured-output           accept JSON, JSON Schema, regex, choice and GBNF\n"
+           "                                response formats; native tool constraints are\n"
+           "                                enabled by default\n"
            "  --unconstrained-response-format\n"
            "                                without --structured-output, generate such a\n"
            "                                request unconstrained instead of refusing it\n"
@@ -597,6 +651,7 @@ std::vector<std::uint32_t> parse_stage_layers(std::string_view text) {
 
 ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
+    kvmem::CliOptions memory;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
     bool redact_next = false;
     for (int i = 0; i < argc; ++i) {
@@ -690,6 +745,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+            continue;
+            continue;
+        }
+        if(arg=="--kvmem-query-replay-max-tokens") {
+            options.kvmem.query_replay_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),1);
+            continue;
+        }
+        if(arg=="--kvmem-query-max-tokens") {
+            options.kvmem.query_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),1);
+            continue;
+        }
+        if (memory.parse(arg, require_value)) continue;
+        if (arg == "--kvmem-verify-transfers") {
+            options.kvmem.verify_transfers = true;
             continue;
         }
         if (arg == "--kv-headroom-mib" || arg == "--vram-headroom-mib") {
@@ -1266,6 +1335,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--cpu-vision-idle-seconds") {
+            const auto seconds = parse_u64(require_value("--cpu-vision-idle-seconds"),
+                                           "cpu-vision-idle-seconds");
+            if (seconds > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("cpu-vision-idle-seconds exceeds uint32 range");
+            }
+            options.cpu_vision_idle_seconds = static_cast<std::uint32_t>(seconds);
+            continue;
+        }
         if (arg == "--vision-cpu") {
             // The gzenz fork's switch for Vision on CPU threads.
             options.enable_vision    = true;
@@ -1329,7 +1407,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--derive-session-keys") {
-            legacy_cache_flag           = "--derive-session-keys";
+            // The lineage hint also feeds KVMem histories.
             options.derive_session_keys = true;
             continue;
         }
@@ -1422,6 +1500,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--rope-scaling-original-context") {
             options.rope_scaling_original_context = product::parse_rope_scaling_original_context(
                 require_value("--rope-scaling-original-context"));
+            continue;
+        }
+        if (arg == "--cuda-memory-policy") {
+            const auto policy = product::parse_cuda_memory_options(require_value(arg.c_str()));
+            options.cuda_memory_policy = policy.policy;
+            options.cuda_vram_reserve_bytes = policy.reserve_bytes;
+            options.cuda_memory_probe_step_bytes = policy.probe_step_bytes;
             continue;
         }
         if (arg == "--wddm-evictable-budget") {
@@ -1646,6 +1731,26 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--default-graft '" + options.default_graft +
                                     "' does not name a --graft");
     }
+    memory.resolve();
+    options.kvmem.selected_tokens = memory.budget;
+    options.kvmem.reserve_tokens = memory.gen_reserve;
+    options.kvmem.host_bytes = static_cast<std::size_t>(memory.payload_host_bytes);
+    options.kvmem.disk_bytes = memory.payload_disk_bytes;
+    options.kvmem.disk_path = std::filesystem::u8path(memory.payload_disk_dir);
+    options.kvmem.sink_tokens = memory.sink_tokens;
+    options.kvmem.recent_tokens = memory.recent_tokens;
+    options.kvmem.retained_sessions = memory.sessions;
+    options.kvmem.lrfu = memory.lrfu;
+    options.kvmem.lrfu_lambda = memory.lrfu_lambda;
+    options.kvmem.lrfu_top_fraction = memory.lrfu_top_fraction;
+    options.kvmem.score_agg_max = memory.score_agg == 1;
+    options.kvmem.query_meanq_cosine = memory.query_scorer == kvmem::QueryScorer::MeanQCosine;
+    options.kvmem.graph_alpha = memory.graph_alpha;
+    if (options.kvmem.selected_tokens != 0 &&
+        (options.suspend.enabled || !options.grafts.empty() || options.router() ||
+         options.expert_residency != ExpertResidency::Device)) {
+        throw std::invalid_argument("KVMem does not support model suspend, prompt grafts, model router mode or host/disk routed experts");
+    }
     if (original_cache_selected && hybrid_cache_selected) {
         throw std::invalid_argument(
             "--use-original-prefix-caching and --use-alt-prefix-caching select different prefix "
@@ -1661,10 +1766,38 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         catalog_option = "--no-prefix-reuse";
     }
     if (catalog_option == nullptr && !options.grafts.empty()) { catalog_option = "--graft"; }
+    if (catalog_option == nullptr && options.kvmem.selected_tokens != 0) {
+        catalog_option = "--kvmem";
+    }
+    if (catalog_option == nullptr && options.derive_session_keys) {
+        catalog_option = "--derive-session-keys";
+    }
     options.context_cache.mode =
         hybrid_cache_selected || (!original_cache_selected && catalog_option == nullptr)
             ? ContextCacheMode::Hybrid
             : ContextCacheMode::Legacy;
+    // Resolve policy-implied cache mode before choosing the KV default or validating cache flags.
+    if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        if (original_cache_selected || !options.allow_prefix_reuse) {
+            throw std::invalid_argument(
+                "--cuda-memory-policy strict enables hybrid prefix caching and conflicts with "
+                "--use-original-prefix-caching and --no-prefix-reuse");
+        }
+        options.context_cache.mode = ContextCacheMode::Hybrid;
+    } else {
+        options.cuda_vram_reserve_bytes = 0;
+        options.cuda_memory_probe_step_bytes = 0;
+    }
+    if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault &&
+        (options.wddm_evictable_budget || options.enable_vision || options.devices.size() > 1)) {
+        throw std::invalid_argument(
+            "--cuda-memory-policy mixed/strict requires one GPU, text-only inference and "
+            "ordinary CUDA allocation (no --wddm-evictable-budget)");
+    }
+    if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault &&
+        (options.suspend.enabled || !options.grafts.empty() || options.router())) {
+        throw std::invalid_argument("--cuda-memory-policy mixed/strict does not support model suspend, prompt grafts or the model router");
+    }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
         // it sizes the KV pool to free VRAM unless a capacity is given.
@@ -1673,8 +1806,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (options.context_cache.mode == ContextCacheMode::Hybrid) {
-        if (legacy_cache_flag != nullptr) {
-            throw std::invalid_argument(std::string(legacy_cache_flag) +
+        if (legacy_cache_flag != nullptr || options.derive_session_keys) {
+            throw std::invalid_argument(std::string(legacy_cache_flag ? legacy_cache_flag : "--derive-session-keys") +
                                         " configures the checkpoint catalog and cannot be "
                                         "combined with --use-alt-prefix-caching");
         }
@@ -1715,10 +1848,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             " selects the checkpoint catalog");
     }
     if (kv_headroom_mib.has_value()) {
+        if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+            throw std::invalid_argument("--kv-headroom-mib is available only with --cuda-memory-policy default");
+        }
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
+    } else if (options.kv_capacity.mode == KvCapacityMode::Automatic &&
+               options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+        options.kv_capacity = KvCapacityPolicy::automatic(options.cuda_vram_reserve_bytes);
     }
     if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {
         throw std::invalid_argument("--long-anchor-spacing requires --auto-long-anchors");
@@ -1795,7 +1934,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--stats-port must be in [1,65535] and differ from --port");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (!options.kvmem.selected_tokens && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
@@ -1837,10 +1976,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--cuda-graph-allowance-mib requires CUDA graphs (omit --no-cuda-graph)");
     }
-    // The GDN conv-record workspace admits at most 16 verification columns when the batch holds
-    // more than one request, so a wider ngram proposal is admitted only for one active request.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("--ngram-draft-tokens above 15 requires --max-concurrency 1");
+    const auto effective_ngram = runtime::concurrent_ngram_draft_tokens(
+        options.speculative.ngram_draft_tokens, options.max_concurrency);
+    if (effective_ngram != options.speculative.ngram_draft_tokens) {
+        options.requested_ngram_draft_tokens = options.speculative.ngram_draft_tokens;
+        options.speculative.ngram_draft_tokens = effective_ngram;
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
@@ -1860,6 +2000,88 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
     }
+    if (options.kvmem.selected_tokens) {
+        if (options.speculative.lookup_ngram != 0) {
+            throw std::invalid_argument(
+                "KVMem disables legacy --lookup-ngram; use --ngram-draft-tokens and --ngram-min-match");
+        }
+        const auto window = options.kvmem.device_tokens();
+        const bool ordinary = options.speculative.backend == SpeculativeBackend::None &&
+            options.speculative.draft_tokens == 0;
+        const bool memory_mtp = options.speculative.backend == SpeculativeBackend::Mtp &&
+            (options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15);
+        const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
+        const bool adaptive_mtp = memory_mtp &&
+            options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
+        // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
+        const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
+            options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
+            options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
+        const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
+            ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
+             options.speculative.ngram_draft_tokens <= 63 &&
+             options.speculative.ngram_min_match >= 4 && options.speculative.ngram_min_match <= 64 &&
+             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens) +
+                 options.speculative.draft_tokens <= options.kvmem.reserve_tokens);
+        const bool memory_spec_supported = (ordinary || fixed_mtp || adaptive_mtp || memory_dflash2) && memory_ngram_supported &&
+            options.speculative.mtp_attention_window == 0;
+
+        if (legacy_cache_flag || hybrid_option_flag || original_cache_selected ||
+            options.context_cache.mode != ContextCacheMode::Legacy ||
+            options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency ||
+            (options.enable_vision && options.vision_residency != VisionResidency::Resident &&
+                options.vision_residency != VisionResidency::Cpu) ||
+            !memory_spec_supported || options.concurrent_prefill ||
+            (options.fast_prefill_kernel &&
+                (options.kv_cache != KvCacheStorage::Int8Group64 &&
+                 options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+                 options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
+                 options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+                 options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) || options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault ||
+            (options.kv_cache != KvCacheStorage::BFloat16 && options.kv_cache != KvCacheStorage::Int8Group64 &&
+             options.kv_cache != KvCacheStorage::Nvfp4Group16 &&
+             options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value &&
+             options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+             options.kv_cache != KvCacheStorage::Fp8E4M3Row256 &&
+             options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
+             options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+             options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
+            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                "and exclusive ownership of history caching");
+        }
+        if (options.kvmem.recent_blocks() == 0) {
+            throw std::invalid_argument(
+                "KVMem --kvmem-recent-tokens must be at least 64 to retain the partial append page");
+        }
+        if (static_cast<std::uint64_t>(options.kvmem.sink_blocks()) + options.kvmem.recent_blocks() >
+            options.kvmem.selected_tokens / 64) {
+            throw std::invalid_argument(
+                "KVMem sink and recent tokens exceed --kvmem-budget after rounding to 64-token pages");
+        }
+        if (options.kvmem.selected_tokens < 128 || options.kvmem.selected_tokens % 64 ||
+            options.kvmem.reserve_tokens < 64 || options.kvmem.reserve_tokens % 64 ||
+            window < 256 || window > options.max_context || !options.kvmem.host_bytes ||
+            options.kvmem.retained_sessions == 0 || options.kvmem.retained_sessions > 16 ||
+            options.prefill_chunk > options.kvmem.reserve_tokens ||
+            (kv_capacity_explicit && (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+                                     options.kv_capacity.explicit_tokens != window * options.max_concurrency))) {
+            throw std::invalid_argument("KVMem requires aligned B/R, nonzero H, prefill <= R, "
+                                        "and device capacity B+R <= max-context");
+        }
+        if (window * options.max_concurrency > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::invalid_argument("KVMem global device capacity exceeds uint32");
+        }
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(window * options.max_concurrency));
+        // --no-prefix-reuse still controls request reuse. Only the native catalog
+        // is disabled here; KVMem owns the current session's trusted checkpoint.
+        options.context_cache.enabled = false;
+    } else if (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers ||
+         !options.kvmem.disk_path.empty() || options.kvmem.disk_bytes) {
+        throw std::invalid_argument("KVMem auxiliary options require --kvmem-budget");
+    }
+    if (options.kvmem.disk_path.empty() != (options.kvmem.disk_bytes == 0) ||
+        options.kvmem.host_bytes > UINT64_MAX - options.kvmem.disk_bytes)
+        throw std::invalid_argument("KVMem SSD requires both --kvmem-disk-path and --kvmem-disk-mib");
     return options;
 }
 

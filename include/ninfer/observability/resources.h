@@ -37,8 +37,8 @@ struct ArenaMemorySummary {
     std::size_t peak_used_bytes = 0;
 };
 
-// Logical regions within the one physical workspace allocation. These byte values describe
-// layout and live extents and must not be added to workspace.capacity_bytes.
+// Vision workspace extents and separate weight residency. Workspace extents describe regions
+// within workspace.capacity_bytes; CPU/overlay Host weights are separate allocations.
 struct VisionWorkspaceMemorySummary {
     std::uint32_t aggregate_prompt_tokens = 0;
     std::uint32_t max_item_tokens         = 0;
@@ -52,6 +52,14 @@ struct VisionWorkspaceMemorySummary {
     std::size_t window_capacity_bytes     = 0; // overlay: device bytes one window borrows
     std::size_t pinned_weight_bytes       = 0; // overlay: host-pinned tower bytes
     std::size_t mirror_bytes              = 0; // overlay: pinned mirror of the borrowable tail
+    bool cpu_weights_lazy                = false;
+    bool cpu_weights_loading             = false;
+    std::size_t cpu_weight_bytes          = 0;
+    std::size_t cpu_weight_users          = 0;
+    std::uint64_t cpu_weight_loads        = 0, cpu_weight_unloads = 0;
+    double cpu_weight_last_load_seconds   = 0;
+    std::uint32_t cpu_weight_idle_seconds = 0;
+
 };
 
 // One device of a pipeline: what its weights, its layers' persistent state, its scratch and its
@@ -64,7 +72,47 @@ struct DeviceMemorySummary {
     std::size_t expert_cache_bytes = 0;
 };
 
+// Latest observed process residency, not a permanent physical-pinning guarantee. Intentional
+// pinned Host allocations are established before shared_baseline_bytes; device-driven growth
+// above that baseline invalidates a strict candidate. Zero counters while disabled are unknown.
+struct CudaResidencySummary {
+    bool enabled = false;
+    bool verified = false;
+    std::size_t cuda_free_bytes = 0;
+    std::size_t cuda_total_bytes = 0;
+    std::size_t dedicated_bytes = 0;
+    std::size_t shared_bytes = 0;
+    std::size_t shared_baseline_bytes = 0;
+    std::size_t device_allocated_bytes = 0;
+    std::size_t host_pool_bytes = 0;
+    std::size_t host_used_bytes = 0;
+    std::size_t verified_reserve_bytes = 0;
+};
+
+// Gauges of the current KVMem history (active or retained), not process-lifetime
+// counters. Payload H excludes statistics, checkpoint images and native workspace.
+struct KvmemMemorySummary {
+    bool enabled = false;
+    std::uint32_t selected_tokens = 0, reserve_tokens = 0;
+    std::uint64_t host_payload_budget_bytes = 0, host_payload_bytes = 0;
+    std::uint64_t disk_payload_budget_bytes = 0, disk_payload_bytes = 0;
+    std::uint64_t retained_payload_budget_bytes = 0;
+    std::uint64_t disk_read_bytes = 0, disk_written_bytes = 0;
+    std::uint64_t statistics_bytes = 0, checkpoint_bytes = 0;
+    std::uint64_t transfer_staging_bytes = 0;
+    std::uint64_t statistics_staging_bytes = 0;
+    std::uint32_t mtp_resident_pages = 0;
+    std::uint32_t retained_sessions = 0, active_sessions = 0, retained_sessions_limit = 0;
+    std::uint64_t history_hits = 0, history_misses = 0, history_evictions = 0;
+    std::uint64_t disk_hits = 0, disk_writes = 0, disk_errors = 0;
+    std::uint64_t active_payload_reservation_bytes = 0;
+    std::uint32_t evaluated_tokens = 0, checkpoint_tokens = 0, resident_pages = 0;
+    std::uint32_t history_swaps = 0;
+    std::uint64_t history_spilled_bytes = 0, history_restored_bytes = 0;
+};
+
 struct MemorySummary {
+    KvmemMemorySummary kvmem;
     int device                                = 0;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
@@ -102,6 +150,7 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
+    CudaResidencySummary cuda_residency;
     // Host or disk routed experts: persistent device cache bytes, over every device. Native
     // Qwen delivery windows are counted separately in workspace.
     std::size_t expert_cache_bytes = 0;

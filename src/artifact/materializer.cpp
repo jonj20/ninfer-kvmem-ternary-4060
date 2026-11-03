@@ -692,6 +692,15 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
     return *objects_[handle.index].host;
 }
 
+const WeightParent& MaterializedArtifact::device_replica(ObjectHandle handle,
+                                                        std::size_t rank) const {
+    const auto& storage = objects_.at(handle.index);
+    if (storage.device && storage.device_rank == rank) { return *storage.device; }
+    const auto found = storage.replicas.find(rank);
+    if (found == storage.replicas.end()) { throw ArtifactError("object has no replica on requested rank"); }
+    return found->second;
+}
+
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].host_data.empty()) {
         throw ArtifactError("object has no retained Host bytes");
@@ -762,12 +771,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.device_capacity_bytes = plan.device_capacity(0);
     out.stats_.device_object_count   = plan.device_objects.size();
     out.stats_.host_object_count     = plan.host_objects.size();
-    if (backing && rank_count > 1) {
-        // The pool's window is borrowed by a Vision encode that runs on the primary device, and
-        // nothing on an offloaded rank is lendable. Combining them is a planning error, not a
-        // configuration to silently half-apply.
-        throw ArtifactError("an eviction pool backs only a single-device materialization");
-    }
+    // The pool backs rank 0's arena alone: its window is borrowed by a Vision encode on the primary
+    // device, and later ranks get ordinary arenas below. The planner already refuses an evictable
+    // placement anywhere but rank 0.
     out.arenas_.resize(rank_count);
     if (options.suspendable) { out.regions_.resize(rank_count); }
     for (std::size_t rank = 0; rank < rank_count; ++rank) {
@@ -934,7 +940,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         const auto& arena    = out.arenas_[placement.rank];
         const auto rank_capacity = plan.device_capacity(placement.rank);
-        if (object.device || !arena || geometry.bytes != placement.bytes ||
+        if ((!placement.replica && object.device) || object.replicas.contains(placement.rank) ||
+            (object.device && object.device_rank == placement.rank) ||
+            !arena || geometry.bytes != placement.bytes ||
             (placement.transcode && object.host)) {
             throw ArtifactError("invalid or duplicate device placement");
         }
@@ -953,8 +961,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             divisor = read_divisor(reader, stored, stored_geometry, {}, out.stats_,
                                    placement.selection ? placement.selection->rows.front().first : 0);
         }
-        object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
-                                     divisor, stored_geometry.format};
+        WeightParent parent{geometry, static_cast<const std::byte*>(storage.data),
+                            divisor, stored_geometry.format};
+        if (placement.replica) {
+            object.replicas.emplace(placement.rank, std::move(parent));
+        } else {
+            object.device = std::move(parent);
+            object.device_rank = placement.rank;
+        }
     }
     const UploadTotals upload = upload_device_objects(reader, plan.device_objects,
                                                       out.arena_bases(), device, observer, phase,

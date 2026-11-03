@@ -1,4 +1,5 @@
 #pragma once
+namespace kvmem { class monitor; class monitor_hardware; }
 
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
@@ -136,7 +137,7 @@ private:
         std::atomic<State> state_{State::Pending};
     };
 
-    [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
+    [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context, PreparedRequest& prepared);
 
     [[nodiscard]] httplib::Server::HandlerResponse pre_route(const httplib::Request& req,
                                                              httplib::Response& res) const;
@@ -191,6 +192,7 @@ private:
     // What the server reports about one loaded model, computed once per Engine instance: an
     // unload and a later load start a new one.
     struct ModelFacts {
+        nlohmann::json monitor_devices = nlohmann::json::array();
         const GenerationService* service = nullptr;
         LoadCapacity capacity;
         ninfer::ModelMetadata metadata;
@@ -247,6 +249,8 @@ private:
     OperationalLog operational_log_;
     // Mutable: a model's server_start record is written when a const handler first sees it.
     mutable JsonlRequestLog request_jsonl_;
+    std::unique_ptr<kvmem::monitor> monitor_;
+    std::unique_ptr<kvmem::monitor_hardware> monitor_hardware_;
     ServeMetrics metrics_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;

@@ -70,6 +70,7 @@ struct BenchOptions {
     bool fast_prefill_kernel    = false;
     std::uint32_t prefill_chunk = 0; // 0: the Engine's automatic chunk
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    KvmemOptions kvmem;
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
     EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
@@ -90,6 +91,7 @@ struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    std::vector<TokenId> generated_token_ids;
 };
 
 struct TestResult {

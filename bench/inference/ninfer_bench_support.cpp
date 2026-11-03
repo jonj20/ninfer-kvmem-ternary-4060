@@ -1,5 +1,6 @@
 #include "ninfer_bench_support.h"
 #include "product/hybrid_expert_options.h"
+#include "kvmem/cli_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -270,6 +271,9 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
 void append_timings_json(std::ostringstream& out, const GenerationTimings& timings,
                          std::string_view indent) {
     out << indent << "\"timings\": {" << "\"prepare_seconds\": " << number(timings.prepare_seconds)
+        << ", \"first_token_seconds\": " << number(timings.first_token_seconds)
+        << ", \"prompt_wall_seconds\": " << number(timings.prompt_wall_seconds)
+        << ", \"generation_wall_seconds\": " << number(timings.generation_wall_seconds)
         << ", " << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "
@@ -309,6 +313,12 @@ std::string usage_text(std::string_view program) {
         << "  --warmup <n>                discarded repetitions (default: " << kDefaultWarmup
         << ")\n"
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
+        << "  --kvmem-budget <B>         enable KVMem with B selected history tokens\n"
+        << "  --kvmem-gen-reserve <G>    generation reserve; Main KV capacity is B+G\n"
+        << "  --kvmem-host-mib <MiB>     host history payload budget\n"
+        << "  --kvmem-disk-path <path>   disk history directory; requires --kvmem-disk-mib\n"
+        << "  --kvmem-verify-transfers   expensive validation; do not enable for timings\n"
+        << "  Other shared --kvmem-* policy options match ninfer-serve.\n"
         << "  --rope-yarn-factor <F>      YaRN at this fixed factor, 1..4, for every position "
            "(default: 1, native RoPE)\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
@@ -351,10 +361,17 @@ std::string usage_text(std::string_view program) {
 
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
+    kvmem::CliOptions memory;
     bool saw_artifact         = false;
     bool ngram_width_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
+        const auto need = [&](const char* flag) -> const char* {
+            if (++i >= argc) throw std::invalid_argument(std::string(flag) + " requires value");
+            return argv[i];
+        };
+        if (memory.parse(std::string(arg), need)) continue;
+        if (arg == "--kvmem-verify-transfers") { options.kvmem.verify_transfers = true; continue; }
         auto value = [&](const char* flag) -> std::string {
             if (i + 1 >= argc) {
                 throw std::invalid_argument(std::string(flag) + " requires value");
@@ -472,6 +489,21 @@ BenchOptions parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
+    memory.resolve();
+    options.kvmem.selected_tokens = memory.budget;
+    options.kvmem.reserve_tokens = memory.gen_reserve;
+    options.kvmem.host_bytes = static_cast<std::size_t>(memory.payload_host_bytes);
+    options.kvmem.disk_bytes = memory.payload_disk_bytes;
+    options.kvmem.disk_path = std::filesystem::u8path(memory.payload_disk_dir);
+    options.kvmem.sink_tokens = memory.sink_tokens;
+    options.kvmem.recent_tokens = memory.recent_tokens;
+    options.kvmem.retained_sessions = memory.sessions;
+    options.kvmem.lrfu = memory.lrfu;
+    options.kvmem.lrfu_lambda = memory.lrfu_lambda;
+    options.kvmem.lrfu_top_fraction = memory.lrfu_top_fraction;
+    options.kvmem.score_agg_max = memory.score_agg == 1;
+    options.kvmem.query_meanq_cosine = memory.query_scorer == kvmem::QueryScorer::MeanQCosine;
+    options.kvmem.graph_alpha = memory.graph_alpha;
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
@@ -807,7 +839,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
-        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
+        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << ",\n"
+        << "    \"kvmem\": {\"enabled\": " << (env.memory.kvmem.enabled ? "true" : "false")
+        << ", \"selected_tokens\": " << env.memory.kvmem.selected_tokens
+        << ", \"reserve_tokens\": " << env.memory.kvmem.reserve_tokens
+        << ", \"host_payload_bytes\": " << env.memory.kvmem.host_payload_bytes
+        << ", \"disk_payload_bytes\": " << env.memory.kvmem.disk_payload_bytes << "}\n"
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
@@ -881,7 +918,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
                                              : "null")
                 << ",\n";
             append_timings_json(out, rep.timings, "          ");
-            out << ",\n";
+            out << ",\n          \"generated_token_ids\": [";
+            for (std::size_t t = 0; t < rep.generated_token_ids.size(); ++t) {
+                if (t) out << ',';
+                out << rep.generated_token_ids[t];
+            }
+            out << "],\n";
             append_speculative_json(out, rep.speculative, "          ");
             out << "\n        }" << (r + 1 == result.reps.size() ? "" : ",") << '\n';
         }

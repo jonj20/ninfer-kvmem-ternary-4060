@@ -4,6 +4,7 @@
 // hybrid_cache.{h,cpp}.
 
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/planning/prefill_service_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/internal.h"
@@ -222,6 +223,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     quote->summary                     = plan.summary;
     quote->sampling                    = plan.sampling;
     quote->grammar                     = plan.grammar;
+    quote->suppressed_tool_open        = plan.suppressed_tool_open;
     quote->logprobs                    = plan.logprobs;
     quote->readout_tokens              = plan.readout_tokens;
     quote->branches                    = plan.branches;
@@ -921,20 +923,16 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         sequence.rebuild_tail_begin = quote.root_rebuild_tail_begin;
         bind_sequence_kv(sequence);
 
-        const std::uint32_t initial_mtp_extent =
-            prepare_mtp ? std::min({draft_window,
-                                    quote.summary.effective_output_tokens > 1
-                                        ? quote.summary.effective_output_tokens - 2
-                                        : 0U,
-                                    capacity - n > 0 ? capacity - n - 1 : 0U})
-                        : 0U;
+        const auto initial_mtp_extent = initial_mtp_prefill_extent(
+            prepare_mtp ? draft_window : 0U, quote.summary.effective_output_tokens, capacity, n);
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity, n + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? n
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, n, backend_materialized);
-        request.grammar  = quote.grammar;
+        request.grammar              = quote.grammar;
+        request.suppressed_tool_open = quote.suppressed_tool_open;
         request.logprobs = quote.logprobs;
         request.readout_tokens = quote.readout_tokens;
         request.branches       = quote.branches;
@@ -1071,6 +1069,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = prepare_mtp,
             .reuse              = quote.summary.prefix_reuse_path,
+            .reported_reuse_path = quote.summary.prefix_reuse_path,
             .mtp_bridge =
                 prepare_mtp && reuse != 0 ? MtpBridgeMode::BeforeSuffix : MtpBridgeMode::None,
         };

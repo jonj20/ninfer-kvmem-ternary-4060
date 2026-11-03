@@ -4,6 +4,8 @@
  * \brief Implementation of extended format converters.
  */
 #include "json_schema_converter_ext.h"
+#include "json_string_grammar.h"
+#include "grammar_functor.h"
 
 #include <picojson.h>
 
@@ -562,7 +564,10 @@ void XMLToolCallingConverter::AddBasicRules() {
   // The outer part, xml format, is at level 1.
   nested_object_level_ = 1;
   // Add XML string rule
-  builder_.UpdateRuleBody(kXMLString, TagDispatch(false, {xml_wrapper_.parameter_suffix}));
+  builder_.UpdateRuleBody(kXMLString,
+      json_format_ == JSONFormat::kQwenXML
+          ? RuleRef(SubGrammarAdder::Apply(&builder_, StringConstraints({}, 0, -1, {"\n</parameter>"}, false)))
+          : TagDispatch(false, {xml_wrapper_.parameter_suffix}));
   AddCache(kStringCacheKey, builder_.GetRuleId(kXMLString));
 
   // Add XML any rule
@@ -582,7 +587,9 @@ void XMLToolCallingConverter::AddBasicRules() {
   // Add XML variable name rule
   builder_.UpdateRuleBody(
       kXMLVariableName,
-      Sequence(
+      json_format_ == JSONFormat::kQwenXML
+          ? RuleRef(SubGrammarAdder::Apply(&builder_, StringConstraints({}, 1, -1, {"<", ">", "\r", "\n"}, false)))
+          : Sequence(
           {builder_.AddCharacterClass({{'a', 'z'}, {'A', 'Z'}, {'_', '_'}}),
            builder_.AddCharacterClassStar({{'a', 'z'}, {'A', 'Z'}, {'0', '9'}, {'_', '_'}})}
       )
@@ -614,15 +621,78 @@ int32_t XMLToolCallingConverter::GetKeyPatternExcluding(
 
 std::string XMLToolCallingConverter::NextSeparator(bool is_end) {
   if (nested_object_level_ <= 1) {
+    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_) return "\"\"";
     return GetWhitespacePattern();
   }
   return JSONSchemaConverter::NextSeparator(is_end);
+}
+
+int32_t XMLToolCallingConverter::GenerateInteger(const IntegerSpec& spec,
+                                                 const std::string& rule_name) {
+  if (json_format_ != JSONFormat::kQwenXML)
+    return JSONSchemaConverter::GenerateInteger(spec, rule_name);
+  // Protocol adapters materialize argument integers in their exact signed 64-bit domain.
+  auto bounded = spec;
+  if (!bounded.minimum) bounded.minimum = std::numeric_limits<int64_t>::min();
+  if (!bounded.maximum) bounded.maximum = std::numeric_limits<int64_t>::max();
+  return JSONSchemaConverter::GenerateInteger(bounded, rule_name);
+}
+
+int32_t XMLToolCallingConverter::GenerateNumber(const NumberSpec& spec,
+                                                const std::string& rule_name) {
+  if (json_format_ == JSONFormat::kQwenXML && !spec.minimum && !spec.maximum &&
+      !spec.exclusive_minimum && !spec.exclusive_maximum) {
+    // Fixed notation for common values; normalized scientific notation covers the rest of
+    // finite binary64. The upper exponent uses the largest round-trip decimal significand.
+    // Arbitrary exponents such as 1e999 are valid JSON syntax but cannot be published as a
+    // numeric Anthropic input value. Const/enum literals use their separately checked values.
+    const auto digits = builder_.AddCharacterClass({{'0', '9'}});
+    const auto fraction = Choice(
+        {Empty(), Sequence({ByteString("."), Repeat(rule_name + "_fraction", digits, 1, -1)})});
+    const auto fixed = Sequence(
+        {Choice({ByteString("0"), Sequence({builder_.AddCharacterClass({{'1', '9'}}),
+                                            Repeat(rule_name + "_whole", digits, 0, 18)})}),
+         fraction});
+    const auto scientific =
+        Sequence({builder_.AddCharacterClass({{'1', '9'}}), fraction,
+                  builder_.AddCharacterClass({{'e', 'e'}, {'E', 'E'}}),
+                  RegexExpression(xgrammar::GenerateRangeRegex(-324, 307), false, true)});
+    const std::string limit = "7976931348623157";
+    int32_t suffix = Empty();
+    for (int i = static_cast<int>(limit.size()) - 1; i >= 0; --i) {
+      std::vector<int32_t> choices;
+      if (i != 0) choices.push_back(Empty());
+      if (limit[i] != '0')
+        choices.push_back(
+            Sequence({builder_.AddCharacterClass({{'0', limit[i] - 1}}),
+                      Repeat(rule_name + "_significand", digits, 0, limit.size() - i - 1)}));
+      choices.push_back(Sequence({ByteString(std::string(1, limit[i])), suffix}));
+      suffix = Choice(choices);
+    }
+    const auto largest =
+        Sequence({ByteString("1"), Choice({Empty(), Sequence({ByteString("."), suffix})}),
+                  builder_.AddCharacterClass({{'e', 'e'}, {'E', 'E'}}), ByteString("308")});
+    return Sequence({Choice({Empty(), ByteString("-")}), Choice({fixed, scientific, largest})});
+  }
+  return JSONSchemaConverter::GenerateNumber(spec, rule_name);
 }
 
 int32_t XMLToolCallingConverter::GenerateString(
     const StringSpec& spec, const std::string& rule_name
 ) {
   if (nested_object_level_ <= 1) {
+    if (json_format_ == JSONFormat::kQwenXML) {
+      std::vector<std::string> patterns;
+      if (spec.pattern) patterns.push_back(*spec.pattern);
+      if (spec.format) {
+        auto pattern = JSONFormatToRegexPattern(*spec.format);
+        if (!pattern) throw std::invalid_argument("unsupported raw tool string format");
+        patterns.push_back("^(?:" + *pattern + ")$");
+      }
+      auto grammar = StringConstraints(patterns, spec.min_length, spec.max_length,
+                                       {"\n</parameter>"}, false);
+      return RuleRef(SubGrammarAdder::Apply(&builder_, grammar));
+    }
     if (!spec.pattern.has_value() && !spec.format.has_value() && spec.min_length == 0 &&
         spec.max_length == -1) {
       return RuleRef(kXMLString);
@@ -825,6 +895,9 @@ int32_t XMLToolCallingConverter::FormatProperty(
            FormatDeepSeekV41ParamSuffix(schema, value_rule_id)}
       );
     }
+    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_)
+      return Sequence({FormatPropertyKey(key, schema), ByteString("\n"),
+                       RuleRef(value_rule_id), ByteString(xml_wrapper_.parameter_suffix)});
     std::vector<int32_t> elements = {FormatPropertyKey(key, schema)};
     if (!xml_wrapper_.value_wrapper_prefix.empty()) {
       // NInfer: a whitespace prefix is the value's framing; whitespace before it would reach a raw
@@ -864,6 +937,10 @@ int32_t XMLToolCallingConverter::FormatOtherProperty(
            FormatDeepSeekV41ParamSuffix(schema, value_rule_id)}
       );
     }
+    if (json_format_ == JSONFormat::kQwenXML && !any_whitespace_)
+      return Sequence({ByteString(xml_wrapper_.key_wrapper_prefix), key_pattern_expr,
+                       XMLKeySuffix(std::nullopt), ByteString("\n"), RuleRef(value_rule_id),
+                       ByteString(xml_wrapper_.parameter_suffix)});
     std::vector<int32_t> elements = {
         ByteString(xml_wrapper_.key_wrapper_prefix),
         key_pattern_expr,

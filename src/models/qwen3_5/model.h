@@ -16,7 +16,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-struct CpuVisionWeights;
+class CpuVisionCache;
 
 struct InstanceInfo {
     std::string name;
@@ -98,8 +98,8 @@ public:
         return backing_.upload_device_objects_again(device);
     }
 
-    // CPU Vision residency only: the tower decoded to host FP32, shared with every encode session.
-    [[nodiscard]] const std::shared_ptr<const CpuVisionWeights>& cpu_vision() const noexcept {
+    // CPU Vision capability and lazy Host residency, independent of whether weights are loaded.
+    [[nodiscard]] const std::shared_ptr<CpuVisionCache>& cpu_vision() const noexcept {
         return cpu_vision_;
     }
 
@@ -111,7 +111,7 @@ private:
           AuxiliaryReplicas replicas, FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing,
           std::optional<VisionOverlayLayout> vision_overlay,
-          std::shared_ptr<const CpuVisionWeights> cpu_vision,
+          std::shared_ptr<CpuVisionCache> cpu_vision,
           NativeExpertSources experts);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
@@ -124,7 +124,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<VisionOverlayLayout> vision_overlay_;
-    std::shared_ptr<const CpuVisionWeights> cpu_vision_;
+    std::shared_ptr<CpuVisionCache> cpu_vision_;
     NativeExpertSources experts_;
 };
 

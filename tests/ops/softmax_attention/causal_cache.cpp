@@ -1499,8 +1499,13 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    const std::vector<int>* page_map = nullptr) {
     const Geometry& geometry  = cache.geometry;
+    const auto source_position = [&](int position) {
+        return page_map ? page_map->at(position / 64) * 64 + position % 64
+                        : position;
+    };
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
                                static_cast<std::size_t>(geometry.q_heads) *
@@ -1521,13 +1526,13 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                 std::array<double, kHeadDim> key{};
                 std::array<double, kHeadDim> value{};
                 const std::size_t fp8_code =
-                    cache_index(geometry, cache.logical_capacity, head, position, 0);
+                    cache_index(geometry, cache.logical_capacity, head, source_position(position), 0);
                 const std::size_t fp8_scale =
-                    fp8_scale_index(geometry, cache.logical_capacity, head, position);
+                    fp8_scale_index(geometry, cache.logical_capacity, head, source_position(position));
                 const std::size_t packed_code = logical_plane_index(
-                    kNvfp4CodeBytes, geometry, cache.logical_capacity, head, position, 0);
+                    kNvfp4CodeBytes, geometry, cache.logical_capacity, head, source_position(position), 0);
                 const std::size_t packed_scale = logical_plane_index(
-                    kNvfp4QuantGroups, geometry, cache.logical_capacity, head, position, 0);
+                    kNvfp4QuantGroups, geometry, cache.logical_capacity, head, source_position(position), 0);
                 for (int d = 0; d < kHeadDim; ++d) {
                     const int shift = (d & 1) * 4;
                     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
@@ -1582,8 +1587,8 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         [&](int d, int head, int token) {
             return static_cast<double>(q[q_index(geometry, head, d, token)]);
         },
-        [&](int d, int head, int position) { return cache_value(cache, true, head, position, d); },
-        [&](int d, int head, int position) { return cache_value(cache, false, head, position, d); },
+        [&](int d, int head, int position) { return cache_value(cache, true, head, source_position(position), d); },
+        [&](int d, int head, int position) { return cache_value(cache, false, head, source_position(position), d); },
         [&](int token, int position) {
             return position <= positions[static_cast<std::size_t>(token)];
         },
@@ -4729,6 +4734,15 @@ int run_softmax_attention_prompt_split_tests() {
         failures += run_a1_case(geometry, kPlanInt8, fast({200, 100, 8192, 934u}),
                                 MappingPattern::Identity);
     }
+    // KVMem's additional dense geometries use the prompt route even at small widths. Check
+    // both cached reads and masked append with forced splits and the reserved partial workspace.
+    for (const Geometry geometry : {Geometry{"dense-h8-kv2", 8, 2},
+                                    Geometry{"dense-h16-kv4", 16, 4}}) {
+        failures += run_a1_case(geometry, kPlanInt8, fast({129, 2000, 8192, 935u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanInt8, fast({129, 2000, 8192, 936u}),
+                                MappingPattern::Offset);
+    }
     std::cout << (failures ? "FAIL" : "PASS") << " split-key prompt causal attention\n";
     return failures ? 1 : 0;
 }
@@ -4826,6 +4840,13 @@ int run_softmax_attention_dflash2_tests() {
     failures += run_case_allowing_arch_skip("causal_softmax_attention DFlash2 verification",
                                             [] { return run_dflash2_cases(); });
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention DFlash2\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_rk8v4_tests() {
+    if (cuda_unavailable()) return 77;
+    const int failures = run_rk8v4_cases();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention rk8v4\n";
     return failures == 0 ? 0 : 1;
 }
 
@@ -5280,4 +5301,38 @@ int run_softmax_attention_invariant_tests() {
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " invariant attention\n";
     return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_dense_family_tests() {
+    std::cout << std::unitbuf;
+    if (cuda_unavailable()) return 77;
+    int failures = 0;
+    for (const Geometry geometry : {Geometry{"dense-h8-kv2", 8, 2}, Geometry{"dense-h16-kv4", 16, 4}}) {
+        failures += run_geometry(geometry);
+        for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::RotatedLloyd4KeyInt4Value,
+                KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value,
+                KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+            const auto check = [&](const auto& profile) {
+                return run_a1_case(geometry, profile, {.tokens=17, .base=63, .envelope_max=256,
+                    .seed=9021u, .graph_replay=true}, MappingPattern::Fragmented) +
+                    run_a3_case(geometry, profile, {.tokens=6, .base=127, .envelope_max=256,
+                    .seed=9022u, .graph_replay=true}, MappingPattern::Fragmented);
+            };
+            // These two packed profiles use the CachePlan reference encoder.
+            if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64)
+                failures += check(kPlanRk8v4);
+            else if (storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)
+                failures += check(kPlanRk4v4);
+            else failures += check(storage);
+        }
+        for (const auto plan : {kPlanBf16, kPlanInt8, kPlanRk8v4}) {
+            failures += run_batch_case(geometry, plan,
+                {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 9041u});
+            failures += run_batch_case(geometry, plan,
+                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Fragmented, 9042u});
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " dense-family causal attention\n";
+    return failures ? 1 : 0;
 }

@@ -49,6 +49,7 @@ public:
                  std::vector<std::uint32_t> rewrite_execution_frontiers);
 
 private:
+    friend struct KvmemSnapshotCodec;
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
     std::vector<VisionItem> vision_items_;

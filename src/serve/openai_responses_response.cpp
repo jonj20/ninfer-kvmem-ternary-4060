@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
+#include "serve/kvmem_metrics.h"
 
 #include <algorithm>
 #include <iterator>
@@ -15,8 +16,6 @@ namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
-
-constexpr char kReasoningSummaryPlaceholder[] = "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
 
 std::string response_status(ninfer::FinishReason reason) {
     switch (reason) {
@@ -82,12 +81,6 @@ void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest
     }
     object["name"] = position->second.name;
     if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
-}
-
-// Build the display-only reasoning summary requested by the client.
-Json reasoning_summary(const OpenAIResponsesCreateRequest& request) {
-    if (!request.prompt.reasoning_summary) { return Json::array(); }
-    return Json::array({Json{{"type", "summary_text"}, {"text", kReasoningSummaryPlaceholder}}});
 }
 
 // Mirror raw reasoning into the opaque field requested by Harness. This is deliberately not
@@ -162,7 +155,8 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
             {"id", ids.reasoning},
             {"type", "reasoning"},
             {"status", reasoning_status},
-            {"summary", reasoning_summary(request)},
+            // Clients may prefer summary over content; never mask raw reasoning with a placeholder.
+            {"summary", Json::array()},
             {"content",
              Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}};
         add_reasoning_encrypted_content(reasoning_item, request, outcome.reasoning);
@@ -242,6 +236,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         {"output_tokens", outcome.completion_tokens},
         {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
         {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+    response["kvmem"] = kvmem_generation_metrics(outcome);
     built.body = std::move(response);
     return built;
 }
@@ -295,40 +290,15 @@ public:
         reasoning_started               = true;
         ids.reasoning                   = new_openai_response_item_id("rs");
         reasoning_index                 = next_output_index++;
-        const Json summary              = reasoning_summary(request);
         const Json item                 = {{"id", ids.reasoning},
                                            {"type", "reasoning"},
                                            {"status", "in_progress"},
-                                           {"summary", summary},
+                                           {"summary", Json::array()},
                                            {"content", Json::array()}};
         const Json part                 = {{"type", "reasoning_text"}, {"text", ""}};
         std::vector<std::string> events = {
             sse(event("response.output_item.added",
                       Json{{"output_index", reasoning_index}, {"item", item}}))};
-        if (!summary.empty()) {
-            const Json added_summary_part = {{"type", "summary_text"}, {"text", ""}};
-            const Json& done_summary_part = summary.at(0);
-            events.push_back(sse(event("response.reasoning_summary_part.added",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
-                                            {"summary_index", 0},
-                                            {"part", added_summary_part}})));
-            events.push_back(sse(event("response.reasoning_summary_text.delta",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
-                                            {"summary_index", 0},
-                                            {"delta", kReasoningSummaryPlaceholder}})));
-            events.push_back(sse(event("response.reasoning_summary_text.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
-                                            {"summary_index", 0},
-                                            {"text", kReasoningSummaryPlaceholder}})));
-            events.push_back(sse(event("response.reasoning_summary_part.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
-                                            {"summary_index", 0},
-                                            {"part", done_summary_part}})));
-        }
         events.push_back(
             sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
                                                           {"output_index", reasoning_index},
@@ -346,7 +316,7 @@ public:
         Json item = {{"id", ids.reasoning},
                      {"type", "reasoning"},
                      {"status", item_status},
-                     {"summary", reasoning_summary(request)},
+                     {"summary", Json::array()},
                      {"content", Json::array({part})}};
         add_reasoning_encrypted_content(item, request, reasoning_text);
         return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},

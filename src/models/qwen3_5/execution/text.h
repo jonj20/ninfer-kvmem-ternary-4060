@@ -1,4 +1,5 @@
 #pragma once
+#include "models/qwen3_5/execution/memory_statistics.h"
 #include "models/qwen3_5/program/internal.h"
 
 
@@ -135,7 +136,9 @@ public:
         proposal_head_n_   = count;
     }
 
+    void set_memory_statistics(const MemoryStatistics* value) noexcept { statistics_ = value; }
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+    void set_cache_position_shift(std::uint32_t shift) noexcept { cache_position_shift_ = shift; }
 
     // The typed readout a finalizing chunk performs on its sampled token's logits: the first
     // `count` ids of io.readout_ids, read into io.readout_values; zero reads nothing.
@@ -242,6 +245,7 @@ public:
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
+    void capture_attention_tokens(const Tensor&);
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
@@ -368,14 +372,17 @@ private:
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
+    const MemoryStatistics* statistics_ = nullptr;
     bool fast_prefill_kernel_ = false;
     std::uint32_t text_kv_base_;
+    std::uint32_t cache_position_shift_ = 0;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;
     const Tensor* active_kv_table_rows_                                            = nullptr;
     const Tensor* active_linear_state_source_slots_                                = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
+    const Tensor* active_memory_prefill_origin_                                    = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;

@@ -2,6 +2,7 @@
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/load/bindings.h"
 
 #include <algorithm>
 #include <array>
@@ -264,6 +265,44 @@ void logical_data_and_instances() {
         "--stage-layers without a multi-device split was accepted");
 }
 
+void shared_stage_auxiliaries() {
+    ModelFixture fixture;
+    fixture.tensor("permutation", {128}, QType::INT32);
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    const auto offset = fixture.file.root["objects"].back()["offset"].get<std::size_t>();
+    for (std::size_t i = 0; i < 128; ++i) {
+        put_word(fixture.file.payload, offset + i * 4, 127 - i, 4);
+    }
+    for (auto& use : fixture.file.root["uses"]) {
+        const auto parameter = use["parameter"].get<std::string>();
+        if (parameter.ends_with("/mlp/gate") || parameter.ends_with("/mlp/up")) {
+            use["auxiliaries"]["input_columns"] = {{"object", "permutation"}};
+        }
+    }
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    artifact::Binder binder(reader);
+    qwen::loading::Bindings bindings(binder);
+    const std::string p = "text/layers/0/";
+    const auto gate = bindings.parameter(p + "mlp/gate", {24, 128}, {p + "ffn_input"});
+    const auto up = bindings.parameter(p + "mlp/up", {24, 128}, {p + "ffn_input"});
+    const auto original = *bindings.at(gate).uses[0].input_columns;
+    bindings.place(gate, 0);
+    bindings.place(up, 1);
+    const auto local = *bindings.at(up).uses[0].input_columns;
+    require(original.index != local.index &&
+                !bindings.at(original).reference.device_replica &&
+                bindings.at(local).reference.device_replica == 1 &&
+                bindings.at(local).reference.binding.parts[0].object ==
+                    bindings.at(original).reference.binding.parts[0].object,
+            "shared gather was not rebound to its consuming stage");
+    const auto plan = std::move(binder).finish();
+    const auto object = reader.find("permutation");
+    require(std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
+                         [&](const auto& item) { return item.object == object; }) == 2,
+            "shared gather does not have exactly one copy on each consuming rank");
+}
+
 void native_uses() {
     const std::array<std::uint64_t, 2> shape{128, 64};
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
@@ -355,6 +394,7 @@ void invalid_model_data() {
 int main() {
     try {
         logical_data_and_instances();
+        shared_stage_auxiliaries();
         native_uses();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";

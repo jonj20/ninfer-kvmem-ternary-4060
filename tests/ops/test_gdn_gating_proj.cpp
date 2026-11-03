@@ -757,6 +757,16 @@ int main() {
     failures += verify_workspace_capacity_contract(
         kQwen35, plan_endpoints(kQwen35, device.multiprocessor_count(), 3905));
 
+    for (const auto geometry : {Geometry{"dense_0_8b", 1024, 16, false},
+                                Geometry{"dense_2b", 2048, 16, true},
+                                Geometry{"dense_4b", 2560, 32, false},
+                                Geometry{"dense_9b", 4096, 32, true}}) {
+        for (const int tokens : {1, 2, 8, 17, 128, 257}) {
+            failures += run_projection_case(geometry, tokens, 0xA000u + tokens, execution);
+            failures += run_norm_projection_case(geometry, tokens, 0xB000u + tokens, norm_execution);
+        }
+    }
+
     // Every registered 27B projection route, including predicated and full token tiles, and both
     // sides of each sm_86 residency boundary (768/769, 1664/1665, 3456/3457).
     for (const std::int32_t tokens :

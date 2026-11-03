@@ -123,11 +123,13 @@ private:
     WeightId gather_piece(const artifact::Binding& gather,
                           const std::vector<std::pair<std::uint64_t, std::uint64_t>>& columns,
                           std::uint64_t base, std::size_t rank, const std::string& use);
+    WeightId auxiliary_on_rank(WeightId id, std::size_t rank);
 
     std::map<std::string, WeightId, std::less<>> parameters_;
     std::map<std::string, WeightId, std::less<>> signs_;
     std::map<std::string, WeightId, std::less<>> columns_;
     std::map<std::string, WeightId, std::less<>> gather_pieces_;
+    std::map<std::pair<std::size_t, std::size_t>, WeightId> auxiliary_ranks_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

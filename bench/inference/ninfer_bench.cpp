@@ -78,7 +78,8 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
                                   : test.n_prompt;
     auto prompt = engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false);
     ninfer::GenerationResult generated =
-        engine.generate(std::move(prompt), benchmark_request(test));
+        engine.submit(std::move(prompt), benchmark_request(test),
+                      ninfer::OutputConsumerMode::Aggregate, {.phase_timings = true}).wait();
 
     const std::uint32_t expected = test.requested_output_tokens();
     if (generated.generated_token_ids.size() != expected) {
@@ -94,6 +95,7 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
     timing.timings                 = generated.timings;
     timing.speculative             = std::move(generated.speculative);
     timing.generated_output_tokens = expected;
+    timing.generated_token_ids = std::move(generated.generated_token_ids);
     return timing;
 }
 
@@ -153,6 +155,11 @@ int main(int argc, char** argv) {
         engine_options.max_context   = max_context;
         engine_options.rope_yarn_factor = options.rope_yarn_factor;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.kvmem = options.kvmem;
+        if (options.kvmem.selected_tokens) {
+            engine_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
+                static_cast<std::uint32_t>(options.kvmem.device_tokens()));
+        }
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;

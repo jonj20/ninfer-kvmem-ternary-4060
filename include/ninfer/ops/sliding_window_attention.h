@@ -28,6 +28,11 @@ struct SlidingWindowAttentionExecutionEnvelope {
  * columns, positions[i,b]=L+i for i<V, and lanes[b] selects its cyclic-cache lane. Columns i>=V
  * are an inert physical tail and produce exact BF16 zero.
  *
+ * min_positions optionally supplies one device I32 floor per batch row: committed context at
+ * absolute positions below min_positions[b] is invisible to row b (masked out), which callers
+ * use to invalidate ring slots whose features were evicted by a KVMem-style reselection. A null
+ * tensor disables the floor.
+ *
  * The read-only cyclic BFloat16 context stores BF16 K and V for committed absolute positions
  * [max(0,L-window),L), with absolute position p stored at slot p mod window. Temporary query K/V is
  * a separate BF16 segment at [L,L+V). For live query position p_i, a populated context or
@@ -50,7 +55,8 @@ struct SlidingWindowAttentionExecutionEnvelope {
  */
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& lanes, AttentionHeadGeometry geometry,
+                              const Tensor& lanes, const Tensor& min_positions,
+                              AttentionHeadGeometry geometry,
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,

@@ -895,18 +895,12 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
     }
 }
 
-// A forced choice is executed by writing the call opener into the generation prompt, and that
-// opener carries the function name. One callable tool determines the name; several leave it to the
-// model, which is the part NInfer cannot constrain.
-void force_single_callable_tool(ParsedPromptFields& out, const std::string& request) {
+// Required selection is enforced by the generation tool contract. Keep declarations in the
+// reusable prompt; an optional allowed_names subset limits which tools may be called.
+void require_callable_tools(ParsedPromptFields& out, const std::string& request) {
     std::vector<ToolDefinition>& tools = out.prompt.generation.tools;
     if (tools.empty()) { bad_request(request + " requires at least one tool", "tool_choice"); }
-    if (tools.size() != 1) {
-        bad_request(request + " over several tools leaves the function to the model, which NInfer "
-                              "cannot constrain; name the function instead",
-                    "tool_choice", "tool_choice_not_supported");
-    }
-    out.prompt.generation.tool_choice.forced_name = tools.front().name;
+    out.prompt.generation.tool_choice.mode = ToolChoiceMode::Required;
 }
 
 void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
@@ -947,14 +941,9 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
         selected.insert(name);
     }
 
-    std::vector<ToolDefinition> effective;
-    effective.reserve(selected.size());
-    for (ToolDefinition& tool : out.prompt.generation.tools) {
-        if (selected.contains(tool.name)) { effective.push_back(std::move(tool)); }
-    }
-    out.prompt.generation.tools = std::move(effective);
+    out.prompt.generation.tool_choice.allowed_names = std::vector<std::string>(selected.begin(), selected.end());
     if (allowed_mode == "required") {
-        force_single_callable_tool(out, "allowed_tools mode 'required'");
+        require_callable_tools(out, "allowed_tools mode 'required'");
     }
 }
 
@@ -972,7 +961,7 @@ void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
             out.prompt.generation.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
             out.prompt.generation.tool_choice.mode = ToolChoiceMode::Auto;
-            force_single_callable_tool(out, "tool_choice 'required'");
+            require_callable_tools(out, "tool_choice 'required'");
         } else {
             bad_request("tool_choice must be 'auto', 'none', or a supported object", "tool_choice");
         }
@@ -1001,6 +990,7 @@ void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
         }
         out.prompt.generation.tool_choice.mode        = ToolChoiceMode::Auto;
         out.prompt.generation.tool_choice.forced_name = name;
+        out.prompt.generation.tool_choice.parallel = false;
         out.wire_tool_choice                          = choice;
         return;
     }
@@ -1027,8 +1017,8 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
         }
     }
     // summary and its deprecated alias generate_summary ask for a summary of the reasoning. NInfer
-    // has no summarizer: a valid value requests the fixed protocol placeholder summary, without
-    // changing model execution, and is echoed in the response.
+    // has no summarizer: a valid value is echoed without changing model execution; reasoning
+    // Items keep an empty summary and complete raw content.
     std::optional<std::string> summary_style;
     for (const char* key : {"summary", "generate_summary"}) {
         if (!reasoning.contains(key) || reasoning.at(key).is_null()) { continue; }
@@ -1153,6 +1143,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    parse_tool_constraints(body, out.prompt.generation);
     out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
     // Honoured by trimming the response to one tool call rather than refused; see the chat parser.
     out.prompt.generation.parallel_tool_calls = out.parallel_tool_calls;
@@ -1276,6 +1267,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "text",
                                                                   "thinking_budget",
                                                                   "tool_choice",
+                                                                  "tool_constraints",
                                                                   "tools",
                                                                   "top_logprobs",
                                                                   "top_p",
@@ -1294,6 +1286,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "reasoning",
                                                                   "text",
                                                                   "tool_choice",
+                                                                  "tool_constraints",
                                                                   "tools",
                                                                   "truncation"};
     const auto& allowed = create ? create_fields : count_fields;

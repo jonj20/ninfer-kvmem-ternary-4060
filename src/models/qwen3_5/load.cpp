@@ -8,7 +8,7 @@
 #include "core/stage_plan.h"
 #include "core/tensor_split.h"
 #include "models/qwen3_5/load/bindings.h"
-#include "models/qwen3_5/load/vision_cpu.h"
+#include "models/qwen3_5/load/vision_cpu_cache.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,7 +28,7 @@ struct LoadPlan::Impl {
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
-    std::shared_ptr<const CpuVisionWeights> cpu_vision;
+    std::shared_ptr<CpuVisionCache> cpu_vision;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -99,7 +99,20 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
         throw std::invalid_argument("--vision-residency cpu requires a Vision artifact");
     }
     if (options.cpu_vision()) {
-        out->cpu_vision = loading::load_cpu_vision(binder, *out->config.vision, text);
+        if (out->artifact_path.empty()) {
+            throw std::invalid_argument("CPU Vision lazy loading requires the artifact entry path");
+        }
+        loading::validate_cpu_vision(binder, *out->config.vision, text);
+        out->cpu_vision = std::make_shared<CpuVisionCache>(
+            [path = std::filesystem::absolute(out->artifact_path), id = reader.artifact_id(),
+             vision = *out->config.vision, target = text] {
+                artifact::Reader source(path);
+                if (source.artifact_id() != id) {
+                    throw artifact::ArtifactError("CPU Vision artifact changed since model loading");
+                }
+                artifact::Binder source_bindings(source);
+                return loading::load_cpu_vision(source_bindings, vision, target);
+            }, std::chrono::seconds(options.cpu_vision_idle_seconds));
     } else if (out->config.vision) {
         out->weights.vision = loading::bind_vision(
             bindings, *out->config.vision, text.hidden_size,

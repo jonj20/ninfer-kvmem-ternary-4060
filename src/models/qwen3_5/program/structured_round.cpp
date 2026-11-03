@@ -100,6 +100,12 @@ void CUDART_CB StructuredRound::collect(void* opaque) noexcept {
                 if (!self.error_) { self.error_ = job->error(); }
                 continue;
             }
+            if (const auto problem = runtime::grammar_mask_problem(*job); !problem.empty()) {
+                if (!self.error_) {
+                    self.error_ = std::make_exception_ptr(std::runtime_error(problem));
+                }
+                continue;
+            }
             std::copy_n(job->masks(), job->columns() * self.words_,
                         static_cast<std::uint32_t*>(self.host_masks_.data()) +
                             lane * self.width_ * self.words_);

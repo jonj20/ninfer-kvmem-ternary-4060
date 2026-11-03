@@ -50,7 +50,9 @@ ledger.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`. DFlash2
+artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`. With
+KVMem, DFlash2 is currently restricted to one sequence on one GPU, with resident or CPU Vision
+and 1 to 15 drafts. DFlash2
 accepts draft counts 1..15 and supports the same sampling, concurrency, prefix reuse, and
 image/video request surfaces. It may remain combined with
 `--vision`.
@@ -141,8 +143,9 @@ request log line reports `overlay=<windows>x<conc|excl|mixed> <ms> (evict <MiB> 
 staged <MiB>)` and the JSON record carries `vision_overlay`, including `exclusive_windows`.
 
 `--vision-residency cpu` (or `--vision-cpu`, which also sets `--vision`) keeps no Vision memory on
-the device at all: the tower is decoded to FP32 host memory at load (about 1.7 GiB for the Qwen3.6
-tower) and each image is encoded on CPU threads, then uploaded a chunk's columns at a time like an
+the device at all: on the Qwen3.5 family (including Qwen3.6/3.8), the first uncached image encode
+loads and decodes the tower to FP32 host memory (about 1.7 GiB), and each image is encoded on CPU
+threads, then uploaded a chunk's columns at a time like an
 overlay result. The encode of the next image runs beside other lanes' decode, and the lane that
 owns it yields its prefill units until it completes, but it is slow: on a 12-core desktop CPU a
 512x512 image takes seconds, and the cost grows with the square of the patches, so this residency
@@ -151,6 +154,22 @@ The CPU encoder computes in FP32 where the device encoder rounds activations to 
 agree closely but not bit for bit. It reads the tower's weights in the official artifacts' grouped
 formats as well as BF16, FP8 and NVFP4; a projection stored with a Hadamard rotation or an input
 gather is refused at load.
+
+Qwen CPU Vision weights are shared across encoders and unload automatically after **300 seconds**
+without a weight reader, including when the server receives no further requests. Configure this
+with `--cpu-vision-idle-seconds N`; `0` disables timed unloading while preserving lazy loading.
+Active encoders hold read leases; the timeout starts only when the last lease is released. Cached
+media/prepared embeddings do not hold the tower in RAM. A later uncached encode reloads the same
+artifact and pays the load/decode delay again; text generation never does. Logical binding/format
+checks still run at startup, and a failed on-demand read publishes no partial weights and may be
+retried. An on-demand read failure returns an unavailable error for that image request; the Engine
+continues serving other requests. The artifact must remain available at its original entry path. This policy applies to the
+Qwen3.5-family CPU tower; Gemma 4 retains its separate CPU implementation.
+
+`/props.cpu_vision` reports residency, logical weight bytes, active encoder leases, load/unload
+counts, the last load time and the idle timeout. `CPU_VISION loaded` / `unloaded` log records
+identify actual transitions. Weight bytes exclude vector spare capacity and allocator overhead;
+OS working set and private memory can differ from this logical count.
 
 Gemma 4 places its tower the same three ways with its own mechanics: `overlay` keeps the 27
 blocks' matrices in pinned host memory and streams them through a two-block device window during
@@ -167,7 +186,9 @@ accepted as `auto`, `high` or `low`. `auto` and `high` see the image at the reso
 `--vision-max-merged` allows, which is NInfer's normal preprocessing. `low` bounds the image at the
 area of a 512 x 512 picture, 256 merged Vision tokens (or the server's bound when that is smaller),
 for a cheaper and coarser look. The same bytes at both details are prepared, cached and reused as
-two different images. Any other value is refused with `image_detail_not_supported`, or read as
+two different images. The KVMem integration retains its documented `original` compatibility value
+as `auto`; it does not introduce a fourth preprocessing mode. Any other value (including an empty
+string) is refused with `image_detail_not_supported`, or read as
 `auto` when the server runs with `--lenient-image-detail`. Gemma 4 maps the three to its budgets:
 `low` 70 soft tokens, `auto` the release's 280, `high` the `--vision-max-merged` bound (1120 by
 default). DeepSeek-V4.1 gives an image's span at most the release's 1024 prompt positions (fewer
@@ -239,13 +260,13 @@ of the count: a token inside the string is decided by the characters it adds aga
 
 Every model computes a constrained request's masks on host threads while the GPU runs the step
 that needs them: the next token's mask, or in a speculative round one mask per draft position,
-filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
-DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
-hides, and decodes without drafts while they cost more, resuming once they are cheap again.
-A costly mask holds only its own request. Gemma 4, Flint, DeepSeek-V4.1 and Qwen3.8-Flash-Next run the decode step
+filled in parallel. Grammar-mask duration does not disable draft verification: MTP,
+DFlash/DFlash2 and context lookup retain their configured policy, output/context limits and
+available-draft checks. Slow masks can extend a speculative round's wait before sampling.
+Gemma 4, Flint, DeepSeek-V4.1 and Qwen3.8-Flash-Next run an ordinary decode step
 without it: the row keeps its logits and samples once the mask is ready, while the other requests
-go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
-the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
+go on. With speculation disabled, the Qwen3.5 family computes the next mask ahead and leaves
+the request out of decode rounds until that mask is ready. A mask over 5 s fails its request with
 an explicit error, and so does a Gemma 4, Flint, DeepSeek-V4.1 or Flash-Next decoding request without a token for 120 s
 ([Gemma 4](gemma4.md#structured-output)). A generated token the grammar does not admit, which the
 masks should have excluded, fails its own request with an internal error (HTTP 500) and leaves
@@ -393,38 +414,51 @@ grammar text instead.
 This helps the model choose the intended final-answer branch when tools remain enabled; the
 token grammar enforces validity independently. Tool selection and termination remain model
 decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
-Requests without an explicit response format receive no format instruction or grammar.
+Requests without an explicit response format receive no format instruction or final-body grammar.
+Regex, choice and GBNF final formats compose with the same tool selection rules as JSON formats.
 
-The native tool envelope restricts calls to declared names and emits each declared parameter at most
-once, in the declaration order shown in the prompt. A non-strict tool's parameter values are free
-text; delimiter spellings that would make Qwen XML ambiguous are excluded.
+Tool requests default to `tool_constraints:"auto"`. Ordinary non-strict auto requests use native
+tool parsing without an added generation grammar. Required/named/allowed selections, strict tools
+and parallel-call restrictions still activate the constraints needed to enforce those requests,
+independently of `--structured-output`.
+Explicit `tool_constraints:"basic"` restricts native Qwen calls to declared/allowed tool names and complete
+terminal call sequences. Non-strict parameter values retain best-effort normalization.
+An empty non-strict value may share its opening and closing framing newline; it is normalized
+independently of the next parameter. Strict values retain their canonical framing and exact codecs.
+With `tool_choice:"none"`, the default auto mode neither builds a prohibition grammar nor publishes
+structured tool calls. Tool definitions remain in the reusable prompt, so the model may still emit
+tool markup as ordinary content; this mode does not guarantee a tag-free final answer. Explicit
+basic mode retains the prohibition grammar. A JSON response format under none retains its JSON
+grammar without a tool-call alternative in both modes.
 
-A tool marked `strict: true` (Chat `function.strict`, the Responses and Anthropic tool `strict`)
-gets its arguments under its parameters' JSON Schema, in the Qwen XML form the chat template
-shows (`<parameter=NAME>`, a newline, the value, a newline, `</parameter>`): a string value is raw
-text and any other value JSON, required parameters appear, undeclared ones cannot, and the schema
-rules above apply. The schema must describe an object and cannot use `uniqueItems`. This holds
-with or without a response format; without one, text around the calls stays free and only the
-calls are constrained, starting inside the opened call when `tool_choice` forced it. DeepSeek-V4.1's
-strict calls follow the same rules in its DSML form (`<｜DSML｜ parameter name="NAME"
-string="true">` for a string value, `string="false">` and the JSON for any other). Gemma 4 and
-Flint refuse strict tools with HTTP 400, as their own tool-call markup has no grammar here; Flint
-also refuses a response format beside tools. Without
-`--structured-output`, Chat Completions treats `strict` as the advisory flag OpenAI-compatible
-servers commonly do and runs the tool non-strict; Responses and Anthropic Messages refuse it with
-HTTP 400 `strict_tools_not_supported`, unless `--unconstrained-response-format` lets it run
-non-strict.
+`strict:true` enforces the supported JSON Schema subset for tool arguments. Its root must resolve
+to one `type:"object"` with `additionalProperties:false`. Required fields, nested JSON objects and
+arrays, enums, raw string patterns/lengths, and numeric bounds are constrained during sampling.
+Top-level parameters mixing string and non-string types are rejected because Qwen renders strings
+as raw text and other values as JSON. The pinned compiler rejects unsupported assertions instead
+of weakening them; this includes `uniqueItems` in strict tool arguments, inexact numeric schema
+literals, and general schema intersections. Singleton root `allOf` and local root references are
+supported. Final JSON responses retain the existing unique-string validator. Gemma 4 and Flint reject strict
+tools because their tool-call syntax does not have a corresponding grammar. Flint also rejects
+a response format beside tools.
 
-Custom stops and assistant-prefill continuation are rejected with a response format. Public C++
-callers select `ExecutionOptions::structured_output` and use default stops and decoded text
-output.
+OpenAI `required` supports multiple declarations; a named OpenAI choice produces exactly one call.
+Anthropic `any` requires at least one call, and a named Anthropic choice allows repeated calls to
+that tool unless parallel use is disabled. `none` suppresses structured tool calls. Allowed selections and `none`
+retain the original prompt declarations and their order so KV reuse is independent of selection.
+Thinking remains available with required/named choices. With a JSON response format, `auto` permits
+either the JSON final body or tool calls; `required` permits calls, and `none` permits the JSON body.
 
-Only normal completed final-content responses guarantee complete content that satisfies the format
-(for JSON, a complete document under the supported schema). Token/context limits, cancellation,
-transport failure, or generation errors can leave a partial document; inspect the finish reason or
-Responses status before parsing it as complete. SSE content deltas are ordinary partial JSON bytes;
-concatenate them before parsing. Constraints guarantee format, not factual accuracy or semantic task
-success.
+Active constraints require default EOS stops and decoded output. Assistant continuation must be
+a legal grammar prefix. Cancellation and truncation publish only completed tool calls; partial
+calls are discarded without repair or a synthetic error-tool call. Public C++ callers use
+`RequestOptions::tool_choice`; JSON formats also use `ExecutionOptions::structured_output`.
+
+Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
+schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
+partial document; inspect the finish reason or Responses status before parsing it as complete.
+SSE content deltas are ordinary partial JSON bytes; concatenate them before parsing. Constraints
+guarantee format, not factual accuracy or semantic task success.
 
 Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
 including correction and bonus tokens. Drafts are proposed without the mask; every verification
@@ -931,12 +965,10 @@ The endpoint supports:
 - function tools and free-form `custom` tools, the latter served to the model as a
   single-string-input function under the caller's own tool name so callers that dispatch by name
   keep working;
-- `tool_choice` `auto`, `none`, a named function, `required` over a single callable tool, or
-  `allowed_tools` in either mode, which force that call; a `custom` selection is accepted as
-  advisory narrowing;
-- `function.strict:true`, enforced with `--structured-output` and advisory without it (see
-  [Structured output](#structured-output)), and `parallel_tool_calls:false`, honored by keeping
-  the first call;
+- `tool_choice` `auto`, `none`, named functions/custom tools, `required` across one or more
+  callable tools, and `allowed_tools`; selections are enforced during generation;
+- `strict:true` for the supported tool-argument schemas, and `parallel_tool_calls:false` enforced
+  by sampling at most one call;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
@@ -949,7 +981,8 @@ The endpoint supports:
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes constrained output on a server without `--structured-output` (unless
 it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
-output, `required` tool choice over several callable tools, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+output, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy
+`functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
@@ -1013,7 +1046,8 @@ complete responses agree, and quoted examples stream as they arrive. A marker af
 still opens a call. Strict tools' grammar completes a call the model opens inside code, and that
 call is still returned as text.
 
-Generated prose can quote tool-call markup before the real call. Unless the first marker's region
+In the unconstrained `tool_constraints:"auto"` route, generated prose can quote tool-call markup
+before the real call. Unless the first marker's region
 opens with a complete call, each marker is tried in order, and the first complete region that
 consumes the rest of the response becomes the structured turn; quoted markup before it stays
 ordinary content. At most sixteen markers are tried, the first one included, so an output that
@@ -1660,15 +1694,15 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` requests disabled thinking; other standard effort values pass to the selected template |
-| `reasoning.summary`, `reasoning.generate_summary` | `auto`, `concise` or `detailed` (other values are rejected, and the two must agree when both are sent); a value requests the same fixed protocol placeholder summary without changing model execution, and is echoed in the response. `reasoning.context` and `reasoning.mode` are rejected with `reasoning_option_not_supported` |
+| `reasoning.summary`, `reasoning.generate_summary` | `auto`, `concise` or `detailed` (other values are rejected, and the two must agree when both are sent); accepted and echoed without changing model execution. Summaries are not generated: reasoning Items retain `summary: []` and complete raw `reasoning_text`. `reasoning.context` and `reasoning.mode` are rejected with `reasoning_option_not_supported` |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, a named function, `required` over a single callable tool, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
-| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `tool_choice` | `auto`, `none`, a named function, `required` over one or more callable tools, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
+| `parallel_tool_calls` | `true` by default; `false` constrains generation to at most one tool call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | integer in `[0,20]`; a nonzero value also asks for [token log probabilities](#token-log-probabilities) |
@@ -1765,7 +1799,7 @@ and without `strict`, which only selects the server's output contract, and parse
 into separate `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` filters that set without changing
+undeclared names are blocked during constrained decoding. `allowed_tools` filters that set without changing
 declaration order, while `tool_choice:"none"` disables structured tool output even when the history
 contains earlier calls. A function definition's `async` may be `false`; `async:true` fails with
 `async_tools_not_supported`, because the turn-based tool loop has no non-blocking call protocol.
@@ -1792,14 +1826,18 @@ run non-strict (see [Structured output](#structured-output)). NInfer does not ex
 so hosted tools, remote MCP tools, and custom free-form tools are rejected. Deferred
 loading, output schemas, and caller restrictions that exclude direct invocation are also rejected
 because their semantics cannot be honored.
+Required, named and allowed tool selections use the common [tool constraints](#structured-output)
+contract, retain declarations in the prompt, and support thinking. `strict:true` enforces supported
+tool-argument schemas. Hosted tools, remote MCP tools, custom Responses free-form tools, deferred
+loading, output schemas and caller restrictions excluding direct invocation remain unsupported.
 
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
 `cancelled` in `status`, and a typed `output` array. NInfer may emit:
 
-- a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
-  `reasoning.summary` is requested;
+- a `reasoning` item containing complete raw `reasoning_text` and an empty `summary` array,
+  including when `reasoning.summary` is requested;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
@@ -1853,13 +1891,11 @@ The normal lifecycle is:
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
-For a reasoning Item requested with any string-valued `reasoning.summary`, its
-`response.output_item.added` and `.done` payloads carry the same placeholder summary. Immediately
-after the Item is added, the stream emits `response.reasoning_summary_part.added`,
-`response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, and
-`response.reasoning_summary_part.done` with `summary_index:0`, then continues with the raw
-`reasoning_text` content lifecycle. Omitted or `null` summary requests emit none of these summary
-events and retain an empty Item `summary` array.
+Reasoning Items carry `summary: []` in `response.output_item.added`, `.done`, and the terminal
+Response, regardless of the requested summary style. The stream emits the raw `reasoning_text`
+content lifecycle and no `response.reasoning_summary_*` events. Unsupported summaries must not
+be replaced with explanatory placeholder text: clients that prefer a non-empty summary over raw
+content would otherwise lose the full reasoning body used for display and context accounting.
 
 For `include:["reasoning.encrypted_content"]`, the in-progress
 `response.output_item.added` Item omits `encrypted_content` because the complete reasoning text is
@@ -1932,8 +1968,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 Unsupported Create fields include Conversations, prompt templates, context management,
 `access_programs`, hosted moderation, `include` values other than
 `reasoning.encrypted_content`, background execution, compaction, files/audio, and
-OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
-these are compatibility boundaries rather than silently accepted approximations.
+OpenAI-hosted/MCP/custom tools. Documented accepted hints and the local raw-reasoning mirror
+are exceptions; other unsupported capabilities remain explicit compatibility boundaries.
 
 
 ## Anthropic Messages
@@ -2000,21 +2036,15 @@ protocol-validated value to the selected template, substituting the nearest valu
 accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
 enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 
-User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
-`strict`, which constrains the tool's input to its schema as described under [Structured
-output](#structured-output). `tool_choice` `auto`, `none`, `tool` naming a declared tool, and `any`
-over a single callable tool are executable; the last two require reasoning to be disabled for the
-request. `any` over several tools is advisory: NInfer cannot make the model pick one of them, so the
-tools stay offered under automatic selection (Qwen Code sends `any` for its JSON side queries such
-as its permission classifier, session title and next-speaker check); `any` without tools is
-rejected. `disable_parallel_tool_use:true` is honoured as `parallel_tool_calls:false` is on the
-OpenAI endpoints: the response keeps the first tool call and drops the rest. Deferred tools, tools
-that exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and containers are
-rejected because their required constraint or executor is absent. `tool_result` preserves text/image
-order and marks `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use
-turn, the next User turn must provide exactly one leading result for every declared ID; valid
-results are matched by ID and normalized to call order. A history that begins with results remains
-valid as a truncated or imported conversation.
+User-defined tools support `name`, `description`, object `input_schema`, `strict` and
+`input_examples`. `auto`, `none`, a named `tool`, and `any` use the common tool selection
+rules described above; `any` without tools is rejected. `disable_parallel_tool_use:true` constrains
+generation to one call. Deferred tools, tools excluding direct model calls, Anthropic-provided
+server tools, toolsets, MCP and containers remain unsupported. `tool_result` preserves text/image order and marks
+`is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
+User turn must provide exactly one leading result for every declared ID; valid results are matched
+by ID and normalized to call order. A history that begins with results remains valid as a truncated
+or imported conversation.
 
 Ephemeral `cache_control` on the request, tools, System blocks, and User text/image frontiers is a
 best-effort retention hint. NInfer maps representable breakpoints to exact prompt frontiers, keeps
@@ -2243,6 +2273,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from the evict-ranked text weight tail, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management; Gemma 4 keeps its tower's blocks pinned and streams them through a two-block device window instead. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` decodes the tower to host FP32 and encodes on CPU threads with no device Vision memory (see [Vision residency](#vision-residency)); it caps `--vision-max-merged` at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
+| `--cpu-vision-idle-seconds N` | Qwen3.5-family CPU Vision weights load on the first uncached image encode and unload N seconds after the last encoder releases them; 0 retains them until model unload. Text-only requests never load the tower | 300 |
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it. Gemma 4 (at least 70): the most soft tokens an image or video frame takes, rounded down to its budgets 70, 140, 280, 560, 1120; an image takes 280 (70 at `detail: low`, this bound at `detail: high`), a video frame 70 | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--gpu-clock-floor MHZ` | hold the graphics clock of the model's GPUs at MHZ or more while requests run and for 2 s after the last one (NVML locked clocks; an idle card then returns to the driver's clocks and idle power), so the stages of a layer pipeline do not wait at idle clocks (four RTX 3060 under Windows idled at 210 MHz between stages; two RTX 4090 under Linux kept their boost clocks without it, and decode stayed within 0.6 %). Giving the clocks back resets the cards' locked clocks, including a lock set before the start; a killed process leaves them locked until `nvidia-smi -rgc`. Needs administrator rights on Windows and root on Linux (a container usually lacks them); without them the start reports it and keeps the driver's clocks | off |
@@ -2776,3 +2807,20 @@ use [structured output](#structured-output).
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+### KVMem statistics extension
+
+KVMem builds preserve the native `usage`, `timings`, streaming usage selection, and
+`/metrics` names and meanings. Completed Chat Completions and Responses also carry
+`kvmem.speculative`, separately from those native fields. For Chat streams it is
+on the terminal timing chunk; for Responses it is in the terminal response body.
+
+The extension exposes native proposed/accepted draft counts, verification and
+fallback counts, accepted counts by draft position, and the Engine's actual
+`generation_rounds`. `output_tokens` excludes the first output token;
+`timing_scope: "first_to_last_token"` identifies the matching `wall_ms` interval.
+`tokens_per_round` and `ms_per_round` divide those totals by the observed round
+count. Without observed rounds they are `null`, with `unavailable_reason`, rather
+than being inferred from output tokens. Acceptance is accepted draft tokens divided
+by proposed draft tokens; the bonus token is excluded. Native MTP, ngram and DFlash
+counters keep their existing meanings.

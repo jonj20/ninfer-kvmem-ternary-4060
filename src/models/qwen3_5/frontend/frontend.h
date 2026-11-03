@@ -135,7 +135,8 @@ public:
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                         const OutputOptions& output               = {},
                         const ThinkingControlOptions& thinking    = {},
-                        const StructuredOutputOptions& structured = {}) const;
+                        const StructuredOutputOptions& structured = {},
+                        const ToolChoice& tool_choice = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
     // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence

@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
+#include "serve/kvmem_metrics.h"
 
 #include <nlohmann/json.hpp>
 
@@ -235,6 +236,7 @@ std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json f
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     add_slot_identity(payload, slot_identity);
+    if (slot_identity) payload["kvmem"] = kvmem_generation_metrics(*slot_identity);
     return event(std::move(payload));
 }
 
@@ -245,6 +247,7 @@ std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const Comple
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     add_slot_identity(payload, &outcome);
+    payload["kvmem"] = kvmem_generation_metrics(outcome);
     return event(std::move(payload));
 }
 
@@ -308,6 +311,7 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
     add_slot_identity(payload, &outcome);
+    payload["kvmem"] = kvmem_generation_metrics(outcome);
     return payload.dump();
 }
 

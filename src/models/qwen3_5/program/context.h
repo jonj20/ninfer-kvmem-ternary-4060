@@ -46,6 +46,7 @@ struct ExecutionCore {
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
     NativeExpertRuntime* experts = nullptr;
+    const MemoryStatistics* memory_statistics = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,
@@ -97,6 +98,7 @@ struct PrefillContext {
     // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
     // then returns without waiting for the drafter's work behind them. Empty waits for everything.
     std::function<void()> first_token;
+    std::uint32_t cache_position_shift = 0;
 };
 
 struct OrdinaryBatchContext {

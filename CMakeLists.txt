@@ -232,7 +232,13 @@ if(MSVC)
     # active code page instead. Needed by every translation unit that includes fmt/spdlog
     # headers, not just spdlog's own .cpp files, so this is global rather than per-target.
     $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    # Host __FILE__ otherwise keeps the absolute path CMake writes on the command line.
+    # The prefix is the source root plus a trailing separator; without that separator
+    # 14.44.35207 leaves __FILE__ unchanged. On CUDA 13.2, -Xcompiler also rewrites the
+    # device __FILE__ string. Intermediate #line markers still name the absolute path.
+    $<$<COMPILE_LANGUAGE:C,CXX>:/d1trimfile:${PROJECT_SOURCE_DIR}/>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/d1trimfile:${PROJECT_SOURCE_DIR}/>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process. $<HOST_LINK:...> keeps this
   # off the CUDA relocatable device-link step, which forwards it to cl.exe without the /link
@@ -253,24 +259,11 @@ else()
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wimplicit-fallthrough>
     $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=implicit-fallthrough>)
 
-  # Keep the builder's absolute paths out of the shipped binaries. `__FILE__` and nvcc's own source
-  # references otherwise embed wherever the tree happened to sit: the v0.9.0 Linux binaries carry
-  # `/home/ash/ninfer-rel/src/...` about 200 times, and v0.8.1 carried `/mnt/c/ninfer-fork/...` 405
-  # times. Not a secret -- the file names are public and no path contains a home directory -- but
-  # it makes every assertion message shorter and more readable, and it makes two builds of the same
-  # commit from different directories produce closer output.
-  #
-  # Verified on this box under real Linux g++: `/tmp/ftest/sub/a.cpp` becomes `./sub/a.cpp`, and
-  # the absolute prefix disappears from `strings` entirely.
-  #
-  # **There is no working MSVC equivalent, and this was measured rather than assumed.** MSVC takes
-  # `__FILE__` from the path as written on the command line, and CMake writes absolute paths;
-  # `/d1trimfile:`, the usual suggestion, is undocumented and had *no effect* on `__FILE__` when
-  # tested against 14.44.35207 with an absolute source path. So the Windows binaries keep their
-  # ~466 occurrences until something better turns up.
-  #
-  # -Xcompiler reaches the host half of a .cu translation unit. Device-side `__FILE__` comes from
-  # nvcc's own frontend and has no documented remapping flag, so it is not covered here.
+  # Keep the builder's absolute paths out of host __FILE__. GCC and Clang rewrite it with
+  # -ffile-prefix-map, which does not reach nvcc's device frontend. The MSVC branch above passes
+  # /d1trimfile with the source root and a trailing separator. Retested on 14.44.35207, that form
+  # rewrites host __FILE__; the earlier "no effect" result omitted the separator. On CUDA 13.2 the
+  # same flag, forwarded with -Xcompiler, also rewrites the device __FILE__ string.
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>)
@@ -332,6 +325,14 @@ function(ninfer_stamp_build_id target)
   target_sources(${target} PRIVATE ${NINFER_BUILD_ID_HEADER})
   target_include_directories(${target} PRIVATE ${CMAKE_BINARY_DIR}/generated)
 endfunction()
+# The portable core is versioned in this same repository.
+get_filename_component(_kvmem_core "${CMAKE_CURRENT_SOURCE_DIR}/../../kvmem" ABSOLUTE)
+set(NINFER_KVMEM_SOURCE_DIR "${_kvmem_core}" CACHE PATH "Portable KVMem core directory")
+if(NOT EXISTS "${NINFER_KVMEM_SOURCE_DIR}/include/kvmem/memory_contract.hpp")
+  message(FATAL_ERROR "Set NINFER_KVMEM_SOURCE_DIR to the portable KVMem core")
+endif()
+add_subdirectory("${NINFER_KVMEM_SOURCE_DIR}" "kvmem-core" EXCLUDE_FROM_ALL)
+kvmem_enable_cuda_recall(CUDART_TARGET ${NINFER_CUDART_TARGET})
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

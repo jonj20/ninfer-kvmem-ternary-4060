@@ -166,6 +166,12 @@ struct PreparedPromptData {
     std::vector<std::uint64_t> block_hashes;
     std::vector<std::uint64_t> block_extras;
     std::vector<TokenId> token_ids;
+    // Exact token range from frontend provenance. Absent means no trusted query;
+    // retrieval keeps its recency fallback. Raw token input explicitly uses all rows.
+    std::optional<TokenSpan> memory_query;
+    // Proven message boundary before a transient generation header; zero uses all input.
+    std::uint32_t memory_input_end = 0;
+
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
@@ -176,7 +182,10 @@ struct PreparedPromptData {
     PreparedContextCache context_cache;
     PreparedTapHints tap_hints;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
+    std::string assistant_continuation;
     bool starts_in_reasoning = false;
+    std::int32_t memory_think_open = -1, memory_think_close = -1;
+    std::vector<TokenSpan> memory_messages;
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;

@@ -52,6 +52,13 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
     return 8;
 }
 
+// GQA=4 dense towers use the registered prompt kernels for every width. Each
+// batch lane has its own device-side table/valid-prefix metadata.
+bool dense_gqa4(AttentionHeadGeometry geometry) {
+    return geometry.kv_heads > 0 && geometry.kv_heads <= 4 &&
+           geometry.query_heads == 4 * geometry.kv_heads;
+}
+
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !causal_attention_geometry_supported(geometry.query_heads, geometry.kv_heads)) {
@@ -514,6 +521,7 @@ int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
                                           CausalAttentionExecutionEnvelope envelope,
                                           std::int32_t batch_size, std::int32_t width) {
     require_causal_geometry(geometry, "causal_softmax_attention route family");
+    if (dense_gqa4(geometry)) return 2;
     switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                    cache_storage, envelope)) {
     case detail::CausalAttentionRoute::SmallT:
@@ -531,6 +539,7 @@ int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
                                               CausalAttentionExecutionEnvelope envelope,
                                               std::int32_t batch_size, std::int32_t width) {
     require_causal_geometry(geometry, "causal_softmax_attention small-T launches");
+    if (dense_gqa4(geometry)) return 0;
     switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                    cache_storage, envelope)) {
     case detail::CausalAttentionRoute::SmallT:
@@ -654,13 +663,13 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
         batch_size == 1 && (envelope.wide_verification || envelope.small_prefill)
             ? kMaximumSingleRowVerifyTokens
             : kMaximumVerifyTokens;
-    if (min_width <= maximum_verify_tokens) {
+    if (!dense_gqa4(geometry) && min_width <= maximum_verify_tokens) {
         const std::int32_t last = std::min(max_width, maximum_verify_tokens);
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    if (batch_size == 1 && kv_cache_is_int8_family(cache_storage) &&
+    if ((batch_size == 1 || dense_gqa4(geometry)) && kv_cache_is_int8_family(cache_storage) &&
         detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
         // The fast INT8-family prompt kernel's split partials. Only widths past every
         // graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
@@ -677,6 +686,9 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
                 maximum, detail::causal_prompt_i8_fast_split_bytes(q_heads, width, plan.splits));
         }
     }
+    // The generalized GQA4 route launches prompt attention one lane at a time. It needs the
+    // same split partials as a single lane, but none of the specialized small-T workspaces.
+    if (dense_gqa4(geometry)) return maximum;
     if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
         // The fast NVFP4 prompt kernel's split partials. A launch plans its split count from the
         // visible keys it passes, and fewer keys never select more splits, so each width reserves
@@ -781,6 +793,29 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             "causal_softmax_attention: a position-split cache needs a valid rank and a partial");
     }
 
+    if (dense_gqa4(geometry)) {
+        for (int lane = 0; lane < batch; ++lane) {
+            auto q_row = q.slice(3, lane, 1);
+            auto k_row = k.slice(3, lane, 1);
+            auto v_row = v.slice(3, lane, 1);
+            auto pos_row = positions.slice(1, lane, 1);
+            auto valid_row = valid_columns.data ? valid_columns.slice(0, lane, 1) : Tensor{};
+            auto table_row = kv_table_rows.slice(0, lane, 1);
+            auto out_row = out.slice(3, lane, 1);
+            if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
+                detail::kv_cache_append_batch_launch(k_row, v_row, pos_row, valid_row, table_row, cache, stream);
+                detail::causal_attention_prompt_sm70_launch(q_row, pos_row, valid_row, table_row,
+                                                           scale, cache, out_row, stream);
+            } else {
+                detail::causal_attention_prompt_launch(q_row, k_row, v_row, pos_row, valid_row,
+                    table_row, scale, cache, envelope.max_visible_keys, workspace, out_row,
+                    envelope.fast_prompt_kernel, stream);
+            }
+        }
+        if (gate != nullptr) sigmoid_mul(*gate, out, stream);
+        return;
+    }
+
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
@@ -855,6 +890,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (cache.page_stride != 1) {
         throw std::invalid_argument(
             "causal_softmax_attention_cached: a position-split cache takes the batched form");
+    }
+
+    if (dense_gqa4(geometry)) {
+        if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1))
+            detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
+        else
+            detail::causal_attention_prompt_attention_launch(q, positions, scale, cache,
+                envelope.max_visible_keys, workspace, out, envelope.fast_prompt_kernel, stream);
+        return;
     }
 
     auto scope = workspace.scope();

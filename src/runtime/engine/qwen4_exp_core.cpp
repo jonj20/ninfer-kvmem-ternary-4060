@@ -488,7 +488,6 @@ struct Qwen4ExpCore::Request {
     // are kept (saved_logits) and the token is sampled once the mask is ready.
     bool constrained = false;
     std::shared_ptr<runtime::GrammarMaskJob> mask;
-    runtime::GrammarMaskCost mask_cost; // whether its masks are cheap enough to speculate
     bool awaiting_sample          = false;
     std::int32_t awaiting_purpose = 0;
     // Its last accepted token, which the progress watchdog measures a decoding request from.
@@ -643,7 +642,7 @@ struct Qwen4ExpCore::Impl {
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
         const std::size_t width = std::size_t(drafts) + 1;
-        if (structured_output) {
+        { // Tool constraints need the same per-column masks as JSON output.
             token_mask = DeviceBuffer(rows * width * mask_words() * sizeof(std::uint32_t));
             host_mask  = std::make_unique<PinnedHostBuffer>(rows * width * mask_words() *
                                                             sizeof(std::uint32_t));
@@ -763,7 +762,7 @@ struct Qwen4ExpCore::Impl {
     // now, a step ahead; one that speculates fills its round's columns during the verification.
     void next_mask(const std::shared_ptr<Request>& request) {
         Request& r = *request;
-        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+        if (r.constrained && active(request) && drafts == 0) {
             schedule_mask(r);
         } else {
             r.mask.reset();
@@ -777,7 +776,6 @@ struct Qwen4ExpCore::Impl {
     bool mask_usable(const std::shared_ptr<Request>& request) {
         const auto& job = request->mask;
         if (!job) { return true; }
-        request->mask_cost.observe(job->seconds());
         const std::string problem = runtime::grammar_mask_problem(*job);
         if (problem.empty()) { return true; }
         fail(request, std::make_exception_ptr(RequestError(
@@ -2198,9 +2196,7 @@ struct Qwen4ExpCore::Impl {
     // switch of sampling parameters pending (a reasoning block that has not closed yet when the
     // request samples its answer differently).
     [[nodiscard]] bool speculates(const Request& r) const {
-        // A structured row speculates while its masks are cheap enough for the round to fill its
-        // columns during the verification; otherwise it decodes plainly, a mask ahead.
-        return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
+        return drafts > 0 && r.feed.size() == 1 &&
                instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
@@ -2531,7 +2527,6 @@ struct Qwen4ExpCore::Impl {
                                                   : nullptr;
             if (const auto& job = column_masks[j]) {
                 job->wait();
-                batch[j]->mask_cost.observe(job->seconds());
                 mask_failures[j] = runtime::grammar_mask_problem(*job);
                 if (mask_failures[j].empty()) {
                     // Columns past the row's own drafts are never taken; they stay unrestricted.
@@ -2989,12 +2984,7 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
-    // Strict tool arguments bring a grammar without a structured final format.
-    if (request->output.grammar_state() && !impl_->structured_output) {
-        throw std::invalid_argument(
-            "strict tool arguments require an Engine started with structured_output");
-    }
+        options.execution.structured_output, options.tool_choice);
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

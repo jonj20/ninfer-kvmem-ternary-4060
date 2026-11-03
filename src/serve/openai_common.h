@@ -31,6 +31,11 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
+// Recognized image detail levels all use the fixed, startup-configured Vision preprocessing.
+// Validate the wire value before lowering it to that same effective "auto" behavior.
+void validate_openai_image_detail(const RequestJson& image, std::string_view field,
+                                  std::string_view param);
+
 // True for OpenAI tool types the *server* would have executed - hosted search, hosted code
 // execution, hosted file search and the like. NInfer has no executor for any of them, and a client
 // never waits on one itself, so declaring one is silently dropped rather than failing the request:

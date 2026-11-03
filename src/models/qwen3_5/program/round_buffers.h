@@ -60,6 +60,7 @@ struct OrdinaryDecodeEgress {
 struct MtpDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
+    std::array<std::int32_t, kMaximumConcurrency> logical_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
@@ -88,6 +89,12 @@ struct DFlashDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
+    // Draft-side local-ring coordinates. DFlash (Full paged pool in the target's compact space)
+    // keeps the compact coordinate, but DFlash2 is cyclic-only: its rings are addressed by
+    // `position mod S` and are not moved by a KVMem window compaction, so it keeps logical
+    // positions. Using compact coordinates here makes `removed_tokens` shift every ring slot and
+    // collapses acceptance once the context crosses the B/R window.
+    std::array<std::int32_t, kMaximumConcurrency> draft_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> proposal_valid_columns{};
@@ -104,6 +111,9 @@ struct DFlashDecodeIngress {
     // Rows whose proposal is the ngram copy payload below; other rows keep the neural drafter's
     // proposal. Read on the device, so one captured ngram-family graph serves every mixture.
     std::array<std::int32_t, kMaximumConcurrency> copy_rows{};
+    // DFlash2: the lowest logical ring position still guaranteed live after a KVMem reselection;
+    // older slots are masked in the draft attention. DFlash keeps 0 (its Full pool reads by row).
+    std::array<std::int32_t, kMaximumConcurrency> draft_floors{};
     // Neural rounds copy only the prefix before ngram_tokens. Keep all controls above it;
     // proposal-only payloads below it preserve the existing vector-aligned offsets. The arrays
     // are column-major per row (row stride = the round's draft width k, <= verify maximum):
@@ -253,6 +263,7 @@ struct MtpDecodeState {
     DeviceSpan egress;
     Tensor anchors;
     Tensor base_frontiers;
+    Tensor logical_frontiers;
     Tensor remaining_budgets;
     Tensor current_extents;
     Tensor target_valid_columns;
@@ -303,6 +314,8 @@ struct DFlashDecodeState {
     Tensor anchors;
     Tensor execution_frontiers;
     Tensor context_frontiers;
+    Tensor draft_frontiers;
+    Tensor draft_floors;
     Tensor proposal_extents;
     Tensor target_valid_columns;
     Tensor proposal_valid_columns;

@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/resident_memory.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -130,6 +131,7 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     // other kernels than the planner foresaw (cuBLAS chooses its kernels per call, which sm_70's wide
     // projections use), so the executable is instantiated from the definition instead. The failed
     // update leaves the executable as it was and its error is not sticky.
+    if (err != cudaSuccess && err != cudaErrorGraphExecUpdateFailure && core::current_resident_memory()) { CUDA_CHECK(err); }
     if (err == cudaErrorGraphExecUpdateFailure) {
         (void)cudaGetLastError();
         instantiate(definition);

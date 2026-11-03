@@ -119,7 +119,7 @@ resolve_post_thinking_overrides(const std::optional<SamplingParams>& request,
 
 std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
     std::vector<const ToolDefinition*> tools;
-    if (!request.uses_tools()) { return tools; }
+
     tools.reserve(request.tools.size());
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
     return tools;
@@ -235,7 +235,6 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     std::optional<RequestedReasoningEffort> applied = effort;
     if (!applied && server.default_reasoning_effort && result.enable_thinking != false &&
         !(thinking && *server.default_reasoning_effort == RequestedReasoningEffort::None) &&
-        request.tool_choice.forced_name.empty() &&
         request.continuation != ninfer::PromptContinuationMode::ContinueFinalAssistant) {
         applied = server.default_reasoning_effort;
     }
@@ -261,21 +260,6 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                   "unknown_graft");
         }
         result.graft = graft;
-    }
-    if (!request.tool_choice.forced_name.empty() && result.enable_thinking != false) {
-        // The call opener is written into the generation prompt, and a thinking prompt ends
-        // inside the reasoning block, where the opener has no place. Reasoning that only a
-        // default turned on (the server's, or the chat template's when nothing is set) yields to
-        // the forced call, so clients that never mention reasoning can force a function;
-        // reasoning the request itself asks for is refused rather than silently dropped.
-        const bool reasoning_requested =
-            thinking.value_or(false) || (effort && *effort != RequestedReasoningEffort::None);
-        if (reasoning_requested) {
-            invalid_prompt_option("a forced tool_choice cannot be combined with reasoning that "
-                                  "the request enables",
-                                  "tool_choice", "tool_choice_not_supported");
-        }
-        result.enable_thinking = false;
     }
     if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
         result.enable_thinking == true) {
@@ -396,7 +380,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             });
         }
     }
-    if (request.uses_tools()) { input.options.forced_tool_name = request.tool_choice.forced_name; }
+
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
     if (request.private_cache_boundary_at_prompt_end && !input.messages.empty()) {
@@ -450,6 +434,12 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     options.execution.structured_output       = request.structured_output;
+    options.tool_choice = request.tool_choice;
+    options.tool_choice.parallel = request.parallel_tool_calls && request.tool_choice.parallel;
+    if (!request.tool_choice.forced_name.empty()) {
+        options.tool_choice.mode = ToolChoiceMode::Required;
+        options.tool_choice.allowed_names = std::vector<std::string>{request.tool_choice.forced_name};
+    }
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
@@ -477,6 +467,11 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.speculative_drafting = request.speculative_drafting;
     options.output.raw                     = false;
     options.output.preserve_special_tokens =
+        (request.tools.empty() || (request.tool_choice.constraints == ToolConstraintMode::Automatic &&
+        request.tool_choice.mode == ToolChoiceMode::Auto && request.parallel_tool_calls &&
+        request.tool_choice.parallel && !request.tool_choice.allowed_names &&
+        request.tool_choice.forced_name.empty() &&
+        std::none_of(request.tools.begin(), request.tools.end(), [](const auto& tool) { return tool.strict; }))) &&
         request.structured_output.kind == StructuredOutputKind::None &&
         (request.uses_tools() || request.has_tool_history());
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);

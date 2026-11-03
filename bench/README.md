@@ -37,7 +37,8 @@ Python interpreter; a benchmark-only configuration does not require one.
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
-`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
+`Engine::prepare_tokens()`, then calls `Engine::submit(..., Aggregate, {.phase_timings=true}).wait()`
+once for each repetition. It does not
 have a private prefill/decode loop and does not call model implementation interfaces.
 
 The matrix contains three independently measured test kinds:
@@ -54,6 +55,13 @@ All benchmark requests use raw output, disable model-default stops, and disable 
 keeps the requested token count exact without adding another generation path. When CUDA Graph is
 enabled and the matrix contains decode work, one ordinary public generation request primes the
 decode graph before warmups and measured repetitions.
+
+JSON also exports each repetition's `first_token_seconds`, `prompt_wall_seconds`,
+`generation_wall_seconds` and output token IDs. Program prefill/decode time does not include every
+Engine or memory-policy operation. For observed generation throughput, divide the timed output
+count by `generation_wall_seconds` (first through last accepted token). Use `prompt_wall_seconds`
+for prompt throughput and `total_seconds` for whole-request latency. No transfer verification is
+enabled implicitly.
 
 ## CLI
 
@@ -108,6 +116,27 @@ For a DFlash2 companion artifact:
 ```
 
 The benchmark disables context retention because every repetition is an independent root request.
+The KVMem integration accepts the shared `--kvmem-*` CLI contract. With
+`--kvmem-budget B --kvmem-gen-reserve G`, Main KV capacity is exactly `B+G`, independent of the
+logical `--max-ctx` limit, and the JSON memory section records B and G. To compare against native
+NInfer at equal active history, first use the same P=B prompt and an output count smaller than G:
+
+```bash
+# Native engine: logical and physical capacity B+G=2560.
+./build/bench/ninfer_bench --weights model.ninfer --max-ctx 2560 \
+  --kv-dtype int8 --prefill-chunk 256 -pg '2048,256' --warmup 1 -r 3 -o json
+# Integrated engine: same input, capacity, KV format and execution settings.
+./build/bench/ninfer_bench --weights model.ninfer --max-ctx 2560 \
+  --kv-dtype int8 --prefill-chunk 256 -pg '2048,256' --warmup 1 -r 3 -o json \
+  --kvmem-budget 2048 --kvmem-gen-reserve 512 --kvmem-host-mib 8192 --kvmem-lrfu
+```
+
+G is reserved KV capacity, not the actual requested output count (`-pg P,N` requests N+1 tokens).
+Hold the artifact, GPU, graph, MTP/ngram and kernel settings fixed too. Confirm capacity in the
+reports and active KV in a separate `--kvmem-verify-transfers` run; this expensive validation must
+not enter timings. Long-history runs beyond B+G measure additional retrieval/paging work and use
+different inputs, so report them separately from the equal-input comparison.
+
 Schema v16 records `speculative_backend`, `draft_tokens`, `ngram_draft_tokens`, `ngram_min_match`,
 and the proposal head independently; JSON and CSV identify DFlash2 explicitly. MTP alone reserves
 its extra lookahead KV margin. Schema v17 adds `rope_yarn_factor`.

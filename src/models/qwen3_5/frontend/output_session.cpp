@@ -500,7 +500,8 @@ public:
           flint(output.raw ? nullptr : std::move(flint_)),
           deepseek(output.raw ? nullptr : std::move(deepseek_)), tokenizer(std::move(tokenizer_)),
           policy(std::move(policy_)), thinking_control_tokens(std::move(thinking_control_tokens_)),
-          preserve_special(output.raw || output.preserve_special_tokens),
+          preserve_special(output.raw || output.preserve_special_tokens ||
+                           (tool_call_output_ && tool_call_output_->constrained)),
           split_reasoning(starts_in_reasoning && !output.raw),
           // Copied, not moved: the body still asks whether the request declared tools. Gemma's,
           // Flint's and DeepSeek's calls go through their own decoders; the Qwen decoder would
@@ -656,6 +657,7 @@ public:
     }
     bool preview_ready = false;
     std::shared_ptr<text::GrammarState> grammar;
+    std::optional<TokenId> suppressed_tool_open;
     std::unique_ptr<text::GrammarState> preview_grammar;
 };
 
@@ -695,7 +697,8 @@ OutputSession::OutputSession(
     std::shared_ptr<text::GrammarState> grammar,
     std::shared_ptr<const frontend::GemmaMarkers> gemma,
     std::shared_ptr<const frontend::FlintMarkers> flint,
-    std::shared_ptr<const frontend::DeepSeekMarkers> deepseek)
+    std::shared_ptr<const frontend::DeepSeekMarkers> deepseek,
+    std::optional<TokenId> suppressed_tool_open)
     : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
                                    starts_in_reasoning, thinking,
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
@@ -706,10 +709,15 @@ OutputSession::OutputSession(
     // A grammar admits the stop token only after the thinking closes, so a constrained turn
     // cannot end inside it.
     if (impl_->grammar) { impl_->collect_open_reasoning = false; }
+    impl_->suppressed_tool_open = suppressed_tool_open;
 }
 
 std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
     return impl_ ? impl_->grammar : nullptr;
+}
+
+std::optional<TokenId> OutputSession::suppressed_tool_open() const {
+    return impl_ ? impl_->suppressed_tool_open : std::nullopt;
 }
 
 runtime::OutputDecision
@@ -780,6 +788,71 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
             impl_->policy.token_ids.end();
+
+        // A turn-level stop token emitted before the reasoning block closes is the model's
+        // implicit reasoning boundary, not the end of the turn. Stop strings already have an
+        // output-channel guard; keep the token path consistent and continue decoding content.
+        // Preserve the upstream terminal recovery when complete, declared tool calls are
+        // stranded in open reasoning. Otherwise retain KVMem's implicit reasoning boundary.
+        bool recover_open_calls = false;
+        if (stop_token && impl_->preview_state.in_reasoning && impl_->collect_open_reasoning &&
+            !holds_presentation_close(impl_->preview_state)) {
+            std::string reasoning = impl_->open_reasoning;
+            for (const auto& delta : impl_->preview_output)
+                if (delta.channel == OutputChannel::Reasoning) reasoning += delta.text;
+            reasoning += impl_->preview_state.think_marker_pending;
+            auto probe = impl_->tool_call_output;
+            recover_open_calls = probe.finish(FinishReason::StopToken, reasoning)
+                                     .diagnostics.recovered_from_reasoning;
+        }
+        if (!impl_->gemma && stop_token && impl_->preview_state.in_reasoning &&
+            !holds_presentation_close(impl_->preview_state) && !recover_open_calls) {
+            DecoderState& state = impl_->preview_state;
+            // This token itself closes thinking; unlike a token confirming an already held
+            // close marker, it still belongs to the model's thinking-token budget.
+            ++state.reasoning_tokens;
+            SemanticThinkingState& thinking = impl_->preview_semantic;
+            if (thinking.in_reasoning) {
+                ++thinking.model_thinking_tokens;
+                if (impl_->early_close_available && thinking.budget &&
+                    thinking.model_thinking_tokens > *thinking.budget) {
+                    throw std::logic_error("model output exceeded the licensed thinking budget");
+                }
+            }
+            if (!state.utf8_pending.empty()) {
+                state.utf8_pending.clear();
+                feed_decoded_text(state, kUtf8Replacement, impl_->policy, impl_->preview_output,
+                                  count, nullptr);
+            }
+            if (state.in_reasoning) {
+                const ReasoningCloseScan scan =
+                    scan_reasoning_close(state.think_marker_pending, state.exact_close, true);
+                const std::size_t split = scan.close != std::string::npos
+                                              ? scan.close
+                                              : state.think_marker_pending.size();
+                feed_channel(state, OutputChannel::Reasoning,
+                             std::string_view(state.think_marker_pending).substr(0, split),
+                             impl_->policy, impl_->preview_output, count, nullptr);
+                close_channel(state, OutputChannel::Reasoning, impl_->preview_output);
+                state.think_marker_pending.clear();
+                state.in_reasoning          = false;
+                state.strip_content_leading = true;
+            }
+
+            // The presentation decoder, thinking-budget controller and prefix executor are
+            // independent state machines. Commit the implicit boundary in all three so a later
+            // content token cannot re-arm control or leave prefix execution open.
+            impl_->preview_semantic.close_pending.clear();
+            impl_->preview_semantic.in_reasoning    = false;
+            impl_->preview_semantic.control_pending = false;
+            if (impl_->preview_prefix_execution.tracking) {
+                impl_->preview_prefix_execution.tracking = false;
+                impl_->preview_prefix_execution.matched  = 0;
+                impl_->preview_execution_split_after     = count;
+            }
+            release_logprobs(state, impl_->preview_logprobs);
+            continue;
+        }
 
         // A token that confirms a held close (its first byte is a line break, or it ends the
         // turn) is the first one after the thinking, so neither count includes it.
@@ -987,7 +1060,8 @@ std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept 
     if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
         return {};
     }
-    return *impl_->thinking_control_tokens;
+    return std::span<const TokenId>(*impl_->thinking_control_tokens)
+        .subspan(impl_->semantic.injected_tokens);
 }
 
 std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
@@ -996,7 +1070,7 @@ std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
         return 0;
     }
     return impl_->semantic.control_pending || impl_->semantic.in_reasoning
-               ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
+               ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size()) - impl_->semantic.injected_tokens
                : 0U;
 }
 
@@ -1006,9 +1080,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     const std::span<const TokenId> expected = pending_control_tokens();
-    if (expected.empty() || tokens.size() != expected.size() ||
+    if (tokens.empty() || tokens.size() > expected.size() ||
         !std::equal(tokens.begin(), tokens.end(), expected.begin())) {
-        throw std::invalid_argument("thinking control preview requires the exact pending span");
+        throw std::invalid_argument("thinking control preview requires a prefix of the pending span");
     }
     if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("thinking control span exceeds the remaining output budget");
@@ -1041,16 +1115,17 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
     }
-    if (impl_->preview_semantic.in_reasoning) {
+    const bool complete = tokens.size() == expected.size();
+    if (complete && impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");
     }
-    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
+    if (complete && impl_->split_reasoning && impl_->preview_state.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
-    impl_->preview_semantic.control_pending = false;
-    impl_->preview_semantic.applied         = true;
-    impl_->preview_finish_reason            = FinishReason::None;
-    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_semantic.control_pending = !complete;
+    impl_->preview_semantic.applied         = complete;
+    impl_->preview_semantic.injected_tokens += static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_finish_reason = FinishReason::None;
     if (impl_->grammar) {
         auto grammar = impl_->grammar->fork();
         grammar->accept(tokens);
@@ -1059,6 +1134,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_ready = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
+        .continuation                 = complete ? runtime::ContinuationAction::Decode
+                                                 : runtime::ContinuationAction::ApplyTargetControl,
         .prefix_execution_split_after = impl_->preview_execution_split_after,
     };
 }

@@ -1,4 +1,6 @@
 #include "serve/load_report.h"
+#include "serve/cuda_residency_json.h"
+#include "serve/kvmem_status_json.h"
 
 #include "serve/request_events.h"
 #include "serve/request_log.h"
@@ -75,6 +77,7 @@ Json load_report(const LoadCapacity& capacity, const LoadSample& sample) {
                           {"shared_prefill_passes", stats.shared_prefill_passes},
                           {"shared_prefill_requests", stats.shared_prefill_requests}}},
     };
+    if (stats.kvmem.enabled) report["kvmem"] = kvmem_status_json(stats.kvmem);
     return report;
 }
 
@@ -89,6 +92,7 @@ std::string make_stats_report(const LoadCapacity& capacity, const LoadSample& sa
     report["object"]                    = "ninfer.stats";
     report["requests"]["peak_admitted"] = sample.peak_admitted_requests;
     const ninfer::RuntimeStats& stats   = sample.stats;
+    report["memory"] = Json{{"cuda_residency", cuda_residency_json(stats.cuda_residency)}};
     const ThroughputReport since_startup{
         .interval_seconds = std::isfinite(sample.uptime_seconds) ? sample.uptime_seconds : 0.0,
         .computed_prefill_tokens = stats.computed_prefill_tokens,

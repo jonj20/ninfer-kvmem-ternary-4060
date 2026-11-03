@@ -36,13 +36,23 @@ another. The minimum match defaults to 12 and its supported range is 4..64.
 
 At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests.
 The GDN conv-record workspace behind the recurrent state admits at most 16 verification columns
-once the batch holds more than one request, so a verify width above 15 is admitted only at
-`--max-concurrency 1`. This caps the ngram width the same way for every backend.
+once the batch holds more than one request. At startup, the server and Engine automatically
+reduce a requested width of 16..63 to 15 when `--max-concurrency > 1`, and emit a warning with
+the requested and effective widths. This caps the ngram width the same way for every backend.
+The width stays fixed even while only one request is active; concurrency one preserves widths
+up to 63. Zero remains off, and values outside 0..63 remain invalid.
 
 `--lookup-ngram N` is a different, older source: it replaces an MTP round's neural drafts with
 what followed the last `N` tokens earlier in the sequence, inside the neural window. Copy
 proposals match at least `--ngram-min-match` tokens, reach past the neural window and draw on
 tool results and retained sessions as well; the two can be combined.
+
+The KVMem integration disables the legacy lookup source by policy. A nonzero
+`--lookup-ngram` fails at both serving and Engine validation, including without MTP and
+when the new copy proposer is also enabled. Use `--ngram-draft-tokens` and
+`--ngram-min-match` instead. The Windows KVMem launcher rejects explicit lookup flags
+in `WorkerArgs`, including the `--lookup-ngram=N` spelling, and advertises this source
+as disabled. Ordinary NInfer without KVMem retains its existing lookup behavior.
 
 ## Round shapes
 

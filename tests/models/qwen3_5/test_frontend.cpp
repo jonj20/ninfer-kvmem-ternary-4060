@@ -8,6 +8,8 @@
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_open_token.h"
+#include "models/qwen3_5/program/tool_open_mask.h"
 #include "text/unicode.h"
 #include "text/structured_output.h"
 
@@ -27,8 +29,10 @@
 #include <iterator>
 #include <memory>
 #include <random>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -2533,7 +2537,46 @@ int test_open_reasoning_tool_recovery() {
     return failures;
 }
 
-int test_structured_tool_output() {
+int test_tool_open_suppression() {
+    using ninfer::models::qwen3_5::fill_forbidden_token_mask;
+    using ninfer::models::qwen3_5::frontend::unique_exact_token;
+    auto lookup = [](const std::vector<std::string>& vocab) {
+        return [&](std::size_t id) -> std::string_view {
+            if (id >= vocab.size() || vocab[id].empty()) { return {}; }
+            return vocab[id];
+        };
+    };
+    const std::vector<std::string> none = {"a", "b", "c"};
+    int failures = check(!unique_exact_token(none.size(), lookup(none), "<tool_call>"),
+                         "missing tool-open token was reported");
+    std::vector<std::string> one = none;
+    one.emplace_back("<tool_call>");
+    failures += check(unique_exact_token(one.size(), lookup(one), "<tool_call>") == 3,
+                      "unique tool-open token was not found");
+    std::vector<std::string> two = one;
+    two.emplace_back("<tool_call>");
+    failures += check(!unique_exact_token(two.size(), lookup(two), "<tool_call>"),
+                      "ambiguous tool-open token was selected");
+    const std::vector<std::string> invalid = {"<tool_call>", ""};
+    failures += check(unique_exact_token(invalid.size(), lookup(invalid), "<tool_call>") == 0,
+                      "an empty slot counted as a second tool-open token");
+
+    std::vector<std::uint32_t> words(2);
+    fill_forbidden_token_mask(words, 3, 40);
+    const bool bit_clear = (words[0] & (1U << 3)) == 0;
+    const bool neighbors = (words[0] & (1U << 2)) != 0 && (words[0] & (1U << 4)) != 0;
+    const bool rest      = (words[0] | (1U << 3)) == 0xFFFFFFFFU && words[1] == 0xFFFFFFFFU;
+    failures += check(bit_clear && neighbors && rest,
+                      "forbidden-token mask did not clear exactly one bit");
+    bool rejected = false;
+    try {
+        fill_forbidden_token_mask(words, 40, 40);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    failures += check(rejected, "a token outside the sampling domain was masked");
+    return failures;
+}
+
+int test_constrained_tool_output() {
     const Frontend frontend = make_frontend(resources());
 
     ninfer::ChatMessage message;
@@ -2546,20 +2589,25 @@ int test_structured_tool_output() {
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"},"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["taskId"]}}})");
     auto prompt = frontend.prepare(std::move(input));
+    ninfer::ToolChoice basic;
+    basic.constraints = ninfer::ToolConstraintMode::Basic;
     auto session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+                                     {}, {}, basic);
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
-        "</parameter>\n<parameter=enabled>\n</parameter>\n<parameter=count>\nmany\n"
+        "</parameter>\n<parameter=enabled>\n\n</parameter>\n<parameter=count>\nmany\n"
         "</parameter>\n</function>\n</tool_call>";
-    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
-    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+    std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    tokens.push_back(6);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
                                                 ninfer::FinishReason::OutputLimit);
-    int failures        = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
-                                "tool output did not reach the terminal transaction");
+    int failures        = check(session.grammar_state() &&
+                                    decision.finish_reason == ninfer::FinishReason::StopToken,
+                                "constrained tool output did not complete at EOS");
     const auto output   = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Calling.",
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Calling.  \n",
                       "frontend did not hide the terminal tool-call suffix");
     const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
     failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
@@ -2578,6 +2626,90 @@ int test_structured_tool_output() {
         failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1" &&
                               !arguments.contains("enabled") && arguments.at("count") == "many",
                           "frontend did not preserve normalized tool arguments");
+    }
+    // Non-strict normalization also handles a compact empty parameter. Its closing tag must
+    // not become the value of enabled or hide the following count parameter.
+    std::string compact = generated;
+    const auto empty = compact.find("<parameter=enabled>\n\n");
+    compact.erase(empty + std::string_view("<parameter=enabled>\n").size(), 1);
+    auto compact_session = frontend.make_output_session(prompt, {}, {}, {}, {}, basic);
+    tokens = fixture_tokenizer().encode(compact);
+    tokens.push_back(6);
+    (void)compact_session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                                        ninfer::FinishReason::OutputLimit);
+    (void)compact_session.commit_preview();
+    const auto compact_calls = compact_session.take_tool_calls();
+    failures += check(calls.size() == 1 && compact_calls.size() == 1 &&
+                          compact_calls.front().arguments_json == calls.front().arguments_json &&
+                          compact_session.tool_call_parse_diagnostics() ==
+                              session.tool_call_parse_diagnostics(),
+                      "compact empty parameter consumed the next argument or lost diagnostics");
+    ninfer::ToolChoice none = basic;
+    none.mode = ninfer::ToolChoiceMode::None;
+    auto no_tools = frontend.make_output_session(prompt, {}, {}, {}, {}, none);
+    const auto none_grammar = no_tools.grammar_state();
+    failures += check(bool(none_grammar), "explicit basic none lost its prohibition grammar");
+    failures += check(!no_tools.suppressed_tool_open(),
+                      "explicit basic none applied the single-token sampler ban");
+    if (none_grammar) {
+        bool rejected = false;
+        try { none_grammar->fork()->accept(fixture_tokenizer().encode(generated)); }
+        catch (const std::logic_error&) { rejected = true; }
+        failures += check(rejected, "explicit basic none admitted tool markup as text");
+        none_grammar->fork()->accept(fixture_tokenizer().encode("Tools are disabled."));
+    }
+
+    // The default auto path keeps native call parsing, including the empty-argument fix,
+    // without constructing a generation grammar. Use real special-token delimiters too.
+    auto native = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.preserve_special_tokens = true});
+    failures += check(!native.grammar_state(), "default auto unexpectedly enabled tool grammar");
+    failures += check(!native.suppressed_tool_open(),
+                      "default auto suppressed the tool-call token");
+    (void)native.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                               ninfer::FinishReason::OutputLimit);
+    (void)native.commit_preview();
+    const auto native_calls = native.take_tool_calls();
+    failures += check(calls.size() == 1 && native_calls.size() == 1 &&
+                          native_calls.front().name == "TaskUpdate" &&
+                          native_calls.front().arguments_json == calls.front().arguments_json,
+                      "default auto lost native call parsing or argument normalization");
+
+    none.constraints = ninfer::ToolConstraintMode::Automatic;
+    auto free_none = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.preserve_special_tokens = true}, {}, {}, none);
+    failures += check(!free_none.grammar_state(), "default none unexpectedly enabled tool grammar");
+    const auto& open_tokenizer = fixture_tokenizer();
+    const auto expected_open   = ninfer::models::qwen3_5::frontend::unique_exact_token(
+        open_tokenizer.vocab_size(),
+        [&](std::size_t id) -> std::string_view {
+            const auto token = static_cast<int>(id);
+            if (!open_tokenizer.is_valid_token(token)) { return {}; }
+            return open_tokenizer.decode_token_bytes(token, false);
+        },
+        "<tool_call>");
+    failures += check(free_none.suppressed_tool_open() == expected_open,
+                      "default none did not suppress the unique <tool_call> token");
+    (void)free_none.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                                  ninfer::FinishReason::OutputLimit);
+    const auto none_output = free_none.commit_preview();
+    failures += check(free_none.take_tool_calls().empty() &&
+                          channel_text(none_output, ninfer::OutputChannel::Content) == compact,
+                      "default none decoded calls or discarded the model's plain text");
+
+    const ninfer::StructuredOutputOptions json{ninfer::StructuredOutputKind::JsonObject, {}, false};
+    auto json_none = frontend.make_output_session(prompt, {}, {}, {}, json, none);
+    const auto json_grammar = json_none.grammar_state();
+    failures += check(bool(json_grammar), "default none lost explicit JSON grammar");
+    failures += check(!json_none.suppressed_tool_open(),
+                      "none plus JSON applied the single-token sampler ban");
+    if (json_grammar) {
+        bool rejected = false;
+        const auto call_only = compact.substr(compact.find("<tool_call>"));
+        try { json_grammar->fork()->accept(fixture_tokenizer().encode(call_only)); }
+        catch (const std::logic_error&) { rejected = true; }
+        failures += check(rejected, "none plus JSON admitted a tool-call alternative");
+        json_grammar->fork()->accept(fixture_tokenizer().encode("{\"ok\":true}"));
     }
     return failures;
 }
@@ -2642,6 +2774,69 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
     input.options.enable_thinking = true;
     return frontend.prepare(std::move(input));
+}
+
+int test_stop_token_inside_reasoning_keeps_the_turn_alive(const Frontend& frontend) {
+    const std::vector<ninfer::TokenId> thought = fixture_tokens("thought");
+    std::vector<ninfer::TokenId> first_round   = thought;
+    first_round.push_back(6);
+
+    auto session = frontend.make_output_session(
+        thinking_prompt(frontend), {}, {},
+        ninfer::ThinkingControlOptions{
+            .budget = static_cast<std::uint32_t>(first_round.size())});
+    const auto first_decision = session.preview_model(
+        first_round, static_cast<std::uint32_t>(first_round.size() + 32U),
+        ninfer::FinishReason::OutputLimit);
+    int failures = check(first_decision.accepted_tokens == first_round.size() &&
+                             !first_decision.finished() &&
+                             first_decision.continuation ==
+                                 ninfer::runtime::ContinuationAction::Decode &&
+                             first_decision.prefix_execution_split_after == first_round.size(),
+                         "a stop token inside the reasoning block ended the turn");
+    const auto first_output = session.commit_preview();
+    failures += check(channel_text(first_output, ninfer::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(first_output, ninfer::OutputChannel::Content).empty(),
+                      "the implicit reasoning close changed the reasoning output");
+    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    failures += check(session.reasoning_closed() && session.pending_control_tokens().empty() &&
+                          session.model_token_budget_remaining(32) == 32 &&
+                          stats.model_thinking_tokens == first_round.size() && !stats.applied,
+                      "the implicit reasoning close left budget or prefix state open");
+
+    std::vector<ninfer::TokenId> answer = fixture_tokens("\n\nanswer");
+    answer.push_back(6);
+    const auto answer_decision = session.preview_model(
+        answer, static_cast<std::uint32_t>(answer.size() + 32U),
+        ninfer::FinishReason::OutputLimit);
+    failures += check(answer_decision.accepted_tokens == answer.size() &&
+                          answer_decision.finish_reason == ninfer::FinishReason::StopToken &&
+                          !answer_decision.prefix_execution_split_after,
+                      "the round did not continue to the next turn-level stop token");
+    const auto answer_output = session.commit_preview();
+    failures += check(channel_text(answer_output, ninfer::OutputChannel::Reasoning).empty() &&
+                          channel_text(answer_output, ninfer::OutputChannel::Content) == "answer",
+                      "the answer after the mid-thinking stop token was not published");
+    return failures;
+}
+
+int test_stop_token_after_reasoning_still_ends_the_turn(const Frontend& frontend) {
+    auto session = frontend.make_output_session(thinking_prompt(frontend), {});
+    std::vector<ninfer::TokenId> tokens =
+        fixture_tokenizer().encode("thought\n</think>\n\nanswer");
+    tokens.push_back(6);
+    const auto decision = session.preview_model(
+        tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+        ninfer::FinishReason::OutputLimit);
+    int failures = check(decision.accepted_tokens == tokens.size() &&
+                             decision.finish_reason == ninfer::FinishReason::StopToken,
+                         "a stop token after the reasoning block did not end the turn");
+    const auto output = session.commit_preview();
+    failures += check(session.reasoning_closed() &&
+                          channel_text(output, ninfer::OutputChannel::Reasoning) == "thought\n" &&
+                          channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "ordinary stop-token handling changed after a natural reasoning close");
+    return failures;
 }
 
 int test_reasoning_close_requires_boundary(const Frontend& frontend) {
@@ -2847,7 +3042,7 @@ int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
     return failures;
 }
 
-int test_tool_marker_after_quoted_marker() {
+int test_unconstrained_tool_marker_after_quoted_marker() {
     const Frontend frontend = make_frontend(resources());
 
     ninfer::ChatMessage message;
@@ -2860,8 +3055,10 @@ int test_tool_marker_after_quoted_marker() {
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
     auto prompt = frontend.prepare(std::move(input));
-    auto session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    ninfer::ToolChoice automatic;
+    automatic.constraints = ninfer::ToolConstraintMode::Automatic;
+    auto session = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, automatic);
 
     const std::string quoted =
         "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
@@ -3082,7 +3279,7 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
         input.messages.push_back({.role  = ninfer::ChatRole::User,
                                   .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "x"}}});
         input.options.tool_jsons.push_back(
-            R"({"type":"function","function":{"name":"record","strict":true,"parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}})");
+            R"({"type":"function","function":{"name":"record","strict":true,"parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"],"additionalProperties":false}}})");
         auto session = frontend.make_output_session(frontend.prepare(input), {}, {},
                                                     loop_options(ReasoningLoopAction::Conclude));
         failures +=
@@ -3184,6 +3381,33 @@ int test_thinking_budget_control(const Frontend& frontend) {
                           session.model_token_budget_remaining(17) == 17,
                       "thinking control accounting or post-close license is incorrect");
 
+    // SSD control execution can cross several bounded native windows. Splitting
+    // must preserve presentation, closure and injected-token accounting.
+    auto chunked = frontend.make_output_session(
+        prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    (void)chunked.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    (void)chunked.commit_preview();
+    std::string chunked_reasoning, chunked_content;
+    for (std::size_t index = 0; index < control.size(); ++index) {
+        const auto remaining = chunked.pending_control_tokens();
+        failures += check(remaining.size() == control.size() - index &&
+                          chunked.control_suffix_tokens() == remaining.size(),
+                          "partial control lost its remaining suffix");
+        const auto decision = chunked.preview_control(remaining.first(1), 18);
+        failures += check(decision.continuation == (index + 1 == control.size()
+            ? ninfer::runtime::ContinuationAction::Decode
+            : ninfer::runtime::ContinuationAction::ApplyTargetControl),
+            "partial control resumed model sampling too soon");
+        const auto output = chunked.commit_preview();
+        chunked_reasoning += channel_text(output, ninfer::OutputChannel::Reasoning);
+        chunked_content += channel_text(output, ninfer::OutputChannel::Content);
+    }
+    failures += check(chunked_reasoning == channel_text(control_output, ninfer::OutputChannel::Reasoning) &&
+                      chunked_content == channel_text(control_output, ninfer::OutputChannel::Content) &&
+                      chunked.thinking_stats().injected_tokens == stats.injected_tokens &&
+                      chunked.thinking_stats().applied && chunked.pending_control_tokens().empty(),
+                      "chunked control differs from atomic control");
+
     const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 17,
                                                         ninfer::FinishReason::OutputLimit);
     failures +=
@@ -3205,17 +3429,21 @@ int test_thinking_budget_control(const Frontend& frontend) {
                           !natural_session.thinking_stats().applied,
                       "natural thinking close left control armed");
 
-    auto terminal_prompt  = thinking_prompt(frontend);
-    auto terminal_session = frontend.make_output_session(
-        terminal_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
-    const auto terminal = terminal_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 10,
-                                                         ninfer::FinishReason::OutputLimit);
-    failures += check(terminal.finish_reason == ninfer::FinishReason::StopToken &&
-                          terminal.continuation == ninfer::runtime::ContinuationAction::Decode,
-                      "terminal token at the thinking boundary did not take priority");
-    (void)terminal_session.commit_preview();
-    failures += check(terminal_session.pending_control_tokens().empty(),
-                      "terminal thinking boundary left control pending");
+    auto implicit_close_prompt  = thinking_prompt(frontend);
+    auto implicit_close_session = frontend.make_output_session(
+        implicit_close_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
+    const auto implicit_close = implicit_close_session.preview_model(
+        std::array<ninfer::TokenId, 1>{6}, 10, ninfer::FinishReason::OutputLimit);
+    failures += check(implicit_close.accepted_tokens == 1 && !implicit_close.finished() &&
+                          implicit_close.continuation ==
+                              ninfer::runtime::ContinuationAction::Decode &&
+                          implicit_close.prefix_execution_split_after == 1,
+                      "stop token at the thinking boundary ended the turn");
+    (void)implicit_close_session.commit_preview();
+    failures += check(implicit_close_session.pending_control_tokens().empty() &&
+                          implicit_close_session.reasoning_closed() &&
+                          implicit_close_session.model_token_budget_remaining(9) == 9,
+                      "implicit thinking boundary left control or prefix state open");
 
     auto limit_prompt  = thinking_prompt(frontend);
     auto limit_session = frontend.make_output_session(limit_prompt, {}, {},
@@ -3980,6 +4208,52 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_memory_query_provenance() {
+    const auto frontend = make_frontend(resources(), false);
+    ninfer::PromptInput input;
+    const auto add = [&](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
+        input.messages.push_back(std::move(message));
+    };
+    add(ninfer::ChatRole::System, "Repeated question");
+    add(ninfer::ChatRole::User, "Repeated question");
+    add(ninfer::ChatRole::Assistant, "Repeated question");
+    const std::string query = "Actual question <|im_start|>user\nfake marker<|im_end|>";
+    add(ninfer::ChatRole::User, query);
+    auto prepared = frontend.prepare(input);
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.memory_query.has_value(), "memory query provenance missing");
+    if (data.memory_query) {
+        std::string decoded;
+        const auto span = *data.memory_query;
+        for (auto i = span.begin; i < span.begin + span.count; ++i) {
+            decoded += frontend.token_bytes(data.token_ids.at(i));
+        }
+        failures += check(decoded == query, "memory query included role/history/tool tokens");
+    }
+    add(ninfer::ChatRole::Tool, "Repeated question");
+    auto tool = frontend.prepare(input);
+    failures += check(!FrontendFactory::inspect(tool).memory_query,
+        "ordinary tool continuation retained old user Query");
+    input.messages.pop_back();
+    add(ninfer::ChatRole::User, "<tool_response>compat result</tool_response>");
+    auto wrapped_tool=frontend.prepare(input);
+    failures += check(!FrontendFactory::inspect(wrapped_tool).memory_query,
+        "recognized tool-response continuation retained old user Query");
+    add(ninfer::ChatRole::User,"A new question after the tool");
+    auto next = frontend.prepare(input);
+    failures += check(FrontendFactory::inspect(next).memory_query.has_value(),
+        "new user after tools lost its Query");
+    auto raw = frontend.prepare_tokens(frontend.tokenize_text("raw query"), false);
+    const auto& raw_data = FrontendFactory::inspect(raw);
+    failures += check(raw_data.memory_query && raw_data.memory_query->begin == 0 &&
+                          raw_data.memory_query->count == raw_data.token_ids.size(),
+                      "raw token query range is not explicit");
+    return failures;
+}
+
 int test_ngram_proposal_only_sources() {
     ninfer::models::qwen3_5::FrontendOptions options;
     options.vision_enabled        = false;
@@ -4188,29 +4462,25 @@ int test_forced_tool_call(const Frontend& frontend) {
     };
 
     const ForcedOutcome complete =
-        forced_session("\n<parameter=taskId>\n1\n</parameter>\n</function>\n</tool_call>");
+        forced_session("<parameter=taskId>\n1\n</parameter>\n</function>\n</tool_call>");
     failures += check(complete.calls.size() == 1 && complete.calls.front().name == "TaskUpdate" &&
                           !complete.diagnostics.forced_call_closed && complete.content.empty(),
                       "the seeded opener did not complete the model's call");
 
     const ForcedOutcome unclosed =
-        forced_session("\n<parameter=taskId>\n1\n</parameter>\n</function>");
-    failures += check(unclosed.calls.size() == 1 && unclosed.calls.front().name == "TaskUpdate" &&
-                          unclosed.diagnostics.forced_call_closed && unclosed.content.empty(),
-                      "a turn ending on the closed function did not become the forced call");
+        forced_session("<parameter=taskId>\n1\n</parameter>\n</function>");
+    failures += check(unclosed.calls.empty() && !unclosed.diagnostics.forced_call_closed &&
+                          unclosed.content.empty(),
+                      "constrained output repaired an unfinished call's outer close");
 
-    const ForcedOutcome truncated = forced_session("\n<parameter=taskId>\n1\n</par");
-    // An unfinished argument is not completed into the forced call: it is reported back to the
-    // model as a malformed call naming the intended tool, and no markup leaks into content.
-    failures += check(truncated.calls.size() == 1 &&
-                          truncated.calls.front().name == "malformed_tool_call" &&
-                          truncated.calls.front().arguments_json.find("TaskUpdate") !=
-                              std::string::npos &&
+    const ForcedOutcome truncated = forced_session("<parameter=taskId>\n1\n</par");
+    // Constraints publish completed calls only; a truncated argument does not create a call.
+    failures += check(truncated.calls.empty() &&
                           !truncated.diagnostics.forced_call_closed &&
-                          truncated.diagnostics.malformed_call_reported,
-                      "an unfinished argument was not reported as a malformed call");
+                          !truncated.diagnostics.malformed_call_reported,
+                      "constrained output published a truncated argument as a tool call");
     failures += check(truncated.content.empty(),
-                      "a reported malformed call left markup in content");
+                      "a constrained truncated call left markup in content");
     return failures;
 }
 
@@ -4425,11 +4695,33 @@ int test_gemma_forced_tool_call() {
     return failures;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    try {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
+    if (argc == 2 && std::string_view(argv[1]) == "--tool-output-only") {
+        failures += test_tool_open_suppression();
+        failures += test_constrained_tool_output();
+        failures += test_forced_tool_call(frontend);
+        failures += test_unconstrained_tool_marker_after_quoted_marker();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--reasoning-stop-only") {
+        failures += test_stop_token_inside_reasoning_keeps_the_turn_alive(frontend);
+        failures += test_stop_token_after_reasoning_still_ends_the_turn(frontend);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--thinking-control-only") {
+        failures += test_thinking_budget_control(frontend);
+        failures += test_thinking_budget_ignores_quoted_close(frontend);
+        failures += test_structured_thinking_control(frontend);
+        failures += test_thinking_budget_message();
+        failures += test_thinking_budget_branches(frontend);
+        return failures == 0 ? 0 : 1;
+    }
     failures += test_declared_frontend_semantics();
+    failures += test_memory_query_provenance();
     failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
     failures += test_bpe_merge_order();
@@ -4469,12 +4761,15 @@ int main() {
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
-    failures += test_structured_tool_output();
-    failures += test_open_reasoning_tool_recovery();
+    failures += test_tool_open_suppression();
+    failures += test_constrained_tool_output();
     failures += test_forced_tool_call(frontend);
-    failures += test_tool_marker_after_quoted_marker();
+    failures += test_unconstrained_tool_marker_after_quoted_marker();
+    failures += test_open_reasoning_tool_recovery();
     failures += test_tool_definitions_in_prompt();
     failures += test_reasoning_split(frontend);
+    failures += test_stop_token_inside_reasoning_keeps_the_turn_alive(frontend);
+    failures += test_stop_token_after_reasoning_still_ends_the_turn(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
@@ -4501,4 +4796,8 @@ int main() {
     failures += test_gemma_forced_tool_call();
     failures += test_gemma_reasoning_loop_guard();
     return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "frontend test exception: " << error.what() << "\n";
+        return 1;
+    }
 }

@@ -44,7 +44,7 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
                                                     float scale, const CacheView& cache,
                                                     Metadata metadata, Tensor& out,
                                                     cudaStream_t stream) {
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_prompt_fp8_attention_launch_for<Geometry>(q, positions, scale, cache,
                                                                    metadata, out, stream);
     });

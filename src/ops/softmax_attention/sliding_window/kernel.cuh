@@ -11,8 +11,11 @@ struct SlidingWindowAttentionPolicy {
     const std::int32_t* positions;
     int padded_context;
     int window_mask;
+    int min_position = 0;
 
-    __device__ __forceinline__ int context_count(int value) const { return min(value, window_mask); }
+    __device__ __forceinline__ int context_count(int value) const {
+        return min(max(value - min_position, 0), window_mask);
+    }
 
     __device__ __forceinline__ int query_position(int token) const { return positions[token]; }
 
@@ -40,6 +43,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
         const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
         const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
+        const std::int32_t* __restrict__ min_positions,
         const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
         int padded_context, int window_mask, int max_context, int split_capacity, float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
@@ -55,6 +59,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         .positions      = batch_positions,
         .padded_context = padded_context,
         .window_mask = window_mask,
+        .min_position = min_positions != nullptr ? min_positions[batch] : 0,
     };
     context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta,
                                      KeyBlock, DirectOutput>(
@@ -67,7 +72,8 @@ template <int Tokens, int KeyBlock, int WarpsPerBlock>
 __launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attention_reduce_kernel(
     const float* __restrict__ partial_acc, const float* __restrict__ partial_m,
     const float* __restrict__ partial_l, const std::int32_t* __restrict__ positions,
-    const std::int32_t* __restrict__ valid_columns, int window_mask, int max_context,
+    const std::int32_t* __restrict__ valid_columns,
+    const std::int32_t* __restrict__ min_positions, int window_mask, int max_context,
     int split_capacity, __nv_bfloat16* __restrict__ out) {
     pdl::enter();
     static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
@@ -101,7 +107,8 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attentio
         }
         return;
     }
-    const int context_count = min(length, window_mask);
+    const int min_pos       = min_positions != nullptr ? min_positions[batch] : 0;
+    const int context_count = min(max(length - min_pos, 0), window_mask);
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
 

@@ -16,6 +16,8 @@
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 #include "text/structured_output.h"
+#include "models/qwen3_5/frontend/tool_grammar.h"
+#include "models/qwen3_5/frontend/tool_open_token.h"
 #include <mutex>
 
 #include <nlohmann/json.hpp>
@@ -1150,8 +1152,28 @@ public:
         throw std::invalid_argument("unknown graft '" + name + "'");
     }
 
+    // Cached: the vocabulary does not change, and scanning it per request is the cost this
+    // path is avoiding relative to compiling a prohibition grammar.
+    [[nodiscard]] std::optional<TokenId> unique_tool_open_token() const {
+        std::lock_guard lock(grammar_mutex);
+        if (!tool_open_resolved) {
+            tool_open_resolved = true;
+            tool_open_token    = fi::unique_exact_token(
+                tokenizer->vocab_size(),
+                [&](std::size_t id) -> std::string_view {
+                    const auto token = static_cast<int>(id);
+                    if (!tokenizer->is_valid_token(token)) { return {}; }
+                    return tokenizer->decode_token_bytes(token, false);
+                },
+                "<tool_call>");
+        }
+        return tool_open_token;
+    }
+
     mutable std::mutex grammar_mutex;
     mutable std::unique_ptr<text::StructuredCompiler> grammar_compiler;
+    mutable bool tool_open_resolved = false;
+    mutable std::optional<TokenId> tool_open_token;
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
@@ -1411,6 +1433,16 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    const auto memory_open=impl_->tokenizer->encode("<think>");
+    const auto memory_close=impl_->tokenizer->encode("</think>");
+    if(memory_open.size()==1) result.memory_think_open=memory_open[0];
+    if(memory_close.size()==1) result.memory_think_close=memory_close[0];
+    if (!options.forced_tool_name.empty()) {
+        result.assistant_continuation = "<tool_call>\n<function=" + options.forced_tool_name + ">\n";
+    } else if (options.continuation == PromptContinuationMode::ContinueFinalAssistant && !messages.empty()) {
+        for (const auto& part : messages.back().parts)
+            if (part.kind == fi::ChatPartKind::Text) result.assistant_continuation += part.text;
+    }
     // A request that does not draft reads one token: it needs no proposal sources or index.
     const bool drafts_ngrams = impl_->ngram_sources_enabled && options.speculative_drafting;
     if (drafts_ngrams) {
@@ -1448,6 +1480,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.starts_in_reasoning = processed.starts_in_reasoning;
+        if (processed.memory_query) {
+            result.memory_query = TokenSpan{processed.memory_query->begin, processed.memory_query->count};
+        }
         result.token_types         = std::move(processed.token_types);
         result.positions           = std::move(processed.positions);
         result.rope_delta          = processed.rope_delta;
@@ -1491,6 +1526,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             throw_context_length_exceeded(impl_->max_context);
         }
         result.token_ids                   = std::move(encoded.input_ids);
+        if (encoded.memory_query) {
+            result.memory_query = TokenSpan{encoded.memory_query->begin, encoded.memory_query->count};
+        }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
@@ -1512,6 +1550,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // request builds on, so it publishes no prefix of its own; a prefill graft is replayed, and its
     // end is published as a shared prefix.
     const bool is_direct_graft = graft && graft->kind != GraftKind::PrefillKV;
+    if (options.continuation == PromptContinuationMode::NewAssistantTurn && !message_boundaries.empty())
+        result.memory_input_end = message_boundaries.back().value_or(0);
+    for(std::size_t i=0;i+1<message_boundaries.size();++i) {
+        if((message_boundaries[i] || i==0) && message_boundaries[i+1]) {
+            const auto begin=message_boundaries[i].value_or(0),end=*message_boundaries[i+1];
+            if(begin<end && end<=result.token_ids.size()) result.memory_messages.push_back({begin,end-begin});
+        }
+    }
     if (impl_->ngram_archive_enabled && options.speculative_drafting) {
         const std::span<const TokenId> tokens(result.token_ids);
         auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
@@ -1653,6 +1699,11 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
+    const auto memory_open=impl_->tokenizer->encode("<think>");
+    const auto memory_close=impl_->tokenizer->encode("</think>");
+    if(memory_open.size()==1) result.memory_think_open=memory_open[0];
+    if(memory_close.size()==1) result.memory_think_close=memory_close[0];
+    result.memory_query = TokenSpan{0, result.token_ids.size()};
     if (impl_->ngram_sources_enabled && speculative_drafting) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);
@@ -1714,7 +1765,9 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
                                             const ThinkingControlOptions& thinking,
-                                            const StructuredOutputOptions& structured) const {
+                                            const StructuredOutputOptions& structured,
+                                            const ToolChoice& tool_choice) const {
+    if (impl_->deepseek) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     std::shared_ptr<text::GrammarState> grammar;
@@ -1771,6 +1824,80 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output,
                          std::move(grammar), impl_->gemma, impl_->flint, impl_->deepseek);
+    }
+
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
+    std::shared_ptr<text::GrammarState> grammar;
+    text::validate_structured_output(structured);
+    const auto& tools       = prompt.data_->tool_call_output;
+    const bool strict_tools = tools && fi::has_strict_tools(*tools);
+    if (strict_tools && (impl_->gemma || impl_->flint)) {
+        throw std::invalid_argument("strict tool arguments need Qwen's or DeepSeek's tool-call "
+                                    "syntax, which " +
+                                    std::string(impl_->gemma ? "Gemma 4" : "Flint") +
+                                    " does not use");
+    }
+    if (structured.kind != StructuredOutputKind::None && tools && impl_->flint) {
+        throw std::invalid_argument("structured output beside tool calls needs Qwen's or "
+                                    "DeepSeek's tool-call syntax, which Flint does not use");
+    }
+    auto contract = (impl_->gemma || impl_->flint) ? prompt.data_->tool_call_output
+        : fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
+    const bool tools_constrained = contract && contract->constrained;
+    if (tools_constrained && !prompt.data_->assistant_continuation.empty()) {
+        auto continuation_contract = std::make_shared<fi::ToolCallOutputContract>(*contract);
+        continuation_contract->continuation = prompt.data_->assistant_continuation;
+        contract = std::move(continuation_contract);
+    }
+    if (tools_constrained || structured.kind != StructuredOutputKind::None) {
+        if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
+            !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
+            caller_stop.publish_stop_token) {
+            if (tools_constrained)
+                throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                    "tool constraints require default EOS stops and decoded text output");
+            throw std::invalid_argument("structured output requires default stops and decoded text output");
+        }
+        text::StructuredOutputEnvelope envelope;
+        if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
+        if (!tools_constrained && contract) {
+            envelope.alternative_format =
+                impl_->deepseek ? fi::deepseek_structured_tool_call_format(*contract)
+                                : fi::structured_tool_call_format(*contract);
+        }
+        std::lock_guard lock(impl_->grammar_mutex);
+        if (!impl_->grammar_compiler) {
+            std::vector<std::string> vocab(impl_->tokenizer->vocab_size());
+            for (std::size_t id = 0; id < vocab.size(); ++id) {
+                if (impl_->tokenizer->is_valid_token(id) &&
+                    (!impl_->tokenizer->is_special_token(id) ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</think>" ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "<tool_call>" ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</tool_call>")) {
+                    vocab[id] = impl_->tokenizer->decode_token_bytes(id, false);
+                }
+            }
+            impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
+                std::move(vocab), impl_->tokenizer->default_stop_token_ids());
+        }
+        grammar = tools_constrained
+            ? impl_->grammar_compiler->compile_model(fi::tool_grammar(*contract, structured),
+                                                     structured, envelope.reasoning_close,
+                                                     prompt.data_->assistant_continuation)
+            : impl_->grammar_compiler->compile(structured, envelope);
+    }
+    std::optional<TokenId> suppressed_tool_open;
+    if (!impl_->gemma && !impl_->flint && !impl_->deepseek && !grammar && tool_choice.mode == ToolChoiceMode::None &&
+        tool_choice.constraints == ToolConstraintMode::Automatic &&
+        prompt.data_->tool_call_output && !prompt.data_->tool_call_output->tools.empty()) {
+        suppressed_tool_open = impl_->unique_tool_open_token();
+    }
+    if (output.raw) { policy.publish_stop_token = true; }
+    return OutputSession(impl_->tokenizer, std::move(policy), output,
+                         prompt.data_->starts_in_reasoning, thinking,
+                         impl_->thinking_control_tokens, std::move(contract), std::move(grammar),
+                         impl_->gemma, impl_->flint, impl_->deepseek, suppressed_tool_open);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

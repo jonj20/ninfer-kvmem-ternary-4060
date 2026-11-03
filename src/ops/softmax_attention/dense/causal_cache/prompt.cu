@@ -331,7 +331,7 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
                                                                nullptr, max_visible_keys, workspace,
                                                                out, fast, stream);
@@ -369,7 +369,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .table_stride = cache.block_tables.ne[0],
         };
         const std::int32_t* valid = metadata.valid_columns;
-        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+        with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
             causal_attention_prompt_attention_launch_for<Geometry>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
                 stream);

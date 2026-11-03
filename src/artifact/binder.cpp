@@ -207,6 +207,9 @@ void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
         throw ArtifactError(tensor.id + ": an evictable placement requires a device placement");
     }
     if (rank == 0) { throw ArtifactError(tensor.id + ": evictable rank must be nonzero"); }
+    if (!demand.device_replicas.empty()) {
+        throw ArtifactError(tensor.id + ": replicated objects cannot be evictable");
+    }
     demand.evict_rank = std::max(demand.evict_rank, rank);
 }
 
@@ -242,6 +245,19 @@ void Binder::require_mapped(ObjectHandle object) {
     auto& demand         = demands_.at(object.index);
     demand.alignment     = std::max(demand.alignment, geometry.alignment);
     demand.mapped        = true;
+}
+
+void Binder::replicate_device(ObjectHandle object, std::size_t rank) {
+    const auto& tensor = reader_.directory().tensor(object);
+    auto& demand = demands_.at(object.index);
+    if (!demand.device || demand.evict_rank || demand.pinned_order) {
+        throw ArtifactError(tensor.id + ": a replica requires a resident device placement");
+    }
+    if (rank == demand.device_rank.value_or(0)) { return; }
+    if (std::find(demand.device_replicas.begin(), demand.device_replicas.end(), rank) ==
+        demand.device_replicas.end()) {
+        demand.device_replicas.push_back(rank);
+    }
 }
 
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
@@ -333,17 +349,22 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         if (demand.device && demand.device_rank) {
             rank_count = std::max(rank_count, *demand.device_rank + 1);
         }
+        for (const auto rank : demand.device_replicas) {
+            rank_count = std::max(rank_count, rank + 1);
+        }
     }
     for (const auto& entry : selected_) { rank_count = std::max(rank_count, entry.rank + 1); }
     plan.device_capacity_by_rank.assign(rank_count, 0);
-    const auto place_device = [&](std::size_t index) {
+    const auto place_device = [&](std::size_t index, std::size_t rank) {
         const auto& demand  = demands_[index];
-        const auto rank     = demand.device_rank.value_or(0);
         const auto bytes    = device_bytes(index);
         auto& capacity      = plan.device_capacity_by_rank[rank];
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
-        plan.device_objects.push_back({ObjectHandle{index}, offset, bytes, demand.alignment,
-                                       demand.transcode, rank, demand.tail, demand.panel});
+        plan.device_objects.push_back(DevicePlacement{
+            .object = ObjectHandle{index}, .offset = offset, .bytes = bytes,
+            .alignment = demand.alignment, .transcode = demand.transcode,
+            .rank = rank, .tail = demand.tail, .panel = demand.panel,
+            .replica = rank != demand.device_rank.value_or(0)});
         capacity = checked_add(checked_add(offset, bytes, "device capacity"), demand.tail,
                                "device capacity");
     };
@@ -378,6 +399,9 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
             evictable.push_back(i);
         } else {
             resident[demand.device_rank.value_or(0)].push_back(i);
+            for (const auto rank : demand.device_replicas) {
+                if (rank != demand.device_rank.value_or(0)) { resident[rank].push_back(i); }
+            }
         }
     }
     // Selected pieces follow their rank's stored objects; on rank 0 they stay ahead of the
@@ -400,7 +424,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
                                    entry.tail, "device capacity");
         }
     };
-    for (const std::size_t index : resident[0]) { place_device(index); }
+    for (const std::size_t index : resident[0]) { place_device(index, 0); }
     place_selected(0);
     if (!evictable.empty()) {
         std::stable_sort(evictable.begin(), evictable.end(), [&](std::size_t a, std::size_t b) {
@@ -409,11 +433,11 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         plan.evictable_tail_offset = align_up(plan.device_capacity_by_rank[0], evictable_alignment,
                                               "evictable tail offset");
         plan.device_capacity_by_rank[0] = plan.evictable_tail_offset;
-        for (const std::size_t index : evictable) { place_device(index); }
+        for (const std::size_t index : evictable) { place_device(index, 0); }
         plan.evictable_tail_bytes = plan.device_capacity_by_rank[0] - plan.evictable_tail_offset;
     }
     for (std::size_t rank = 1; rank < rank_count; ++rank) {
-        for (const std::size_t index : resident[rank]) { place_device(index); }
+        for (const std::size_t index : resident[rank]) { place_device(index, rank); }
         place_selected(rank);
     }
     std::sort(pinned.begin(), pinned.end(), [&](std::size_t a, std::size_t b) {

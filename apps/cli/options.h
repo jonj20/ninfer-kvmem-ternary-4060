@@ -51,6 +51,7 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0: retain lazily loaded Qwen CPU Vision weights
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph = true;
     std::uint32_t gpu_clock_floor_mhz = 0;
@@ -66,6 +67,10 @@ struct Options {
     float rope_scaling_factor                   = 1.0F;
     std::uint32_t rope_scaling_original_context = 0;
     bool wddm_evictable_budget = false;
+    CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
+    bool use_alt_prefix_caching = false;
     bool mlp_a8_decode  = false;
     bool prefill_a8     = true;
     bool prefill_cublas = false;

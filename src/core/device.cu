@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/resident_memory.h"
 
 #include "core/peer_preflight.h"
 

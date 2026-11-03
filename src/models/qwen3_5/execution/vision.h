@@ -109,6 +109,8 @@ public:
     [[nodiscard]] bool vision_pending() const;
     [[nodiscard]] VisionOverlayWindowStats overlay_stats() const noexcept;
     void release_encoded_media_payloads() noexcept;
+    // Resident/CPU KVMem query replay retains source payloads until this rewind.
+    void rewind(std::uint32_t begin);
     void retire_handoff() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 

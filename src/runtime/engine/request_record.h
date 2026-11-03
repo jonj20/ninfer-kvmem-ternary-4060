@@ -142,11 +142,11 @@ struct RequestRecord {
     }
 
     [[nodiscard]] bool is_decode_ready() const noexcept {
-        return model_state == EngineRequestState::DecodeReady;
+        return model_state == EngineRequestState::DecodeReady && !storage_failure && !storage_cancelling;
     }
 
     [[nodiscard]] bool is_control_ready() const noexcept {
-        return model_state == EngineRequestState::ControlReady;
+        return model_state == EngineRequestState::ControlReady && !storage_failure && !storage_cancelling;
     }
 
     [[nodiscard]] bool is_model_finished() const noexcept {
@@ -187,6 +187,10 @@ struct RequestRecord {
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
+    // Engine-owned: settle at the next safe resource boundary without running
+    // another model unit or invalidating a peer's materialization transaction.
+    std::exception_ptr storage_failure;
+    bool storage_cancelling = false;
     // A Device KV lease that stayed short after retained-cache reclaim was reported once.
     bool lease_shortfall_reported         = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

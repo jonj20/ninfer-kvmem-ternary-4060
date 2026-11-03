@@ -707,6 +707,24 @@ void Bindings::evict(WeightId id, std::uint32_t rank) {
     }
 }
 
+WeightId Bindings::auxiliary_on_rank(WeightId id, std::size_t rank) {
+    if (rank == 0) { return id; }
+    const auto key = std::pair{id.index, rank};
+    if (const auto found = auxiliary_ranks_.find(key); found != auxiliary_ranks_.end()) {
+        return found->second;
+    }
+    auto copy = at(id);
+    copy.reference.name += "/rank/" + std::to_string(rank);
+    copy.reference.device_replica = rank;
+    for (const auto& part : copy.reference.binding.parts) {
+        binder.replicate_device(part.object, rank);
+    }
+    const WeightId placed{weights.size()};
+    weights.push_back(std::move(copy));
+    auxiliary_ranks_.emplace(key, placed);
+    return placed;
+}
+
 void Bindings::place(WeightId id, std::size_t rank) {
     // Rank 0 is recorded too, so an object shared between a rank-0 layer and a later stage's layer
     // is refused as a conflicting placement instead of silently living on one of them.
@@ -717,6 +735,22 @@ void Bindings::place(WeightId id, std::size_t rank) {
         }
     }
     weights.at(id.index).rank = rank;
+    // Input permutations and Hadamard signs may be shared by layers on different devices.
+    // Retarget each Use to a rank-local immutable copy, deduplicated within that rank. Keep
+    // indices across pushes: creating a copy can reallocate the pending-weight vector.
+    const auto count = parameter.uses.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto signs = weights[id.index].uses[i].hadamard_signs;
+        const auto columns = weights[id.index].uses[i].input_columns;
+        if (signs) {
+            const auto placed = auxiliary_on_rank(*signs, rank);
+            weights[id.index].uses[i].hadamard_signs = placed;
+        }
+        if (columns) {
+            const auto placed = auxiliary_on_rank(*columns, rank);
+            weights[id.index].uses[i].input_columns = placed;
+        }
+    }
 }
 
 bool Bindings::transcode(WeightId id, QType target, std::string_view option) {

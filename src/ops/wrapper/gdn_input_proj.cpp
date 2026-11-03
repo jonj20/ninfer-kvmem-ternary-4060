@@ -1470,10 +1470,15 @@ PartGdnGeometry require_part_gdn(const PartProjectionWeights& weights) {
     for (const auto& part : weights.parts) {
         if (gguf) { detail::require_gguf(part.weight, "gdn_input_proj GGUF part"); }
         if (part.weight.k != geometry.hidden || part.output < 0 || part.output > 1 ||
-            part.row != covered[part.output]) {
+            part.row != covered[part.output] || part.weight.n <= 0) {
             throw std::invalid_argument("gdn_input_proj: parts do not tile q/k/v and z");
         }
         covered[part.output] += part.weight.n;
+    }
+    const auto key = (covered[0] - covered[1]) / 2;
+    if (geometry.hidden <= 0 || key <= 0 || key % 128 || covered[1] <= 0 ||
+        covered[1] % key || 2 * key + covered[1] != covered[0] || covered[0] > INT32_MAX) {
+        throw std::invalid_argument("gdn_input_proj: invalid GGUF q/k/v/z geometry");
     }
     geometry.qkv       = static_cast<std::int32_t>(covered[0]);
     geometry.z         = static_cast<std::int32_t>(covered[1]);

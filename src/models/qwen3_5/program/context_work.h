@@ -81,6 +81,8 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
                                                                       std::uint32_t draft_window,
                                                                       std::uint32_t capacity);
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier);
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
+                                            std::uint32_t max_frontier,
+                                            std::uint32_t local_absolute_max);
 
 } // namespace ninfer::models::qwen3_5::detail

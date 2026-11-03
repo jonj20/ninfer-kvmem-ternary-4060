@@ -240,3 +240,9 @@ ninfer_add_test(ninfer_qwen3_5_structured_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_structured_round.cpp"
   LIBRARIES ninfer_model_runtime ninfer_core)
 set_tests_properties(ninfer_qwen3_5_structured_round_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Lazy CPU Vision ownership, timed idle release, failure retry, and concurrent first users.
+ninfer_add_test(ninfer_cpu_vision_cache_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cpu_vision_cache.cpp"
+  LIBRARIES ninfer_model_loading)
+ninfer_stage_runtime_dlls(ninfer_cpu_vision_cache_test)

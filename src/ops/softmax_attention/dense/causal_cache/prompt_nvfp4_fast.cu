@@ -49,7 +49,8 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
                 causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>,
                 Shape::SmemBytes);
             const dim3 grid(div_up(width, Shape::Br), q.ne[1], plan.splits);
-            kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+            causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>
+                <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 q_data, keys, values, key_scales, value_scales, metadata, pos, scale, out_data,
                 width, static_cast<float*>(partials.rows.data),
                 static_cast<float2*>(partials.stats.data));
@@ -98,7 +99,7 @@ void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& po
                                                std::uint32_t max_visible_keys,
                                                WorkspaceArena& workspace, Tensor& out,
                                                cudaStream_t stream) {
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         launch_fast_for<Geometry>(q, positions, valid_columns, table_rows, scale, cache,
                                   max_visible_keys, workspace, out, stream);
     });

@@ -88,7 +88,7 @@ struct ContentPart {
     ninfer::ImageDetail image_detail              = ninfer::ImageDetail::Auto;
     // A detail value outside auto, low and high, read as auto until settle_image_details accepts
     // or refuses it.
-    std::string unknown_image_detail;
+    std::optional<std::string> unknown_image_detail;
     std::optional<CacheBoundary> cache_boundary_after;
 };
 
@@ -116,7 +116,6 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string input_schema_json;
-    // Arguments are generated under input_schema_json (needs --structured-output).
     bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
@@ -128,13 +127,9 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-enum class ToolChoiceMode {
-    Auto,
-    None,
-};
+using ToolChoiceMode = ninfer::ToolChoiceMode;
 
-struct ToolChoice {
-    ToolChoiceMode mode = ToolChoiceMode::Auto;
+struct ToolChoice : ninfer::ToolChoice {
     // Set when the caller selected one function: `tool_choice` naming it, or a forced choice over
     // exactly one callable tool. Empty leaves the choice to the model.
     std::string forced_name;
@@ -280,9 +275,6 @@ struct GenerationRequest {
     StructuredOutputOptions structured_output;
     // The request field that asked for structured_output, named by errors about it.
     std::string structured_output_param = "response_format";
-    // Chat Completions takes a tool's strict flag as a hint where it cannot be enforced (a server
-    // without --structured-output); the other protocols refuse it there.
-    bool strict_tools_advisory = false;
     // Each generated content token's log probability, with `top_logprobs` (0 to
     // kMaximumTokenLogprobs) of its most likely alternatives in the response.
     bool logprobs    = false;

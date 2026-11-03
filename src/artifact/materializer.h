@@ -11,6 +11,7 @@
 #include "ninfer/startup.h"
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -39,6 +40,7 @@ struct DevicePlacement {
     // the artifact's objects, and the bytes are `selection` of `source`.
     std::optional<ObjectHandle> source;
     std::optional<ObjectSelection> selection;
+    bool replica = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned), or inside the mapped Host
@@ -126,6 +128,7 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle) const;
+    [[nodiscard]] const WeightParent& device_replica(ObjectHandle handle, std::size_t rank) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
@@ -170,6 +173,8 @@ private:
 
     struct ObjectStorage {
         std::optional<WeightParent> device;
+        std::size_t device_rank = 0;
+        std::map<std::size_t, WeightParent> replicas;
         std::optional<WeightParent> pinned;
         std::optional<WeightParent> mapped;
         std::optional<WeightParent> host;

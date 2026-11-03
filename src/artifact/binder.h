@@ -22,6 +22,9 @@ struct ParameterReference {
     Shape shape;
     Binding binding;
     Residency residency = Residency::Device;
+    // Explicit replica selected by a stage-local auxiliary binding; ordinary weights use their
+    // sole placement as before.
+    std::optional<std::size_t> device_replica;
 };
 
 struct HostValues {
@@ -87,6 +90,8 @@ public:
     [[nodiscard]] WeightGeometry geometry(ObjectHandle object) const;
     // A stored object's id, or a selected piece's: its source's with the selection appended.
     [[nodiscard]] std::string object_id(ObjectHandle object) const;
+    // Shared immutable auxiliaries may need a local copy on multiple pipeline devices.
+    void replicate_device(ObjectHandle object, std::size_t rank);
     // Places an object in the pinned Host block, in first-request order so a caller's logical
     // groups stay contiguous. It excludes device and Host placements of the same object.
     void require_pinned(ObjectHandle object);
@@ -111,6 +116,7 @@ private:
         std::uint32_t evict_rank = 0;
         std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
+        std::vector<std::size_t> device_replicas;
         std::optional<std::uint64_t> pinned_order;
         bool mapped = false;
         std::vector<std::byte> host_data;

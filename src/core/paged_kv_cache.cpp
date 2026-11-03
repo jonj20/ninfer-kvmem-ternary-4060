@@ -1020,6 +1020,35 @@ void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t r
 
 } // namespace
 
+DeviceKVPagePool::HostRecordCopyStats DeviceKVPagePool::host_record_copy_stats(
+    std::span<const DeviceKVPageHandle> pages, std::span<const std::byte* const> records,
+    std::span<const std::uint32_t> record_groups, const HostKVPageLayout& layout) const {
+    if (records.size() != pages.size() || layout.geometry != geometry()) {
+        throw std::invalid_argument("Paged KV copy statistics geometry or extent is inconsistent");
+    }
+    validate_record_groups(record_groups, records.size(), "Paged KV copy statistics");
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        (void)physical_index(pages[i]);
+        if (records[i] == nullptr) {
+            throw std::invalid_argument("Paged KV copy statistics record is null");
+        }
+    }
+    HostRecordCopyStats result;
+    const auto max_pitch = device_max_copy_pitch();
+    for (std::size_t begin = 0; begin < pages.size();) {
+        std::size_t pitch = 0;
+        begin = host_record_run_end(pages, records, record_groups, begin,
+                                    layout.page_stride, max_pitch, pitch);
+        ++result.runs;
+    }
+    for (std::size_t plane = 0; plane < planes_.size(); ++plane) {
+        result.payload_bytes += pages.size() * layout.planes[plane].page_payload_bytes;
+        result.copies += result.runs * (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor
+            ? 1U : static_cast<std::uint64_t>(planes_[plane].ne[3]));
+    }
+    return result;
+}
+
 void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
                                             std::span<std::byte* const> records,
                                             std::span<const std::uint32_t> record_groups,

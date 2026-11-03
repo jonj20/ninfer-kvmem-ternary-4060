@@ -46,6 +46,7 @@ struct LoadOptions {
     // embedding, proposal head and MTP layer in an evictable device tail that one encode window
     // may borrow. Resident whenever Vision is disabled.
     VisionResidency vision_residency = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0: retain lazily loaded Qwen CPU Vision weights
     // How many devices the instance spans (`--devices`). One is the single-GPU route; more split
     // the layers into that many stages, each owning its layers' weights, KV cache and recurrent
     // state. The embedding, head and round state stay on the first device.
@@ -145,6 +146,7 @@ struct LoadOptions {
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .vision_residency         = options.enable_vision ? options.vision_residency
                                                               : VisionResidency::Resident,
+            .cpu_vision_idle_seconds = options.cpu_vision_idle_seconds,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
             .stage_layers = options.stage_layers,
             .tensor_parallel = options.tensor_parallel,

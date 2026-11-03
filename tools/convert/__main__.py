@@ -40,6 +40,10 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
         if name in block_sources:
             return GGUFFile(path)
+        if name == "dflash2":
+            from .dflash2_gguf import DraftSource
+
+            return DraftSource(path)
         from .sources.gguf_source import GGUFSource
 
         return GGUFSource(path)

@@ -1,15 +1,13 @@
 #pragma once
 
-// Structured-output masks off the engine thread (the Gemma 4, Flint and Qwen3.8-Flash-Next cores)
-// and the per-request mask cost that decides whether a structured request speculates (every
-// core).
+// Structured-output masks computed off the engine thread.
 //
 // A structured request samples under its grammar's token mask. Computing a mask can cost from
 // microseconds to many milliseconds with a large vocabulary, so the cores compute it on a thread of
 // their own (a GrammarMaskJob, from a fork of the grammar) while the GPU runs, instead of holding
 // every request's round for it. A speculative round needs one mask per draft and the bonus; their
 // columns fill in parallel (GrammarState::fill_masks) while the verification runs, which hides a few
-// milliseconds per column. A request whose masks cost more decodes without drafts.
+// milliseconds per column. The adapted Qwen cores do not gate drafting on mask duration.
 
 #include "ninfer/base.h"
 #include "text/structured_output.h"
@@ -28,21 +26,18 @@
 
 namespace ninfer::runtime {
 
-// The mask time above which a structured request decodes without drafts: about what a
-// verification hides on the GPU.
-inline constexpr double kSpeculativeMaskSeconds = 0.004;
 // One mask over this budget fails its request: the grammar is too costly to serve.
 inline constexpr double kGrammarMaskBudgetSeconds = 5.0;
 
-// A structured request's recent mask time: how long its next token's mask, or a speculative round's
-// columns filled in parallel, took to compute.
+// Retained for the upstream Flint core, which is outside the Qwen integration scope.
+// The adapted Qwen cores do not use this cost-based draft gate.
+inline constexpr double kSpeculativeMaskSeconds = 0.004;
 class GrammarMaskCost final {
 public:
     void observe(double seconds) noexcept {
         seconds_ = seen_ ? seconds_ + kAlpha * (seconds - seconds_) : seconds;
         seen_    = true;
     }
-    // Speculate until masks have shown themselves costly.
     [[nodiscard]] bool speculates() const noexcept {
         return !seen_ || seconds_ <= kSpeculativeMaskSeconds;
     }

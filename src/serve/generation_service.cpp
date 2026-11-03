@@ -57,6 +57,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        error.status = 400;
+        error.param = "tools";
+        error.code = "invalid_tool_constraint";
+        break;
     case ninfer::RequestErrorKind::InvalidMedia:
         error.status = 400;
         error.code   = "invalid_media";
@@ -233,17 +238,26 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
+    explicit ServiceOutputSink(const StreamSink& sink, const PreparedRequest& prepared)
+        : sink_(&sink), monitor_(prepared.monitor_update), prompt_(prepared.prompt_tokens) {}
 
     void start(ninfer::GenerationStart start) override {
+        prompt_ = start.prompt.prompt_tokens;
+        cached_ = start.reused_prompt_tokens;
+        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", prompt_}, {"cached_tokens", cached_}});
         if (sink_->on_start) { sink_->on_start(start); }
     }
 
     void progress(ninfer::PromptProgress progress) override {
+        cached_ = progress.reused_prompt_tokens;
+        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", progress.total_prompt_tokens}, {"cached_tokens", cached_}});
         if (sink_->on_progress) { sink_->on_progress(progress); }
     }
 
     void timing(ninfer::GenerationTimingObservation timing) override {
+        if (monitor_) monitor_({{"status", "generating"}, {"generated_tokens", timing.generated_tokens},
+            {"decode_tps", timing.generation_elapsed_ns ? nlohmann::json(1e9 * timing.generated_tokens / timing.generation_elapsed_ns) : nlohmann::json(nullptr)},
+            {"prefill_tps", timing.prompt_elapsed_ns ? nlohmann::json(1e9 * (prompt_ - cached_) / timing.prompt_elapsed_ns) : nlohmann::json(nullptr)}});
         if (sink_->on_timing) { sink_->on_timing(timing); }
     }
 
@@ -258,6 +272,8 @@ public:
 
 private:
     const StreamSink* sink_ = nullptr;
+    std::function<void(const nlohmann::json&)> monitor_;
+    int prompt_ = 0, cached_ = 0;
 };
 
 } // namespace
@@ -269,6 +285,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
+    engine_options.kvmem                    = options.kvmem;
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
@@ -279,6 +296,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     engine_options.vision_residency         = options.vision_residency;
+    engine_options.cpu_vision_idle_seconds   = options.cpu_vision_idle_seconds;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
     engine_options.gpu_clock_floor_mhz      = options.gpu_clock_floor_mhz;
@@ -300,6 +318,9 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.cuda_graph_allowance_bytes =
         static_cast<std::size_t>(options.cuda_graph_allowance_mib) << 20;
     engine_options.wddm_evictable_budget    = options.wddm_evictable_budget;
+    engine_options.cuda_memory_policy = options.cuda_memory_policy;
+    engine_options.cuda_vram_reserve_bytes = options.cuda_vram_reserve_bytes;
+    engine_options.cuda_memory_probe_step_bytes = options.cuda_memory_probe_step_bytes;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
@@ -429,6 +450,10 @@ StagedRequest GenerationService::stage(const GenerationRequest& request,
                                        ninfer::GenerationObservationOptions observation,
                                        std::function<bool()> is_cancelled,
                                        ContextCacheHints context_cache) const {
+    if (consumer_mode == GenerationConsumerMode::Streaming) {
+        observation.live_timings = true;
+        observation.prompt_progress = true;
+    }
     return stage_impl(
         request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
@@ -772,7 +797,7 @@ std::string GenerationService::render_prompt(const GenerationRequest& request,
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
-    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
+    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared); }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {

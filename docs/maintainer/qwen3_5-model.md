@@ -329,7 +329,7 @@ stored rotated is converted back to the primal basis by the converter.
 
 ## GGUF block checkpoints
 
-An artifact converted with `qwen3_8_27b_gguf` stores its text projections, token table, output head
+An artifact converted with `qwen3_5_dense_gguf` stores its text projections, token table, output head
 and MTP head in `gguf_*` formats, one ggml type per tensor, so the parts of a fused projection can
 differ in type. The execution layer keeps each GGUF part as its own weight
 (`ops::GgufProjectionWeights`): the GDN input projection lands q/k/v (output 0) and z (output 1)

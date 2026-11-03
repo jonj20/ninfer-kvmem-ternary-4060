@@ -49,6 +49,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     PrefillProgress out;
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
+    out.waiting_for_storage = requests[lane].prefill && requests[lane].prefill->waiting_for_storage;
     out.complete                = step.complete;
     out.timing                  = step.timing;
     if (step.complete) {
@@ -276,6 +277,12 @@ void ProgramImpl::commit_generated_prefix_identity(
                                               prefix_execution_split_after);
     sequence.prefix_digests.append_generated(accepted_tokens, sequence.rope_delta,
                                              prefix_execution_split_after);
+    if (kvmem_window_tokens && prefix_execution_split_after) {
+        const auto frontier = base_ledger_frontier + *prefix_execution_split_after;
+        if (!sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::Reconstruction).data ||
+            sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::Reconstruction).data->prefix.size() != frontier)
+            sequence.window.reconstruction_frontier = frontier;
+    }
     if (sequence.prefix_identity.size() != sequence.ledger.size() ||
         sequence.prefix_digests.size() != sequence.ledger.size()) {
         throw std::logic_error("committed generated-prefix identity changed the ledger shape");
@@ -377,13 +384,17 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 timing.resume_submit();
             }
 
-            ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
+            if (!kvmem_window_tokens) ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
             // Forced tokens run through Prefill, which reads the shared step table-row scalars.
             bind_sequence_kv(sequence);
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
                 throw std::logic_error("forced-token continuation ledger has an invalid shape");
+            }
+            if (kvmem_window_tokens) {
+                commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
+                                                 prefix_execution_splits[row]);
             }
 
             if (is_masked_draft_backend(speculative_backend)) {
@@ -395,7 +406,12 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
 
             std::uint32_t cursor = base;
             while (cursor < end) {
-                const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
+                std::uint32_t count = std::min(prefill_chunk, end - cursor);
+                const auto reconstruction = sequence.window.reconstruction_frontier;
+                if (kvmem_window_tokens && reconstruction > cursor && reconstruction < cursor + count)
+                    count = reconstruction - cursor;
+                if (kvmem_window_tokens) prepare_window(sequence,cursor,cursor+count,false,false,
+                    kvmem::SelectionReason::DecodePressure);
                 const StateImageSelectors selectors = state_selectors(sequence);
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(0),
@@ -414,6 +430,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     0,
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0};
+                schedule_state.cache_position_shift = sequence.window.removed_tokens;
+                schedule_state.execution.memory_statistics = memory_statistics ? &*memory_statistics : nullptr;
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
@@ -426,6 +444,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
                 }
+                commit_memory_statistics(sequence, cursor, cursor + result.processed_tokens);
                 cursor += result.processed_tokens;
                 sequence.text_kv_valid = cursor;
                 if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -438,6 +457,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 copy_tail(sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+                if (kvmem_window_tokens && request.allow_memory_reuse && reconstruction == cursor) {
+                    capture_memory_rewrite(sequence, KvmemCheckpointKind::Reconstruction);
+                }
             }
             timing.begin_wait();
             device.synchronize();
@@ -452,6 +474,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             sequence.mtp_draft_count    = 0;
             sequence.mtp_drafts_pending = false;
             sequence.tail_hidden_valid  = true;
+            capture_memory_reconstruction_if_ready(sequence);
             if (sequence.ledger.size() != sequence.ledger_frontier ||
                 sequence.prefix_identity.size() != sequence.ledger_frontier ||
                 sequence.prefix_digests.size() != sequence.ledger_frontier ||
@@ -656,6 +679,8 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         return out;
     }
     if (!request.publish_continuation) {
+        capture_memory_endpoint(state, request);
+        retain_memory_history(state, request);
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
         out.timings     = request.timings;
@@ -992,6 +1017,7 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
+    retain_memory_history(state, request);
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

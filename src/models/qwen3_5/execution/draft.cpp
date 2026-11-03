@@ -277,7 +277,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         const cudaStream_t stream      = state.execution.device.stream;
         const DraftParameters& weights = *state.execution.parameters.draft;
         Tensor anchors                 = frame.anchors.slice(0, 0, batch);
-        Tensor frontiers               = frame.execution_frontiers.slice(0, 0, batch);
+        Tensor frontiers               = frame.draft_frontiers.slice(0, 0, batch);
         Tensor valid_columns           = frame.proposal_valid_columns.slice(0, 0, batch);
         Tensor state_slots             = frame.state_destination_slots.slice(0, 0, batch);
         Tensor ids                     = frame.proposal_ids.slice(1, 0, batch);
@@ -320,6 +320,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                                   dimension(config.attention.num_attention_heads), width, batch});
                 ops::sliding_window_attention(
                     query, key, value, positions, valid_columns, state_slots,
+                    frame.draft_floors.slice(0, 0, batch),
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads),
                      dimension(config.attention.num_key_value_heads)},
@@ -477,7 +478,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
                     ops::sliding_window_attention(
                         query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations,
+                        state_destinations, Tensor{},
                         {dimension(config.attention.head_dim),
                          dimension(config.attention.num_attention_heads),
                          dimension(config.attention.num_key_value_heads)},
@@ -588,6 +589,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
         Tensor context_starts     = frame.context_frontiers.slice(0, 0, batch_size);
+        Tensor draft_frontiers    = frame.draft_frontiers.slice(0, 0, batch_size);
         Tensor extents            = frame.proposal_extents.slice(0, 0, batch_size);
         Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
         Tensor target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
@@ -614,7 +616,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             DType::BF16, {dimension(state.execution.parameters.draft->feature_projection.weight.k),
                           frame.append_positions.ne[0], batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
-                                   context_starts, frontiers, compact_features, append_positions,
+                                   context_starts, draft_frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows,
@@ -701,7 +703,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                    : Tensor{},
                     .proposal_q =
                         frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
-                    .frontiers       = frontiers,
+                    // Sampling keys remain logical when KVMem compacts target KV positions.
+                    .frontiers = state.execution.parameters.model.config().draft->dflash2
+                                     ? draft_frontiers : frontiers,
                     .anchors         = anchors,
                     .licensed_tokens = licensed_tokens,
                     .licensed_counts = licensed_counts,

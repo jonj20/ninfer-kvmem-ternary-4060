@@ -2,10 +2,13 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,13 +28,45 @@ ServeOptions parse(std::vector<std::string> arguments) {
     std::vector<char*> argv;
     argv.reserve(arguments.size());
     for (std::string& argument : arguments) { argv.push_back(argument.data()); }
-    return parse_serve_options(static_cast<int>(argv.size()), argv.data());
+    try { return parse_serve_options(static_cast<int>(argv.size()), argv.data()); }
+    catch (const std::invalid_argument& error) {
+        std::string context = error.what();
+        for (const auto& argument : arguments) context += " [" + argument + "]";
+        throw std::invalid_argument(context);
+    }
 }
 
 } // namespace
 
-int main() {
+int run_serve_option_tests() {
     int failures = 0;
+    const auto query_defaults=parse({"ninfer-serve","model.ninfer"});
+    failures+=check(query_defaults.kvmem.query_max_tokens==512 &&
+                    query_defaults.kvmem.query_replay_max_tokens==2048,"Query/replay defaults differ");
+    const auto query_limits=parse({"ninfer-serve","model.ninfer","--kvmem-query-max-tokens","32",
+        "--kvmem-query-replay-max-tokens","8"});
+    failures+=check(query_limits.kvmem.query_max_tokens==32 && query_limits.kvmem.query_replay_max_tokens==8,
+        "independent Query/replay limits lost");
+    for(const auto* limit:{"0","-1","1x","2147483648"}) {
+        bool rejected=false;
+        try { (void)parse({"ninfer-serve","model.ninfer","--kvmem-query-replay-max-tokens",limit}); }
+        catch(const std::invalid_argument&) {rejected=true;}
+        failures+=check(rejected,"invalid replay limit accepted");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-cpu"}).cpu_vision_idle_seconds == 300,
+                      "CPU Vision default idle timeout is not five minutes");
+    for (const char* seconds : {"0", "2", "900", "4294967295"}) {
+        const auto parsed = parse({"ninfer-serve", "model.ninfer", "--vision-cpu", "--cpu-vision-idle-seconds", seconds});
+        failures += check(make_engine_options(parsed).cpu_vision_idle_seconds == std::stoul(seconds),
+                          "CPU Vision idle timeout was not passed to the Engine");
+    }
+    for (const char* seconds : {"-1", "abc", "1.5", "4294967296", "18446744073709551616"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--vision-cpu", "--cpu-vision-idle-seconds", seconds}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid CPU Vision idle timeout was accepted");
+    }
+
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
                       "draft confidence must be opt-in");
     for (const auto* floor : {"0", "0.3", "1"}) {
@@ -112,6 +147,559 @@ int main() {
                              "--expert-dma-share", "auto", "--expert-dma-share", "0.5",
                              "--expert-dma-share", "auto"}).hybrid_experts.dma_share.has_value() == false,
                       "server did not preserve an automatic hybrid DMA share");
+    {
+        const auto off = parse({"ninfer-serve", "model.ninfer", "--no-kvmem",
+                                "--no-kvmem-lrfu", "--kvmem-disk-mib", "0"});
+        failures += check(!off.kvmem.selected_tokens && off.context_cache.enabled,
+                          "disabled KVMem changed native cache defaults");
+        const auto on = parse({"ninfer-serve", "model.ninfer", "--kvmem", "--max-context", "65536",
+                               "--kvmem-lrfu", "--no-kvmem-lrfu", "--kvmem-disk-mib", "0"});
+        failures += check(on.kvmem.selected_tokens == 32768 && on.kvmem.reserve_tokens == 1024 &&
+                          on.kvmem.host_bytes == (16384ULL << 20) && on.kvmem.retained_sessions == 4 &&
+                          !on.kvmem.lrfu && !on.kvmem.disk_bytes,
+                          "shared KVMem defaults or explicit off switches were lost");
+        for (const auto& args : std::vector<std::vector<std::string>>{
+                {"--no-kvmem", "--kvmem-budget", "128"}, {"--kvmem-budget", "0"},
+                {"--kvmem", "--kvmem-gen-reserve", "0"}, {"--kvmem", "--kvmem-sessions", "0"}}) {
+            std::vector<std::string> command{"ninfer-serve", "model.ninfer"};
+            command.insert(command.end(), args.begin(), args.end());
+            bool rejected = false;
+            try { (void)parse(command); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "invalid shared KVMem configuration accepted");
+        }
+    }
+    for (const std::vector<std::string> feature : {
+            std::vector<std::string>{"--model-suspend"},
+            std::vector<std::string>{"--graft", "g=graft.bin"},
+            std::vector<std::string>{"--expert-residency", "host"},
+            std::vector<std::string>{"--expert-residency", "disk", "--expert-cache-mib", "128"},
+            std::vector<std::string>{"--models-dir", "models"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer",
+            "--kvmem-budget", "128", "--kvmem-gen-reserve", "128",
+            "--kvmem-host-mib", "64", "--prefill-chunk", "128"};
+        args.insert(args.end(), feature.begin(), feature.end());
+        bool rejected = false;
+        try { (void)parse(std::move(args)); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("KVMem does not support") != std::string::npos;
+        }
+        failures += check(rejected, "KVMem accepted an unadapted upstream state/serving mode");
+    }
+    const std::vector<std::string> memory_args = {"ninfer-serve", "model.ninfer",
+        "--max-context", "262144", "--prefill-chunk", "128", "--kv-dtype", "int8",
+        "--kvmem-budget", "384", "--kvmem-gen-reserve", "128", "--kvmem-host-mib", "16384"};
+    const auto kvmem = parse(memory_args);
+    const auto kvmem_engine = make_engine_options(kvmem);
+    for (const auto& scorer : {std::string("page-softmax"), std::string("meanq-cosine")}) {
+        for (const auto& aggregation : {std::string("mean"), std::string("max")}) {
+            auto args = memory_args;
+            args.insert(args.end(), {"--kvmem-query-scorer",scorer,"--kvmem-score-agg",aggregation});
+            const auto chosen = make_engine_options(parse(args)).kvmem;
+            const bool cosine = scorer == "meanq-cosine";
+            failures += check(chosen.query_meanq_cosine == cosine && chosen.lrfu == cosine &&
+                chosen.score_agg_max == (aggregation == "max") && chosen.graph_alpha == (cosine ? 0.0 : 0.2),
+                "Query scorer options were not mapped to Engine");
+            args.push_back("--no-kvmem-lrfu");
+            failures += check(!make_engine_options(parse(args)).kvmem.lrfu,"explicit history disable was lost");
+            for (const bool history : {false,true}) for (const auto* alpha : {"0","0.2","1"}) {
+                auto combined = memory_args;
+                combined.insert(combined.end(), {"--kvmem-query-scorer",scorer,"--kvmem-score-agg",aggregation,
+                    "--kvmem-graph-alpha",alpha,history ? "--kvmem-lrfu" : "--no-kvmem-lrfu"});
+                const auto options = make_engine_options(parse(combined)).kvmem;
+                failures += check(options.query_meanq_cosine == cosine && options.lrfu == history &&
+                    options.graph_alpha == std::stod(alpha) && options.score_agg_max == (aggregation == "max"),
+                    "orthogonal Query options were coupled in Engine mapping");
+            }
+        }
+    }
+    {
+        auto args=memory_args; args.insert(args.end(),{"--kvmem-graph-alpha","0"});
+        failures += check(make_engine_options(parse(args)).kvmem.graph_alpha==0,"graph bypass was not mapped");
+    }
+    for (const auto* lanes : {"1", "2"}) {
+        const auto capacity = 512U * static_cast<unsigned>(std::stoul(lanes));
+        auto args = memory_args;
+        args.insert(args.end(), {"--max-concurrency", lanes, "--kv-capacity", std::to_string(capacity)});
+        failures += check(make_engine_options(parse(args)).kv_capacity.explicit_tokens == capacity,
+            "KVMem explicit physical capacity was subject to native logical-context capacity");
+        args.back() = std::to_string(capacity + 64);
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "KVMem accepted a physical capacity different from C*(B+R)");
+    }
+    for (const auto* residency : {"resident", "cpu"}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--devices", "1,0", "--stage-layers", "40,24", "--vision",
+            "--vision-residency", residency, "--spec", "mtp", "--draft-tokens", "3",
+            "--max-concurrency", "2"});
+        const auto pipeline = make_engine_options(parse(args));
+        failures += check(pipeline.devices == std::vector<int>{1, 0} &&
+            pipeline.stage_layers == std::vector<std::uint32_t>{40, 24} &&
+            pipeline.kv_capacity.explicit_tokens == 1024 &&
+            pipeline.kvmem.host_bytes == kvmem_engine.kvmem.host_bytes && pipeline.enable_vision,
+            "KVMem pipeline changed rank order, shared history budget or per-lane windows");
+    }
+    failures += check(kvmem.allow_prefix_reuse && !kvmem_engine.context_cache.enabled &&
+        kvmem_engine.kvmem.selected_tokens == 384 && kvmem_engine.kvmem.reserve_tokens == 128 &&
+        kvmem_engine.kvmem.host_bytes == (16ULL << 30) &&
+        kvmem_engine.kvmem.sink_tokens == 0 && kvmem_engine.kvmem.recent_tokens == 64 &&
+        kvmem_engine.kvmem.sink_blocks() == 1 && kvmem_engine.kvmem.recent_blocks() == 1 &&
+        kvmem_engine.kv_capacity.explicit_tokens == 512,
+        "KVMem budgets or independent history reuse were not mapped to Engine");
+    {
+        auto args = memory_args;
+        // 1024 recent tokens are 16 pages, so this case needs a larger B than the 384 default.
+        std::replace(args.begin(), args.end(), std::string("384"), std::string("2048"));
+        args.insert(args.end(), {"--kvmem-sink-tokens", "100", "--kvmem-recent-tokens", "1024"});
+        const auto kept = make_engine_options(parse(args)).kvmem;
+        failures += check(kept.sink_tokens == 100 && kept.sink_blocks() == 1 &&
+            kept.recent_tokens == 1024 && kept.recent_blocks() == 16,
+            "KVMem sink/recent did not round down to 64-token pages");
+    }
+    {
+        auto args = memory_args;
+        args.insert(args.end(), {"--kvmem-sink-tokens", "128", "--kvmem-recent-tokens", "127"});
+        const auto kept = make_engine_options(parse(args)).kvmem;
+        failures += check(kept.sink_blocks() == 2 && kept.recent_blocks() == 1,
+            "KVMem did not keep a two-page sink and one recent page after rounding");
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--kvmem-sink-tokens", "256", "--kvmem-recent-tokens", "192"},
+             {"--kvmem-recent-tokens", "4096"},
+             {"--kvmem-recent-tokens", "0"}, {"--kvmem-recent-tokens", "1"},
+             {"--kvmem-recent-tokens", "63"},
+             {"--kvmem-sink-tokens", "-1"}, {"--kvmem-recent-tokens", "1.5"}}) {
+        auto args = memory_args; args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid KVMem sink/recent configuration accepted");
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--kvmem-sink-tokens", "0"}, {"--kvmem-recent-tokens", "0"}}) {
+        auto args = std::vector<std::string>{"ninfer-serve", "model.ninfer"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "KVMem sink/recent was accepted without a budget");
+    }
+    failures += check(kvmem_engine.kvmem.disk_path.empty() && kvmem_engine.kvmem.disk_bytes == 0,
+                      "KVMem defaults unexpectedly enabled SSD storage");
+    for (const bool mtp_enabled : {false, true}) {
+        for (const bool image_enabled : {false, true}) {
+            for (const auto* lanes : {"1", "8"}) {
+                for (const auto* lookup : {"1", "4", "64"}) {
+                    for (const bool lookup_first : {false, true}) {
+                        auto args = memory_args;
+                        const std::vector<std::string> legacy_args = {"--lookup-ngram", lookup};
+                        args.insert(lookup_first ? args.begin() + 2 : args.end(), legacy_args.begin(), legacy_args.end());
+                        args.insert(args.end(), {"--max-concurrency", lanes});
+                        if (mtp_enabled) args.insert(args.end(), {"--spec", "mtp", "--draft-tokens", "3",
+                            "--ngram-draft-tokens", "15"});
+                        if (image_enabled) args.insert(args.end(), {"--vision", "--vision-residency", "cpu"});
+                        bool disabled = false;
+                        try { (void)parse(args); }
+                        catch (const std::invalid_argument& error) {
+                            const std::string message = error.what();
+                            disabled = message.find("disables legacy --lookup-ngram") != std::string::npos &&
+                                message.find("--ngram-draft-tokens") != std::string::npos;
+                        }
+                        failures += check(disabled, "serve allowed disabled legacy lookup drafting");
+                    }
+                }
+            }
+        }
+    }
+    for (const bool memory_enabled : {false, true}) {
+        for (const auto& extra : std::vector<std::vector<std::string>>{
+                 {"--kvmem-disk-path", "cache"}, {"--kvmem-disk-path", ""},
+                 {"--kvmem-disk-mib", "1024"},
+                 {"--kvmem-disk-path", "cache", "--kvmem-disk-mib", "18446744073709551615"}}) {
+            auto args = memory_enabled ? memory_args : std::vector<std::string>{"ninfer-serve", "model.ninfer"};
+            args.insert(args.end(), extra.begin(), extra.end());
+            bool rejected = false;
+            try { (void)parse(args); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "serve allowed incomplete/invalid KVMem SSD configuration");
+        }
+    }
+    for (const bool memory_enabled : {false, true}) {
+        auto args = memory_enabled ? memory_args : std::vector<std::string>{"ninfer-serve", "model.ninfer"};
+        args.insert(args.end(), {"--kvmem-disk-path", "cache", "--kvmem-disk-mib", "1024", "--device-profile", "off"});
+        bool rejected = false;
+        try {
+            const auto parsed = parse(args);
+            failures += check(parsed.kvmem.disk_path == "cache" && parsed.kvmem.disk_bytes == (1ULL << 30),
+                              "serve lost KVMem SSD capacity/path");
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected != memory_enabled, "KVMem SSD enablement validation mismatch");
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--kv-capacity", "1024"}, {"--max-concurrency", "9"},
+             {"--kvmem-budget", "385"}, {"--kvmem-host-mib", "0"},
+             {"--prefill-chunk", "256"}, {"--kvmem-host-mib", "18446744073709551615"}}) {
+        auto args = memory_args; args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid KVMem configuration accepted");
+    }
+    {
+        auto args = memory_args; args.push_back("--no-prefix-reuse");
+        failures += check(!parse(args).allow_prefix_reuse, "KVMem ignored explicit reuse disable");
+    }
+    {
+        auto args = memory_args; args.push_back("--derive-session-keys");
+        const auto options = parse(args);
+        failures += check(options.derive_session_keys && !make_engine_options(options).context_cache.enabled,
+                          "KVMem session-key derivation incorrectly selected the native cache");
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--host-kv-mib", "32", "--derive-session-keys"},
+             {"--derive-session-keys", "--host-kv-mib", "32"},
+             {"--derive-session-keys", "--no-prefix-reuse"}}) {
+        auto args = memory_args; args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "session-key derivation hid an incompatible KVMem cache option");
+    }
+    for (const auto drafts : {1U, 4U, 5U, 15U}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--spec", "mtp", "--draft-tokens", std::to_string(drafts)});
+        const auto parsed = make_engine_options(parse(args));
+        failures += check(parsed.speculative.draft_tokens == drafts &&
+            parsed.speculative.mtp_policy == ninfer::MtpDraftPolicy::Fixed,
+            "KVMem fixed MTP draft count was not preserved");
+    }
+    for (const auto lanes : {1U, 2U, 4U, 5U, 8U}) {
+        for (const auto drafts : {1U, 3U, 15U}) {
+            for (const auto copies : {0U, 31U}) {
+                auto args = memory_args;
+                args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", std::to_string(drafts),
+                                         "--ngram-draft-tokens", std::to_string(copies), "--vision",
+                                         "--max-concurrency", std::to_string(lanes)});
+                const auto parsed = make_engine_options(parse(args));
+                failures += check(parsed.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                    parsed.speculative.draft_tokens == drafts &&
+                    parsed.speculative.ngram_draft_tokens == (lanes > 1 && copies > 15 ? 15 : copies) &&
+                    parsed.kvmem.device_tokens() == 512 && parsed.kv_capacity.explicit_tokens == lanes * 512 && parsed.enable_vision,
+                    "KVMem DFlash2 lost its draft, vision, or memory configuration");
+            }
+        }
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--max-concurrency", "9"}, {"--devices", "0,1"},
+             {"--draft-tokens", "0"}, {"--draft-tokens", "16"}}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
+        args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unsupported KVMem DFlash2 configuration accepted");
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "0"},
+             {"--spec", "mtp", "--draft-tokens", "16"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--adaptive-mtp", "--max-concurrency", "2", "--ngram-draft-tokens", "64"}}) {
+        auto args = memory_args; args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unsupported KVMem MTP policy accepted");
+    }
+    for (const auto concurrency : {2U, 4U, 5U, 8U}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--max-concurrency", std::to_string(concurrency),
+                                "--spec", "mtp", "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
+        const auto parsed = make_engine_options(parse(args));
+        failures += check(parsed.max_concurrency == concurrency &&
+            parsed.kv_capacity.explicit_tokens == concurrency * 512 &&
+            parsed.kvmem.device_tokens() == 512 && parsed.speculative.draft_tokens == 3,
+            "KVMem concurrent MTP did not reserve one B+R window per active request");
+    }
+    for (const auto* format : {"bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"}) {
+        for (const auto* residency : {"resident", "cpu"}) {
+            for (unsigned lanes = 1; lanes <= 8; ++lanes) {
+                for (const auto drafts : {0U, 3U, 15U}) {
+                    auto args = memory_args;
+                    args.insert(args.end(), {"--kv-dtype", format, "--vision", "--vision-residency", residency,
+                        "--vision-max-merged", "1024", "--max-concurrency", std::to_string(lanes),
+                        "--ngram-draft-tokens", "0", "--derive-session-keys"});
+                    if (drafts) args.insert(args.end(), {"--spec", "mtp", "--draft-tokens",
+                        std::to_string(drafts), "--adaptive-mtp"});
+                    const auto serving = parse(args);
+                    const auto options = make_engine_options(serving);
+                    failures += check(serving.derive_session_keys && options.enable_vision && options.max_concurrency == lanes &&
+                        options.kv_capacity.explicit_tokens == lanes * 512 &&
+                        options.vision_max_merged_tokens == 1024 && options.speculative.ngram_draft_tokens == 0,
+                        "Concurrent Vision changed per-lane budget or explicit preprocessing limit");
+                }
+            }
+        }
+    }
+    {
+        auto args = memory_args;
+        args.insert(args.end(), {"--spec", "mtp", "--draft-tokens", "3", "--ngram-draft-tokens", "31"});
+        const auto parsed = make_engine_options(parse(args));
+        failures += check(parsed.speculative.ngram_draft_tokens == 31,
+                          "KVMem ngram width was silently disabled");
+        for (const auto& extra : std::vector<std::vector<std::string>>{
+                 {"--ngram-draft-tokens", "64"}, {"--max-concurrency", "2", "--ngram-draft-tokens", "64"}}) {
+            auto bad = args; bad.insert(bad.end(), extra.begin(), extra.end());
+            bool rejected = false;
+            try { (void)parse(bad); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "unsupported KVMem ngram combination accepted");
+        }
+    }
+    for (const auto* format : {"bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--kv-dtype", format, "--spec", "mtp", "--draft-tokens", "15",
+                                 "--adaptive-mtp", "--ngram-draft-tokens", "0"});
+        failures += check(make_engine_options(parse(args)).speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
+                          "KVMem adaptive MTP was not preserved");
+        auto lanes = args;
+        lanes.insert(lanes.end(), {"--max-concurrency", "4"});
+        failures += check(make_engine_options(parse(lanes)).max_concurrency == 4,
+                          "adaptive MTP concurrency was not preserved");
+        auto copy = args;
+        copy.insert(copy.end(), {"--ngram-draft-tokens", "31"});
+        failures += check(make_engine_options(parse(copy)).speculative.ngram_draft_tokens == 31,
+                          "adaptive MTP copy drafting was not preserved");
+        args = memory_args;
+        args.insert(args.end(), {"--kv-dtype", format, "--vision-cpu", "--spec", "mtp",
+                                 "--draft-tokens", "15", "--ngram-draft-tokens", "0", "--adaptive-mtp"});
+        failures += check(make_engine_options(parse(args)).vision_residency == ninfer::VisionResidency::Cpu,
+                          "KVMem CPU Vision was not preserved");
+    }
+    for (const auto* format : {"int8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"}) {
+        for (unsigned lanes = 1; lanes <= 8; ++lanes) {
+            for (const auto* media : {"text", "resident", "cpu"}) {
+                auto args = memory_args;
+                args.insert(args.end(), {"--kv-dtype", format, "--max-concurrency", std::to_string(lanes),
+                    "--fast-prefill-kernel", "--spec", "mtp", "--draft-tokens", "3",
+                    "--adaptive-mtp", "--ngram-draft-tokens", "31"});
+                if (std::string(media) != "text")
+                    args.insert(args.end(), {"--vision", "--vision-residency", media});
+                const auto accepted = make_engine_options(parse(args));
+                failures += check(accepted.fast_prefill_kernel && accepted.max_concurrency == lanes &&
+                    accepted.kv_capacity.explicit_tokens == 512 * lanes &&
+                    accepted.enable_vision == (std::string(media) != "text") &&
+                    accepted.speculative.ngram_draft_tokens == (lanes > 1 ? 15U : 31U),
+                    "KVMem fast prefill text/image/ngram settings were not preserved");
+            }
+        }
+    }
+    for (const auto* format : {"bf16", "fp8", "nvfp4", "k8v4"}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--kv-dtype", format, "--fast-prefill-kernel", "--vision"});
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "KVMem accepted fast prefill for a KV without a fast kernel");
+    }
+    for (const auto* format : {"bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"}) {
+        for (const auto* residency : {"resident", "cpu"}) {
+            for (const auto policy : {ninfer::MtpDraftPolicy::Fixed, ninfer::MtpDraftPolicy::Adaptive}) {
+                for (const auto width : {15U, 31U, 63U}) {
+                    auto args = memory_args;
+                    args.insert(args.end(), {"--kv-dtype", format, "--vision", "--vision-residency", residency,
+                        "--spec", "mtp", "--draft-tokens", "15", "--ngram-draft-tokens", std::to_string(width)});
+                    if (policy == ninfer::MtpDraftPolicy::Adaptive) args.push_back("--adaptive-mtp");
+                    const auto image_copy = make_engine_options(parse(args));
+                    failures += check(image_copy.enable_vision && image_copy.max_concurrency == 1 &&
+                        image_copy.speculative.ngram_draft_tokens == width && image_copy.speculative.mtp_policy == policy,
+                        "KVMem image/ngram mapping changed the requested execution");
+                }
+            }
+        }
+    }
+    for (const auto* format : {"bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"}) {
+        for (unsigned lanes = 2; lanes <= 8; ++lanes) {
+            for (const auto width : {0U, 1U, 4U, 15U, 16U, 31U, 63U}) {
+                for (const bool adaptive : {false, true}) {
+                    auto args = memory_args;
+                    args.insert(args.end(), {"--kv-dtype", format, "--max-concurrency", std::to_string(lanes),
+                        "--spec", "mtp", "--draft-tokens", "3", "--ngram-draft-tokens", std::to_string(width)});
+                    if (adaptive) args.push_back("--adaptive-mtp");
+                    const auto serving = parse(args);
+                    const auto copy = make_engine_options(serving);
+                    failures += check(copy.max_concurrency == lanes && copy.kv_capacity.explicit_tokens == lanes * 512 &&
+                        copy.speculative.ngram_draft_tokens == std::min(width, 15U) &&
+                        serving.requested_ngram_draft_tokens == (width > 15 ? std::optional<std::uint32_t>(width) : std::nullopt) &&
+                        (copy.speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive) == adaptive,
+                        "Concurrent ngram lost lane capacity or draft policy");
+                    for (const auto* residency : {"resident", "cpu"}) {
+                        auto image_args = args;
+                        image_args.insert(image_args.end(), {"--vision", "--vision-residency", residency});
+                        const auto image_serving = parse(image_args);
+                        const auto image = make_engine_options(image_serving);
+                        failures += check(image.enable_vision && image.kv_cache == copy.kv_cache &&
+                            image.max_concurrency == lanes && image.vision_residency ==
+                                (std::string_view(residency) == "cpu" ? ninfer::VisionResidency::Cpu : ninfer::VisionResidency::Resident) &&
+                            image.speculative.ngram_draft_tokens == std::min(width, 15U) &&
+                            image_serving.requested_ngram_draft_tokens == serving.requested_ngram_draft_tokens,
+                            "Concurrent image/ngram settings changed");
+                    }
+                }
+            }
+        }
+    }
+    const auto memory_defaults = parse({"ninfer-serve", "model.ninfer"});
+    for (const auto* format : {"nvfp4", "k8v4"}) {
+        const auto storage = std::string_view(format) == "nvfp4"
+            ? ninfer::KvCacheStorage::Nvfp4Group16 : ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+        for (const auto drafts : {0U, 1U, 2U, 3U, 4U}) {
+            for (const auto lanes : {1U, 2U, 3U, 4U}) {
+                auto args = memory_args;
+                args.insert(args.end(), {"--kv-dtype", format, "--max-concurrency",
+                                        std::to_string(lanes), "--ngram-draft-tokens", "0",
+                                        "--lookup-ngram", "0"});
+                if (drafts) args.insert(args.end(), {"--spec", "mtp", "--draft-tokens",
+                                                   std::to_string(drafts)});
+                const auto options = make_engine_options(parse(args));
+                failures += check(options.kv_cache == storage &&
+                    options.max_concurrency == lanes && options.kv_capacity.explicit_tokens == lanes * 512 &&
+                    options.speculative.backend == (drafts ? ninfer::SpeculativeBackend::Mtp
+                                                           : ninfer::SpeculativeBackend::None) &&
+                    (!drafts || options.speculative.draft_tokens == drafts) &&
+                    options.speculative.ngram_draft_tokens == 0 && options.speculative.lookup_ngram == 0,
+                    "KVMem NVFP4/K8V4/MTP mapping changed storage, lane budgets or disabled ngram settings");
+            }
+            auto image_args = memory_args;
+            image_args.insert(image_args.end(), {"--kv-dtype", format, "--vision",
+                                                "--vision-residency", "resident",
+                                                "--ngram-draft-tokens", "0", "--lookup-ngram", "0"});
+            if (drafts) image_args.insert(image_args.end(), {"--spec", "mtp", "--draft-tokens",
+                                                           std::to_string(drafts)});
+            const auto image = make_engine_options(parse(image_args));
+            failures += check(image.enable_vision && image.max_concurrency == 1 &&
+                image.kv_cache == storage &&
+                image.speculative.ngram_draft_tokens == 0 && image.speculative.lookup_ngram == 0,
+                "KVMem NVFP4/K8V4 resident-image settings were not preserved");
+        }
+        for (const auto& extra : std::vector<std::vector<std::string>>{
+                 {"--max-concurrency", "9"}, {"--vision", "--max-concurrency", "9"},
+                 {"--spec", "mtp", "--draft-tokens", "16"},
+                 {"--spec", "mtp", "--draft-tokens", "4", "--adaptive-mtp", "--max-concurrency", "2", "--ngram-draft-tokens", "64"},
+                 {"--spec", "mtp", "--draft-tokens", "3", "--lookup-ngram", "1"},
+                 {"--kv-dtype", "unknown-kv"}, {"--kv-dtype", "nvpf4"}}) {
+            auto args = memory_args;
+            args.insert(args.end(), {"--kv-dtype", format});
+            args.insert(args.end(), extra.begin(), extra.end());
+            bool rejected = false;
+            try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "NVFP4/K8V4 unexpectedly enabled an unsupported KVMem combination");
+        }
+    }
+    failures += check(memory_defaults.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          memory_defaults.cuda_vram_reserve_bytes == 0 &&
+                          memory_defaults.cuda_memory_probe_step_bytes == 0 &&
+                          memory_defaults.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          memory_defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
+                      "CUDA memory policy defaults changed");
+    const auto resident = parse({"ninfer-serve", "model.ninfer",
+                                 "--cuda-memory-policy", "strict", "--kv-capacity", "auto"});
+    failures += check(resident.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          resident.cuda_vram_reserve_bytes == (64ULL << 20) &&
+                          resident.cuda_memory_probe_step_bytes == (128ULL << 20) &&
+                          resident.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          resident.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "strict must enable hybrid caching and use its own automatic reserve");
+    const auto mixed = parse({"ninfer-serve", "model.ninfer",
+                              "--cuda-memory-policy", "mixed", "--kv-capacity", "auto"});
+    failures += check(mixed.cuda_memory_policy == ninfer::CudaMemoryPolicy::Mixed &&
+                          mixed.cuda_vram_reserve_bytes == 0 &&
+                          mixed.cuda_memory_probe_step_bytes == 0 &&
+                          mixed.kv_capacity.automatic_headroom_bytes == 0,
+                      "mixed must not inherit strict probing or default-policy headroom");
+    const auto ordinary = parse({"ninfer-serve", "model.ninfer",
+                                 "--cuda-memory-policy", "default", "--kv-capacity", "auto",
+                                 "--kv-headroom-mib", "100"});
+    failures += check(ordinary.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          ordinary.kv_capacity.automatic_headroom_bytes == (100ULL << 20),
+                      "default policy must retain explicit automatic-KV headroom");
+    const auto custom = parse({"ninfer-serve", "model.ninfer",
+                               "--cuda-memory-policy", "strict-0-1", "--kv-capacity", "auto"});
+    failures += check(custom.cuda_vram_reserve_bytes == 0 &&
+                          custom.cuda_memory_probe_step_bytes == (1ULL << 20) &&
+                          custom.kv_capacity.automatic_headroom_bytes == 0,
+                      "strict custom reserve and step minimum were not preserved");
+    const auto custom_auto = parse({"ninfer-serve", "model.ninfer",
+                                    "--cuda-memory-policy", "strict-00072-00256", "--kv-capacity", "auto"});
+    failures += check(custom_auto.cuda_vram_reserve_bytes == (72ULL << 20) &&
+                          custom_auto.cuda_memory_probe_step_bytes == (256ULL << 20) &&
+                          custom_auto.kv_capacity.automatic_headroom_bytes == (72ULL << 20),
+                      "custom strict decimal values must control auto-KV headroom");
+    const auto maximum_mib = std::numeric_limits<std::size_t>::max() >> 20;
+    const auto memory_boundaries = parse({"ninfer-serve", "model.ninfer",
+                                          "--cuda-memory-policy", "strict-" + std::to_string(maximum_mib) + "-16384"});
+    failures += check(memory_boundaries.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          memory_boundaries.cuda_vram_reserve_bytes == (maximum_mib << 20) &&
+                          memory_boundaries.cuda_memory_probe_step_bytes == (16384ULL << 20),
+                      "valid CUDA memory parameter boundaries were rejected or truncated");
+    const auto reset_policy = parse({"ninfer-serve", "model.ninfer",
+                                     "--cuda-memory-policy", "strict-7-8", "--cuda-memory-policy", "default"});
+    failures += check(reset_policy.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          reset_policy.cuda_vram_reserve_bytes == 0 &&
+                          reset_policy.cuda_memory_probe_step_bytes == 0 &&
+                          reset_policy.context_cache.mode == ninfer::ContextCacheMode::Hybrid,
+                      "last policy selection must not retain strict side effects");
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--cuda-memory-policy", "unknown"},
+             {"--cuda-memory-policy", "strict-64"}, {"--cuda-memory-policy", "strict--128"},
+             {"--cuda-memory-policy", "strict-64-"}, {"--cuda-memory-policy", "strict-64-0"},
+             {"--cuda-memory-policy", "strict-64-16385"}, {"--cuda-memory-policy", "strict-64-128-1"},
+             {"--cuda-memory-policy", "strict-+64-128"}, {"--cuda-memory-policy", "strict- 64-128"},
+             {"--cuda-memory-policy", "strict-1.5-128"}, {"--cuda-memory-policy", "strict-64--1"},
+             {"--cuda-memory-policy", "strict-18446744073709551615-128"},
+             {"--cuda-memory-policy", "strict-" + std::to_string(maximum_mib + 1) + "-128"},
+             {"--cuda-memory-policy", "strict-64-18446744073709551615"},
+             {"--cuda-memory-policy", "strict", "--vision"},
+             {"--cuda-memory-policy", "mixed", "--vision"},
+             {"--cuda-memory-policy", "strict", "--wddm-evictable-budget"},
+             {"--cuda-memory-policy", "mixed", "--wddm-evictable-budget"},
+             {"--cuda-memory-policy", "strict", "--devices", "0,1"},
+             {"--cuda-memory-policy", "mixed", "--devices", "0,1"},
+             {"--cuda-memory-policy", "strict", "--use-original-prefix-caching"},
+             {"--no-prefix-reuse", "--cuda-memory-policy", "strict"},
+             {"--cuda-memory-policy", "strict", "--kv-capacity", "auto", "--kv-headroom-mib", "64"},
+             {"--cuda-memory-policy", "mixed", "--kv-capacity", "auto", "--vram-headroom-mib", "0"},
+             {"--cuda-memory-policy", "strict", "--model-suspend"},
+             {"--cuda-memory-policy", "mixed", "--model-suspend"},
+             {"--cuda-memory-policy", "strict", "--graft", "test=graft.json"},
+             {"--cuda-memory-policy", "mixed", "--graft", "test=graft.json"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid or conflicting CUDA residency options admitted");
+    }
+    const auto memory_help = serve_usage_text("ninfer-serve");
+    for (const std::string mode : {"mixed", "strict"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "--models-dir", ".", "--cuda-memory-policy", mode});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "model router admitted an unsupported CUDA memory policy");
+    }
+    failures += check(memory_help.find("strict-RESERVE-STEP") != std::string::npos,
+                      "Serve help omits custom strict policy syntax");
+    const auto resident_engine = make_engine_options(resident);
+    failures += check(resident_engine.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          resident_engine.cuda_vram_reserve_bytes == (64ULL << 20) &&
+                          resident_engine.cuda_memory_probe_step_bytes == (128ULL << 20) &&
+                          resident_engine.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          resident_engine.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "serve-to-engine conversion lost strict policy semantics");
+    const auto mixed_engine = make_engine_options(mixed);
+    failures += check(mixed_engine.cuda_memory_policy == ninfer::CudaMemoryPolicy::Mixed &&
+                          mixed_engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          mixed_engine.kv_capacity.automatic_headroom_bytes == 0,
+                      "serve-to-engine conversion lost mixed policy semantics");
+    const auto implicit_strict = parse({"ninfer-serve", "model.ninfer", "--cuda-memory-policy", "strict",
+                                        "--device-snapshot-slots", "2"});
+    failures += check(implicit_strict.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          implicit_strict.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          implicit_strict.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "strict hybrid activation must precede KV default and hybrid-option validation");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
@@ -148,7 +736,6 @@ int main() {
     for (const auto& tail : std::vector<std::vector<std::string>>{
              {"--ngram-draft-tokens", "64"},
              {"--ngram-min-match", "3"},
-             {"--max-concurrency", "2", "--ngram-draft-tokens", "63"},
              {"--spec", "none"}}) {
         std::vector<std::string> arguments{"ninfer-serve",
                                            "model.ninfer",
@@ -184,15 +771,11 @@ int main() {
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.ngram_draft_tokens == 0,
                       "ngram default needs a neural backend");
-    const auto mtp_wide_concurrent = [&] {
-        bool rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
-        } catch (const std::invalid_argument&) { rejected = true; }
-        return rejected;
-    }();
-    failures += check(mtp_wide_concurrent, "wide MTP ngram with concurrency>1 was admitted");
+    const auto mtp_wide_concurrent = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                          "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
+    failures += check(mtp_wide_concurrent.speculative.ngram_draft_tokens == 15 &&
+                      mtp_wide_concurrent.requested_ngram_draft_tokens == 63,
+                      "wide MTP ngram was not reduced with an adjustment record");
 
     const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -231,14 +814,12 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
-        // The GDN conv-record workspace caps a multi-request verify at 16 columns, so any backend
-        // rejects an ngram width above 15 once concurrency exceeds one.
-        bool wide_rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
-        } catch (const std::invalid_argument&) { wide_rejected = true; }
-        failures += check(wide_rejected, "wide ngram with concurrency>1 admitted");
+        // Wider valid requests use the 16-column GDN verification frame at multi-request startup.
+        const auto wide_concurrent = parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                                             "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
+        failures += check(wide_concurrent.speculative.ngram_draft_tokens == 15 &&
+                          wide_concurrent.requested_ngram_draft_tokens == 63,
+                          "wide ngram was not reduced for concurrent execution");
         const auto wide_single =
             parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -1838,4 +2419,12 @@ int main() {
     }
 
     return failures == 0 ? 0 : 1;
+}
+
+int main() {
+    try { return run_serve_option_tests(); }
+    catch (const std::exception& error) {
+        std::cerr << "SERVE_OPTIONS unexpected exception: " << error.what() << std::endl;
+        return 1;
+    }
 }

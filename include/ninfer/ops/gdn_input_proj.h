@@ -320,6 +320,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
  * q8_1 as llama.cpp does; BF16 and row-split Q4/Q5/Q6/Q8 parts each through Linear. The products are
  * BF16, and the snapshot and record forms run the materialized convolution over the projected
  * q/k/value plane at every batch size, as the one-parent forms' prefill does.
+ * Geometry comes from complete output partitions: q/k each have K rows (a positive multiple
+ * of 128), value/z each have V rows (a positive multiple of K), and x has the common parent
+ * input width H. The qkv output has 2*K+V rows; conv_weight is [2*K+V,4] and the history
+ * has [2*K+V,3,Slots]. The snapshot/record contracts above apply with these dimensions.
  */
 [[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(
     const PartProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);

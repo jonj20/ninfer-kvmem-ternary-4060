@@ -174,7 +174,8 @@ public:
 
     template <class Slots>
     [[nodiscard]] ControlMembership build_control_membership(const Slots& slots,
-                                                             std::uint32_t max_concurrency) const {
+                                                             std::uint32_t max_concurrency,
+                                                             std::uint32_t chunk_limit = UINT32_MAX) const {
         ControlMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
@@ -184,7 +185,8 @@ public:
             if (!request->budget || !request->sequence) {
                 throw std::logic_error("control-ready request has no generation state");
             }
-            const std::span<const TokenId> control = request->output.pending_control_tokens();
+            auto control = request->output.pending_control_tokens();
+            control = control.first(std::min<std::size_t>(control.size(), chunk_limit));
             if (control.empty() || control.size() > request->budget->remaining()) {
                 throw std::logic_error("control-ready request has no admissible control span");
             }
@@ -193,7 +195,7 @@ public:
                 membership.tokens.reserve(static_cast<std::size_t>(membership.row_stride) *
                                           max_concurrency);
             } else if (control.size() != membership.row_stride) {
-                throw std::logic_error("compact control membership has ragged target spans");
+                continue; // a peer may already have committed more control chunks
             }
             membership.lanes[membership.size]     = lane;
             membership.sequences[membership.size] = *request->sequence;

@@ -541,4 +541,32 @@ StructuredCompiler::compile_format(const std::string& format,
         throw std::invalid_argument(std::string("cannot compile tool calls: ") + e.what());
     }
 }
+std::shared_ptr<GrammarState> StructuredCompiler::compile_model(
+    const std::string& source, const StructuredOutputOptions& body, const std::string& close,
+    const std::string& continuation) {
+    validate_structured_output(body);
+    std::lock_guard lock(impl_->mutex);
+    auto compiled = impl_->compiler.CompileGrammar(source);
+    if (!close.empty()) {
+        Json content{{"type", "grammar"}, {"grammar", source}};
+        content = Json{{"type", "sequence"}, {"elements", Json::array({
+            Json{{"type", "any_text"}, {"excludes", Json::array({close})}},
+            Json{{"type", "const_string"}, {"value", close}},
+            Json{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}}, content})}};
+        compiled = impl_->compiler.CompileStructuralTag(
+            Json{{"type", "structural_tag"}, {"format", content}}.dump());
+    }
+    std::unique_ptr<StringConstraintState> strings;
+    if (body.kind == StructuredOutputKind::JsonSchema) {
+        strings = std::make_unique<StringConstraintState>(normalize_json_schema(body.schema), close);
+        if (!strings->has_constraints()) strings.reset();
+    }
+    xgrammar::GrammarMatcher matcher(compiled);
+    if (!continuation.empty() && !matcher.AcceptString(continuation))
+        throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                           "assistant continuation is not a prefix of the tool grammar");
+    return std::shared_ptr<GrammarState>(new GrammarState(std::make_unique<GrammarState::Impl>(
+        std::move(matcher), impl_->tokenizer.GetVocabSize(),
+        impl_->vocabulary, impl_->stops, std::move(strings))));
+}
 } // namespace ninfer::text

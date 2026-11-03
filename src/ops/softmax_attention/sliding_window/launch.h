@@ -29,7 +29,7 @@ sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens,
 
 void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                      const Tensor& positions, const Tensor& valid_columns,
-                                     const Tensor& lanes, float scale,
+                                     const Tensor& lanes, const Tensor& min_positions, float scale,
                                      const CyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,

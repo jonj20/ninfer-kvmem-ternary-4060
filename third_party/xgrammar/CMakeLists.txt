@@ -13,6 +13,7 @@ add_library(ninfer_xgrammar STATIC
   cpp/grammar_printer.cc
   cpp/json_schema_converter.cc
   cpp/json_schema_converter_ext.cc
+  cpp/json_string_grammar.cc
   cpp/lark_converter.cc
   cpp/regex_converter.cc
   cpp/structural_tag.cc

@@ -20,15 +20,18 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <optional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <charconv>
 #include <vector>
 
 namespace {
@@ -194,11 +197,11 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 // products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
 // and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
 // 704 not even of its 256-value weight steps).
-int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
+int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
+             const std::vector<std::int32_t>& widths) {
     constexpr std::int32_t kRows = 256;
     const std::int32_t kK        = k;
-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
-    const std::int32_t max_t     = 130;
+    const std::int32_t max_t     = *std::max_element(widths.begin(), widths.end());
     std::mt19937 rng(seed);
     int failures = 0;
 
@@ -495,18 +498,116 @@ int run_mapped_table(const TypeCase& c, std::uint32_t seed, std::int32_t vocabul
     return failures;
 }
 
+int cross_device_matrix() {
+    // Stream-K partitions depend on SM count. Measure the same encoded matrix and activation on
+    // both devices before attributing cross-card greedy differences to pipeline state handling.
+    constexpr int rows = 5120, k = 6144, columns = 128;
+    const TypeCase type{QType::GGUF_IQ3_S, "iq3_s", {0}};
+    const auto native = ops::detail::gguf_type(type.qtype);
+    std::mt19937 rng(314159);
+    const auto bytes = random_blocks(type, rows, k, rng);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> input(std::size_t(k) * columns);
+    for (auto& value : input) { value = __float2bfloat16(normal(rng)); }
+    const auto block = gguf_block_shape(type.qtype);
+    const auto stride = std::int64_t(k / block.elements) * block.bytes;
+    std::array<std::vector<float>, 2> results;
+    for (int device = 0; device < 2; ++device) {
+        check(cudaSetDevice(device), "select matrix device");
+        cudaDeviceProp props{};
+        check(cudaGetDeviceProperties(&props, device), "matrix device properties");
+        DeviceBuffer weights(bytes.size()), x(input.size() * sizeof(__nv_bfloat16));
+        weights.copy_from_host(bytes.data(), bytes.size());
+        x.copy_from_host(input.data(), input.size() * sizeof(__nv_bfloat16));
+        DeviceBuffer activation(ops::gguf::matrix_activation_bytes(k, columns));
+        DeviceBuffer out(std::size_t(rows) * columns * sizeof(float));
+        DeviceBuffer fixup(std::max<std::size_t>(ops::gguf::matrix_fixup_bytes(native, rows, columns), 1));
+        ops::gguf::quantize_matrix_activation(native, static_cast<const __nv_bfloat16*>(x.p),
+                                               k, columns, nullptr, activation.p, nullptr);
+        ops::gguf::matrix_product(native, weights.p, stride, rows, k, activation.p, columns,
+                                   static_cast<float*>(out.p), rows, fixup.p, nullptr);
+        check(cudaDeviceSynchronize(), "cross-device matrix");
+        results[device].resize(std::size_t(rows) * columns);
+        out.copy_to_host(results[device].data(), results[device].size() * sizeof(float));
+        std::cout << "GGUF_DEVICE " << device << " " << props.name
+                  << " SMs=" << props.multiProcessorCount << '\n';
+    }
+    std::size_t different = 0, bf16_different = 0;
+    double squared = 0, reference_squared = 0, max_error = 0, max_reference = 0;
+    for (std::size_t i = 0; i < results[0].size(); ++i) {
+        const auto a = results[0][i], b = results[1][i];
+        if (!std::isfinite(a) || !std::isfinite(b)) { throw std::runtime_error("non-finite matrix output"); }
+        different += a != b;
+        bf16_different += __bfloat162float(__float2bfloat16(a)) != __bfloat162float(__float2bfloat16(b));
+        const double delta = double(a) - b;
+        squared += delta * delta;
+        reference_squared += double(a) * a;
+        max_error = std::max(max_error, std::abs(delta));
+        max_reference = std::max(max_reference, std::abs(double(a)));
+    }
+    const auto rms = std::sqrt(squared / std::max(reference_squared, 1e-30));
+    const auto relative_max = max_error / std::max(max_reference, 1e-30);
+    std::cout << "GGUF_CROSS_DEVICE total=" << results[0].size() << " fp32_different=" << different
+              << " bf16_different=" << bf16_different << " relative_rms=" << rms
+              << " relative_max=" << relative_max << '\n';
+    return rms < 1e-5 && relative_max < 1e-5 ? 0 : 1;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
+        if (std::getenv("NINFER_TEST_GGUF_CROSS_DEVICE")) {
+            return devices >= 2 ? cross_device_matrix() : 77;
+        }
         int failures      = 0;
         std::uint32_t seed = 9001;
+        std::vector<std::string> formats;
+        std::vector<std::int32_t> dimensions{1536, 2560, 2816, 2112, 704};
+        std::vector<std::int32_t> widths{1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
+        const auto split = [](std::string_view value) {
+            std::vector<std::string> out;
+            while (!value.empty()) {
+                const auto end = value.find(',');
+                const auto item = value.substr(0, end);
+                if (item.empty()) throw std::invalid_argument("empty filter value");
+                out.emplace_back(item);
+                if (end == std::string_view::npos) return out;
+                value.remove_prefix(end + 1);
+            }
+            throw std::invalid_argument("empty filter value");
+        };
+        const auto numbers = [&](std::string_view value) {
+            std::vector<std::int32_t> out;
+            for (const auto& item : split(value)) {
+                std::int32_t n = 0;
+                const auto parsed = std::from_chars(item.data(), item.data() + item.size(), n);
+                if (parsed.ec != std::errc{} || parsed.ptr != item.data() + item.size() || n <= 0)
+                    throw std::invalid_argument("filter requires positive integers");
+                out.push_back(n);
+            }
+            return out;
+        };
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view flag = argv[i];
+            if (++i >= argc) throw std::invalid_argument("GGUF filter needs a value");
+            if (flag == "--formats") formats = split(argv[i]);
+            else if (flag == "--k") dimensions = numbers(argv[i]);
+            else if (flag == "--widths") widths = numbers(argv[i]);
+            else throw std::invalid_argument("unknown GGUF filter");
+        }
+        for (const auto& name : formats) {
+            const auto inventory = cases();
+            if (std::none_of(inventory.begin(), inventory.end(), [&](const auto& c) { return name == c.name; }))
+                throw std::invalid_argument("unknown GGUF format: " + name);
+        }
         for (const auto& c : cases()) {
+            if (!formats.empty() && std::find(formats.begin(), formats.end(), c.name) == formats.end()) continue;
             const bool cooperative = c.qtype == QType::GGUF_Q4_K || c.qtype == QType::GGUF_Q6_K;
             for (const std::string_view schedule :
                  cooperative ? std::vector<std::string_view>{"scalar", "cooperative"}
@@ -515,9 +616,9 @@ int main() {
                 if (!schedule.empty()) {
                     force.emplace("gguf_vector/" + std::string(c.name), std::string(schedule));
                 }
-                for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+                for (const std::int32_t k : dimensions) {
                     if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
-                    const int f = run_type(c, seed++, k);
+                    const int f = run_type(c, seed++, k, widths);
                     std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                               << (schedule.empty() ? "" : " ") << schedule << '\n';
                     failures += f;

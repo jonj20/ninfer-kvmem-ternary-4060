@@ -1,4 +1,6 @@
 #include "serve/request_log.h"
+#include "serve/cuda_residency_json.h"
+#include "product/cuda_memory_options.h"
 #include "product/logging/pretty_format.h"
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
@@ -119,6 +121,8 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return "required";
     }
     return "unknown";
 }
@@ -332,7 +336,7 @@ const char* vision_residency_name(ninfer::VisionResidency residency) {
 
 Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySummary>& vision) {
     if (!vision) { return nullptr; }
-    return Json{{"residency", vision_residency_name(vision->residency)},
+    Json out{{"residency", vision_residency_name(vision->residency)},
                 {"aggregate_prompt_tokens", vision->aggregate_prompt_tokens},
                 {"max_item_tokens", vision->max_item_tokens},
                 {"general_capacity_bytes", vision->general_capacity_bytes},
@@ -341,6 +345,14 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_capacity_bytes", vision->handoff_capacity_bytes},
                 {"handoff_active_bytes", vision->handoff_active_bytes},
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
+    if (vision->cpu_weights_lazy) {
+        out["cpu_weights"] = {{"bytes", vision->cpu_weight_bytes},
+            {"loading", vision->cpu_weights_loading}, {"users", vision->cpu_weight_users},
+            {"loads", vision->cpu_weight_loads}, {"unloads", vision->cpu_weight_unloads},
+            {"last_load_seconds", vision->cpu_weight_last_load_seconds},
+            {"idle_timeout_seconds", vision->cpu_weight_idle_seconds}};
+    }
+    return out;
 }
 
 Json rope_json(const ninfer::RopeScalingSummary& rope) {
@@ -748,6 +760,7 @@ std::string format_server_start_json(
         {"lenient_assistant_history", options.lenient_assistant_history},
         {"lenient_image_detail", options.lenient_image_detail},
         {"max_request_bytes", options.max_request_bytes},
+        {"cpu_vision_idle_seconds", options.cpu_vision_idle_seconds},
         {"media_cache_bytes", options.media_cache_bytes},
         {"media_live_bytes", options.media_live_bytes},
         {"media_preprocess_threads", options.media_preprocess_threads},
@@ -818,6 +831,13 @@ std::string format_server_start_json(
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
+        {"cuda_memory_policy", product::format_cuda_memory_policy(
+             engine_options.cuda_memory_policy, engine_options.cuda_vram_reserve_bytes,
+             engine_options.cuda_memory_probe_step_bytes)},
+        {"cuda_vram_reserve_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                       ? engine_options.cuda_vram_reserve_bytes : 0},
+        {"cuda_memory_probe_step_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                            ? engine_options.cuda_memory_probe_step_bytes : 0},
         {"model_suspend", engine_options.suspend.enabled},
         {"suspend_snapshot",
          engine_options.suspend.snapshot_memory == SuspendSnapshotMemory::Pinned ? "pinned"
@@ -894,6 +914,7 @@ std::string format_server_start_json(
              {"greedy", options.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
+             {"cuda_residency", cuda_residency_json(memory.cuda_residency)},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},

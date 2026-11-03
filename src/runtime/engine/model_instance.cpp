@@ -1,4 +1,6 @@
 #include "runtime/engine/model_instance.h"
+#include "kvmem/lrfu.hpp"
+#include "kvmem/retrieval_options.hpp"
 
 #include "core/vmm.h"
 #include "calibration/device_calibration.h"
@@ -8,6 +10,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/speculative_limits.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
@@ -25,6 +28,7 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -40,8 +44,54 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::uint32_t kMaximumDecodeRoundsPerPrefill = 4096;
+void validate_memory_policy(const EngineOptions& options) {
+    if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault &&
+        (options.suspend.enabled || !options.grafts.empty())) {
+        throw std::invalid_argument("mixed/strict CUDA memory does not support model suspend or prompt grafts");
+    }
+    switch (options.cuda_memory_policy) {
+    case CudaMemoryPolicy::DriverDefault:
+        break;
+    case CudaMemoryPolicy::Mixed:
+#ifndef _WIN32
+        throw std::invalid_argument("mixed CUDA memory requires Windows driver paging");
+#endif
+        if (options.purpose != EnginePurpose::Generation || options.devices.size() > 1 ||
+            options.expert_residency != ExpertResidency::Device ||
+            options.enable_vision || options.wddm_evictable_budget) {
+            throw std::invalid_argument(
+                "mixed CUDA memory supports single-GPU text generation and ordinary CUDA "
+                "allocation only; scoring, Vision, pipeline devices and wddm-evictable-budget "
+                "are not supported");
+        }
+        if (options.kv_capacity.automatic_headroom_bytes != 0) {
+            throw std::invalid_argument("mixed CUDA memory requires zero automatic KV headroom");
+        }
+        break;
+    case CudaMemoryPolicy::StrictVram:
+#ifndef _WIN32
+        throw std::invalid_argument("strict requires Windows GPU residency counters");
+#endif
+        if (options.purpose != EnginePurpose::Generation || options.devices.size() > 1 ||
+            options.expert_residency != ExpertResidency::Device ||
+            options.enable_vision || options.wddm_evictable_budget ||
+            !options.context_cache.enabled || options.context_cache.mode != ContextCacheMode::Hybrid) {
+            throw std::invalid_argument(
+                "strict supports single-GPU text generation with the Hybrid prefix cache "
+                "only; scoring, Vision, pipeline devices, Legacy/disabled cache and "
+                "wddm-evictable-budget are not supported");
+        }
+        if (options.cuda_memory_probe_step_bytes == 0) {
+            throw std::invalid_argument("strict probe step must be positive");
+        }
+        break;
+    default:
+        throw std::invalid_argument("unknown CUDA memory policy");
+    }
+}
 
 void validate_options(const EngineOptions& options) {
+    validate_memory_policy(options);
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -238,6 +288,117 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.purpose == EnginePurpose::Generation) {
+        const auto requested_ngram = options.speculative.ngram_draft_tokens;
+        options.speculative.ngram_draft_tokens =
+            concurrent_ngram_draft_tokens(requested_ngram, options.max_concurrency);
+        if (requested_ngram != options.speculative.ngram_draft_tokens) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "ngram draft tokens reduced from %u to %u for max concurrency %u",
+                               requested_ngram, options.speculative.ngram_draft_tokens,
+                               options.max_concurrency);
+        }
+    }
+    if (options.kvmem.disk_path.empty() != (options.kvmem.disk_bytes == 0) ||
+        options.kvmem.disk_bytes > std::uint64_t(INT64_MAX) ||
+        options.kvmem.host_bytes > UINT64_MAX - options.kvmem.disk_bytes) {
+        throw std::invalid_argument("KVMem SSD requires a directory and a valid nonzero disk quota");
+    }
+    if(!options.kvmem.query_max_tokens) throw std::invalid_argument("KVMem Query cap must be positive");
+    kvmem::validate_query_scoring(options.kvmem.query_meanq_cosine ? kvmem::QueryScorer::MeanQCosine : kvmem::QueryScorer::PageSoftmax,
+        options.kvmem.score_agg_max ? 1 : 0,options.kvmem.graph_alpha);
+    if (options.kvmem.selected_tokens)
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+            "KVMEM_SCORING scorer=%s agg=%s lrfu=%d lambda=%.17g top_frac=%.17g graph_alpha=%.17g",
+            options.kvmem.query_meanq_cosine ? "meanq-cosine" : "page-softmax",
+            options.kvmem.score_agg_max ? "max" : "mean",int(options.kvmem.lrfu),
+            options.kvmem.lrfu_lambda,options.kvmem.lrfu_top_fraction,options.kvmem.graph_alpha);
+    if (options.kvmem.selected_tokens)
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+            "KVMEM_LIMITS query_max_tokens=%u query_replay_max_tokens=%u",
+            options.kvmem.query_max_tokens,options.kvmem.query_replay_max_tokens);
+    const kvmem::LrfuHistory validate_lrfu(options.kvmem.lrfu_lambda, options.kvmem.lrfu_top_fraction);
+    if ((options.kvmem.lrfu || options.kvmem.score_agg_max || options.kvmem.query_meanq_cosine || options.kvmem.graph_alpha != 0.2) && !options.kvmem.selected_tokens)
+        throw std::invalid_argument("KVMem retrieval options require selected_tokens");
+    if (!options.kvmem.selected_tokens &&
+        (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers ||
+         !options.kvmem.disk_path.empty() || options.kvmem.disk_bytes)) {
+        throw std::invalid_argument("KVMem auxiliary budgets require selected_tokens");
+    }
+    if (options.kvmem.selected_tokens != 0) {
+        if (options.expert_residency != ExpertResidency::Device) {
+            throw std::invalid_argument("KVMem does not support host/disk routed expert residency");
+        }
+        if (options.suspend.enabled || !options.grafts.empty()) {
+            throw std::invalid_argument("KVMem does not support model suspend or prompt grafts");
+        }
+        if (options.speculative.lookup_ngram != 0) {
+            throw std::invalid_argument(
+                "KVMem disables legacy --lookup-ngram; use --ngram-draft-tokens and --ngram-min-match");
+        }
+        if (options.kvmem.recent_blocks() == 0) {
+            throw std::invalid_argument(
+                "KVMem recent_tokens must be at least 64 to retain the partial append page");
+        }
+        if (static_cast<std::uint64_t>(options.kvmem.sink_blocks()) + options.kvmem.recent_blocks() >
+            options.kvmem.selected_tokens / 64) {
+            throw std::invalid_argument("KVMem sink and recent tokens exceed selected_tokens after rounding to 64-token pages");
+        }
+        const auto window = options.kvmem.device_tokens();
+        const bool ordinary = options.speculative.backend == SpeculativeBackend::None &&
+            options.speculative.draft_tokens == 0;
+        const bool memory_mtp = options.speculative.backend == SpeculativeBackend::Mtp &&
+            (options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15);
+        const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
+        const bool adaptive_mtp = memory_mtp &&
+            options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
+        // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
+        const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
+            options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
+            options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
+        const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
+            ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
+             options.speculative.ngram_draft_tokens <= 63 &&
+             options.speculative.ngram_min_match >= 4 && options.speculative.ngram_min_match <= 64 &&
+             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens) +
+                 options.speculative.draft_tokens <= options.kvmem.reserve_tokens);
+        const bool memory_spec_supported = (ordinary || fixed_mtp || adaptive_mtp || memory_dflash2) && memory_ngram_supported &&
+            options.speculative.mtp_attention_window == 0;
+
+        if (options.purpose != EnginePurpose::Generation || options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency ||
+            options.concurrent_prefill ||
+            (options.enable_vision && options.vision_residency != VisionResidency::Resident &&
+                options.vision_residency != VisionResidency::Cpu) ||
+            !memory_spec_supported ||
+            options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault ||
+            options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens != window * options.max_concurrency || window % 64 != 0 || window < 256 ||
+            window > options.max_context || options.kvmem.selected_tokens < 128 ||
+            !options.kvmem.query_max_tokens || !options.kvmem.query_replay_max_tokens ||
+            options.kvmem.selected_tokens % 64 != 0 || options.kvmem.reserve_tokens < 64 ||
+            options.kvmem.reserve_tokens % 64 != 0 || !options.kvmem.host_bytes ||
+            options.kvmem.retained_sessions == 0 || options.kvmem.retained_sessions > 16 ||
+            options.prefill_chunk == 0 || options.prefill_chunk % 64 != 0 ||
+            options.prefill_chunk > options.kvmem.reserve_tokens ||
+            options.context_cache.enabled || (options.fast_prefill_kernel &&
+                (options.kv_cache != KvCacheStorage::Int8Group64 &&
+                 options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+                 options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
+                 options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+                 options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) ||
+            (options.kv_cache != KvCacheStorage::BFloat16 && options.kv_cache != KvCacheStorage::Int8Group64 &&
+             options.kv_cache != KvCacheStorage::Nvfp4Group16 &&
+             options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value &&
+             options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+             options.kv_cache != KvCacheStorage::Fp8E4M3Row256 &&
+             options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
+             options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+             options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
+            throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
+                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                "and disabled prefix cache");
+        }
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -261,6 +422,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
     ContextCacheOptions& cache = options.context_cache;
+    if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        if (!cache.enabled) {
+            throw std::invalid_argument("strict CUDA memory requires prefix reuse and cannot disable the context cache");
+        }
+        // Select the cache before deriving its capacities. Host cache remains an independent
+        // setting: an explicit zero or nonzero budget must survive this normalization unchanged.
+        cache.mode = ContextCacheMode::Hybrid;
+    }
+    if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
+        if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+            options.kv_capacity.automatic_headroom_bytes = options.cuda_vram_reserve_bytes;
+        } else if (options.cuda_memory_policy == CudaMemoryPolicy::Mixed) {
+            options.kv_capacity.automatic_headroom_bytes = 0;
+        }
+    }
+    validate_memory_policy(options);
     if (options.speculative.ngram_archive_bytes != 0 &&
         options.speculative.ngram_draft_tokens == 0) {
         throw std::invalid_argument(
@@ -272,10 +449,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram session capacity must be between 1 MiB and the total "
                                     "archive capacity");
     }
-    // The GDN conv-record workspace admits at most 16 verification columns once a batch holds
-    // more than one request.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
+    // Invalid widths must not become valid through concurrency normalization.
+    if (options.speculative.ngram_draft_tokens > 63) {
+        throw std::invalid_argument("ngram draft width exceeds the supported range [0,63]");
     }
     const std::uint32_t concurrency = options.max_concurrency;
     // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
@@ -637,6 +813,30 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
 ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& device) {
     validate_options(requested);
     install_device_route_profile_for(requested, device);
+    std::shared_ptr<core::ResidentMemorySession> residency;
+    if (requested.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        constexpr std::size_t staging_and_control = 320ULL << 20;
+        const std::size_t host_cache = requested.context_cache.host_cache_budget_bytes.value();
+        if (host_cache > std::numeric_limits<std::size_t>::max() - staging_and_control) {
+            throw std::overflow_error("strict Host pool capacity overflows size_t");
+        }
+        const std::size_t reserve =
+            requested.kv_capacity.mode == KvCapacityMode::Automatic
+                ? std::max(requested.cuda_vram_reserve_bytes,
+                           requested.kv_capacity.automatic_headroom_bytes)
+                : requested.cuda_vram_reserve_bytes;
+        residency = std::make_shared<core::ResidentMemorySession>(core::ResidentMemoryConfig{
+            .device = device.rank(0).device,
+            .reserve_bytes = reserve,
+            .host_pool_bytes = host_cache + staging_and_control,
+            .probe_step_bytes = requested.cuda_memory_probe_step_bytes,
+        });
+        publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Info,
+                           "strict: fixed Host pool %.1f MiB, verified reserve %.1f MiB",
+                           static_cast<double>(host_cache + staging_and_control) / 1048576.0,
+                           static_cast<double>(reserve) / 1048576.0);
+    }
+    core::ResidentMemoryBinding resident_binding(residency);
     const auto start = Clock::now();
     // Every later stage of startup checks its options against the ones the model was loaded with, so
     // the stage split is decided once, here, and carried in the options from then on.
@@ -711,8 +911,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             options.context_cache.host_kv_capacity_bytes = 0;
         }
     }
+    if (residency && model->storage_stats().pinned_bytes != 0) {
+        throw std::invalid_argument(
+            "strict requires all selected weights resident on the device; "
+            "the artifact materialized pinned Host weights");
+    }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    instance->residency = residency;
+    if (residency) { residency->verify_working_set(false); }
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const std::size_t overlay_window_bytes =
@@ -732,15 +939,39 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
         }
     }
-    auto planner = models::qwen3_5::make_sequence_planner(
-        instance->parameters, device,
-        artifact_scoped_disk_tier(options, instance->model->info().artifact_id), graft_main_pages);
+    const EngineOptions planning_options =
+        artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
+    const auto curve = models::qwen3_5::make_sequence_planner(
+        instance->parameters, device, planning_options, graft_main_pages).capacity_curve();
     std::vector<std::size_t> free_by_rank =
         free_bytes_by_rank(device, options.wddm_evictable_budget,
                            instance->model->storage_stats().device_capacity_bytes);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner.capacity_curve(), free_by_rank.front(),
-        std::span<const std::size_t>(free_by_rank).subspan(1));
+    KvCapacityPolicy capacity_policy = options.kv_capacity;
+    if (residency) {
+        const auto memory = residency->stats();
+        const std::size_t physical_upper_bound =
+            memory.cuda_total_bytes > memory.device_allocated_bytes
+                ? memory.cuda_total_bytes - memory.device_allocated_bytes : 0;
+        if (capacity_policy.mode == KvCapacityMode::Automatic) {
+            capacity_policy.automatic_headroom_bytes =
+                std::max(capacity_policy.automatic_headroom_bytes,
+                         options.cuda_vram_reserve_bytes);
+            // Temporary probe blocks are released before constructing real contiguous arenas.
+            // The probe returns held bytes, without subtracting the reserve a second time.
+            free_by_rank.front() = residency->probe_available_bytes(physical_upper_bound);
+            residency->verify_working_set(false);
+        } else {
+            // WDDM free is an estimate, not an allocation limit. This upper bound rejects only
+            // impossible sizes; actual allocation and working-set verification decide admission.
+            free_by_rank.front() = physical_upper_bound > options.cuda_vram_reserve_bytes
+                ? physical_upper_bound - options.cuda_vram_reserve_bytes : 0;
+        }
+    }
+    auto resolution = options.cuda_memory_policy == CudaMemoryPolicy::Mixed
+        ? resolve_mixed_kv_capacity(capacity_policy, curve, options.max_context,
+                                   options.max_concurrency, free_by_rank.front())
+        : resolve_kv_capacity(capacity_policy, curve, free_by_rank.front(),
+                              std::span<const std::size_t>(free_by_rank).subspan(1));
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
         // Price startup with the real allocations before the KV plan is finalized: the delivery
@@ -752,14 +983,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
         const std::uint64_t headroom =
             automatic_kv ? options.kv_capacity.automatic_headroom_bytes : 0;
-        const auto& curve = planner.capacity_curve();
+        const auto& expert_curve = curve;
         reserved[0] = models::qwen3_5::native_expert_runtime_reservation(
             automatic_kv, options.expert_cache_bytes, reserved[0],
-            curve.minimum_device_reservation_bytes) + headroom;
+            expert_curve.minimum_device_reservation_bytes) + headroom;
         for (std::size_t rank = 1; rank < reserved.size(); ++rank) {
             reserved[rank] = models::qwen3_5::native_expert_runtime_reservation(
                 automatic_kv, options.expert_cache_bytes, reserved[rank],
-                curve.extra_ranks[rank - 1].minimum_device_reservation_bytes) + headroom;
+                expert_curve.extra_ranks[rank - 1].minimum_device_reservation_bytes) + headroom;
         }
         // The routing profile given, else the one recorded on this family's release.
         models::qwen3_5::execution::NativeExpertProfile profile;
@@ -785,61 +1016,125 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_kv_capacity(
-            options.kv_capacity, planner.capacity_curve(), free_by_rank.front(),
+            options.kv_capacity, curve, free_by_rank.front(),
             std::span<const std::size_t>(free_by_rank).subspan(1));
     }
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
-    if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-        sequence.kv_capacity() != resolution.resolved_tokens ||
-        !std::ranges::equal(sequence.extra_rank_reservation_bytes(),
-                            resolution.extra_rank_reservation_bytes)) {
-        throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
-    }
-    // The plan is the one authority for the resolved context-cache shape: its Host state slots,
-    // Host KV bytes and long-anchor count may have been derived from the single host RAM budget.
-    // Publishing that shape to the options the Engine keeps — and to the frontend grid built
-    // before the plan existed — keeps the reported options, the ResourceManager and the Program
-    // on the same capacity instead of a silently divergent default.
     EngineOptions resolved = options;
-    resolved.context_cache = sequence.context_cache_options();
-    instance->frontend.publish_long_anchor_limit(
-        resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
-    instance->kv_capacity_resolution = resolution;
-    planning.complete();
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer,
-                                                        std::move(experts));
     LoadSummary::PrefixCacheRestore restore;
-    if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
-        instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
-        // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
-        // is kept well inside its queue timeout.
-        instance->program->set_hybrid_coalesce_wait_limit(
-            static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
-        const std::filesystem::path& file = resolved.context_cache.hybrid.persistent_file;
-        if (!file.empty()) {
-            const models::qwen3_5::HybridCachePersistence loaded =
-                instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
-            restore = LoadSummary::PrefixCacheRestore{
-                .attempted           = true,
-                .restored            = loaded.ok,
-                .message             = loaded.message,
-                .blocks              = loaded.blocks,
-                .snapshots           = loaded.snapshots,
-                .bytes               = loaded.bytes,
-                .seconds             = loaded.seconds,
-                .saved_blocks        = loaded.saved_blocks,
-                .saved_snapshots     = loaded.saved_snapshots,
-                .required_host_bytes = loaded.required_host_bytes,
-                .host_bytes          = loaded.host_bytes,
-            };
+    constexpr unsigned maximum_attempts = 8;
+    for (unsigned attempt = 0; ; ++attempt) {
+        auto planner = models::qwen3_5::make_sequence_planner(
+            instance->parameters, device, planning_options, graft_main_pages);
+        auto sequence = std::move(planner).finalize(resolution.main_page_groups);
+        if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+            sequence.kv_capacity() != resolution.resolved_tokens ||
+            !std::ranges::equal(sequence.extra_rank_reservation_bytes(),
+                                resolution.extra_rank_reservation_bytes)) {
+            throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+        }
+        resolved.context_cache = sequence.context_cache_options();
+        if (!residency) {
+            // Keep upstream's publication before startup graft preparation on the ordinary path.
+            instance->frontend.publish_long_anchor_limit(
+                resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
+        }
+        if (attempt == 0) { planning.complete(); }
+        StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
+        const auto retry_capacity = [&](const std::runtime_error& error) {
+            device.synchronize();
+            instance->program.reset();
+            if (!residency || capacity_policy.mode != KvCapacityMode::Automatic ||
+                resolution.main_page_groups <= curve.minimum_main_page_groups ||
+                attempt + 1 >= maximum_attempts) {
+                throw core::VramCapacityError(
+                    "strict could not admit max_context=" + std::to_string(options.max_context) +
+                    " with the requested KV capacity and reserve; context was not reduced: " +
+                    error.what());
+            }
+            // A poisoned CUDA context or displaced weight working set aborts recovery.
+            residency->verify_working_set(false);
+            const std::size_t stride = curve.bytes_per_additional_main_page_group;
+            const std::size_t step_pages =
+                1 + (options.cuda_memory_probe_step_bytes - 1) / stride;
+            const std::size_t extra_pages =
+                resolution.main_page_groups - curve.minimum_main_page_groups;
+            const auto next_pages = attempt + 2 == maximum_attempts
+                ? curve.minimum_main_page_groups
+                : resolution.main_page_groups - static_cast<std::uint32_t>(
+                      std::min(extra_pages, step_pages));
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "strict: candidate %u KV tokens failed (%s); retrying %u tokens "
+                               "without reducing max_context %u",
+                               resolution.resolved_tokens, error.what(),
+                               curve.resolved_tokens(next_pages), options.max_context);
+            const std::size_t next_budget = curve.reservation_bytes(next_pages) +
+                                           capacity_policy.automatic_headroom_bytes;
+            resolution = resolve_kv_capacity(capacity_policy, curve, next_budget);
+            resolution.available_after_weights_bytes = free_by_rank.front();
+            resolution.planned_slack_bytes = free_by_rank.front() -
+                                             resolution.runtime_reservation_bytes;
+        };
+        try {
+            instance->program = models::qwen3_5::create_program(
+                instance->parameters, std::move(sequence), device, options.startup_observer, std::move(experts));
+            restore = {};
+            if (resolved.context_cache.enabled &&
+                resolved.context_cache.mode == ContextCacheMode::Hybrid) {
+                instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
+                instance->program->set_hybrid_coalesce_wait_limit(
+                    static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
+                const std::filesystem::path& file = resolved.context_cache.hybrid.persistent_file;
+                if (!file.empty()) {
+                    const auto loaded = instance->program->attach_hybrid_cache_file(
+                        file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+                    restore = LoadSummary::PrefixCacheRestore{
+                        .attempted = true, .restored = loaded.ok, .message = loaded.message,
+                        .blocks = loaded.blocks, .snapshots = loaded.snapshots,
+                        .bytes = loaded.bytes, .seconds = loaded.seconds,
+                        .saved_blocks = loaded.saved_blocks,
+                        .saved_snapshots = loaded.saved_snapshots,
+                        .required_host_bytes = loaded.required_host_bytes,
+                        .host_bytes = loaded.host_bytes,
+                    };
+                }
+            }
+            instance->inject_pinned_grafts();
+            device.synchronize();
+            if (residency) {
+                // Include all KV backing and existing weights after Graph and Host cache setup.
+                residency->verify_working_set(true);
+                const auto memory = residency->stats();
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "strict: admitted %u KV tokens, %.1f MiB device allocations, "
+                                   "Shared %.1f / baseline %.1f MiB, reserve %.1f MiB, %u retries",
+                                   resolution.resolved_tokens,
+                                   static_cast<double>(memory.device_allocated_bytes) / 1048576.0,
+                                   static_cast<double>(memory.shared_bytes) / 1048576.0,
+                                   static_cast<double>(memory.shared_baseline_bytes) / 1048576.0,
+                                   static_cast<double>(memory.verified_reserve_bytes) / 1048576.0,
+                                   attempt);
+            }
+            program.complete();
+            break;
+        } catch (const core::VramCapacityError& error) {
+            retry_capacity(error);
+        } catch (const CudaError& error) {
+            if (!residency || error.status() != cudaErrorMemoryAllocation) { throw; }
+            // Do not let a recoverable Graph allocation error leak through a later
+            // kernel's cudaGetLastError. Any distinct pending execution fault is fatal.
+            const auto pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
+                CUDA_CHECK(pending);
+            }
+            retry_capacity(error);
         }
     }
-    instance->inject_pinned_grafts();
-    device.synchronize();
-    program.complete();
+    // Publish only the fully constructed and verified candidate's shape.
+    if (residency) {
+        instance->frontend.publish_long_anchor_limit(
+            resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
+    }
+    instance->kv_capacity_resolution = resolution;
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

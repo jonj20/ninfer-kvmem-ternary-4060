@@ -15,6 +15,10 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, const Tensor* signs, cudaStream_t stream);
 
+void bf16_gdn_gating_proj_general_launch(const Tensor& x, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& alog, const Tensor& bias,
+    Tensor& g, Tensor& beta, cudaStream_t stream);
+
 enum class Bf16GdnGatingTokenVariant {
     None,
     Full,

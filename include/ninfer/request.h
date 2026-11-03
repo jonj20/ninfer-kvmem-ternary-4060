@@ -188,7 +188,17 @@ struct NgramSessionHints {
     // prior generated proposals must not reuse the random draws that produced them.
 };
 
+enum class ToolChoiceMode : std::uint8_t { Auto, None, Required };
+enum class ToolConstraintMode : std::uint8_t { Automatic, Basic };
+struct ToolChoice {
+    ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::optional<std::vector<std::string>> allowed_names;
+    bool parallel = true;
+    ToolConstraintMode constraints = ToolConstraintMode::Automatic;
+};
+
 struct RequestOptions {
+    ToolChoice tool_choice;
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
@@ -484,6 +494,7 @@ enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     MediaBudgetExceeded,
     InvalidMedia,
+    InvalidToolConstraint,
     Overloaded,
     QueueTimeout,
     Cancelled,
