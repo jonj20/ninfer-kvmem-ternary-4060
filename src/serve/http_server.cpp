@@ -1119,14 +1119,14 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},
         {"stage_layers", execution.stage_layers}, {"monitor_devices", facts.monitor_devices}};
     if (options.enable_vision && options.vision_residency == VisionResidency::Cpu) {
-        const auto memory = service.memory_summary();
-        if (memory.vision_workspace && memory.vision_workspace->cpu_weights_lazy) {
-            const auto& vision = *memory.vision_workspace;
-            props["cpu_vision"] = {{"resident", vision.cpu_weight_bytes != 0}, {"loading", vision.cpu_weights_loading},
-                {"weight_bytes", vision.cpu_weight_bytes}, {"active_encoders", vision.cpu_weight_users},
-                {"load_count", vision.cpu_weight_loads}, {"unload_count", vision.cpu_weight_unloads},
-                {"last_load_seconds", vision.cpu_weight_last_load_seconds},
-                {"idle_timeout_seconds", vision.cpu_weight_idle_seconds}};
+        // Full memory_summary() takes the Engine execution lock. This endpoint is polled
+        // during decode, so observe the independently synchronized Host cache instead.
+        if (const auto vision = service.cpu_vision_status()) {
+            props["cpu_vision"] = {{"resident", vision->weight_bytes != 0}, {"loading", vision->loading},
+                {"weight_bytes", vision->weight_bytes}, {"active_encoders", vision->active_encoders},
+                {"load_count", vision->load_count}, {"unload_count", vision->unload_count},
+                {"last_load_seconds", vision->last_load_seconds},
+                {"idle_timeout_seconds", vision->idle_timeout_seconds}};
         }
     }
     props["kvmem"] = {{"enabled", options.kvmem.selected_tokens != 0},

@@ -166,7 +166,10 @@ retried. An on-demand read failure returns an unavailable error for that image r
 continues serving other requests. The artifact must remain available at its original entry path. This policy applies to the
 Qwen3.5-family CPU tower; Gemma 4 retains its separate CPU implementation.
 
-`/props.cpu_vision` reports residency, logical weight bytes, active encoder leases, load/unload
+`/props.cpu_vision` reads live Host-cache metadata independently of the Engine execution lock,
+so monitoring stays responsive during prefill and decode. `Engine::cpu_vision_status()` exposes
+the same observation without loading weights or querying CUDA. It reports residency, logical
+weight bytes, active encoder leases, load/unload
 counts, the last load time and the idle timeout. `CPU_VISION loaded` / `unloaded` log records
 identify actual transitions. Weight bytes exclude vector spare capacity and allocator overhead;
 OS working set and private memory can differ from this logical count.

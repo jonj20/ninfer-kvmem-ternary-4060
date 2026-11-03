@@ -37,6 +37,17 @@ struct ArenaMemorySummary {
     std::size_t peak_used_bytes = 0;
 };
 
+// Independently synchronized Host weight residency. Reading this status never waits for an
+// Engine execution unit or enters CUDA; unavailable model families return no status.
+struct CpuVisionStatus {
+    bool loading = false;
+    std::size_t weight_bytes = 0;
+    std::size_t active_encoders = 0;
+    std::uint64_t load_count = 0, unload_count = 0;
+    double last_load_seconds = 0;
+    std::uint32_t idle_timeout_seconds = 0;
+};
+
 // Vision workspace extents and separate weight residency. Workspace extents describe regions
 // within workspace.capacity_bytes; CPU/overlay Host weights are separate allocations.
 struct VisionWorkspaceMemorySummary {

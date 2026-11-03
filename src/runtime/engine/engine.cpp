@@ -2,6 +2,7 @@
 #include "text/structured_output.h"
 
 #include "artifact/reader.h"
+#include "models/qwen3_5/load/vision_cpu_cache.h"
 #include "core/device.h"
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
@@ -1246,6 +1247,21 @@ std::vector<SlotState> Engine::slot_states() const {
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->frontend().media_cache_summary();
+}
+
+std::optional<CpuVisionStatus> Engine::cpu_vision_status() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    // The model and cache owner are fixed for this Engine's lifetime. The serving registry
+    // lease keeps them alive; only CpuVisionCache's own metadata lock is needed here.
+    if (!impl_->active || !impl_->active->model->cpu_vision()) { return std::nullopt; }
+    const auto snapshot = impl_->active->model->cpu_vision()->summary();
+    return CpuVisionStatus{.loading = snapshot.loading,
+                           .weight_bytes = snapshot.bytes,
+                           .active_encoders = snapshot.users,
+                           .load_count = snapshot.loads,
+                           .unload_count = snapshot.unloads,
+                           .last_load_seconds = snapshot.last_load_seconds,
+                           .idle_timeout_seconds = impl_->options.cpu_vision_idle_seconds};
 }
 
 RuntimeStats Engine::runtime_stats() const {

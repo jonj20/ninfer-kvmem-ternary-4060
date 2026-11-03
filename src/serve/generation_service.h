@@ -195,6 +195,10 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
+    [[nodiscard]] std::optional<ninfer::CpuVisionStatus> cpu_vision_status() const {
+        return engine_->cpu_vision_status();
+    }
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }

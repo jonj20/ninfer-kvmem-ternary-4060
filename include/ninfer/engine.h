@@ -188,6 +188,8 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    // Live CPU Vision cache metadata, independent of the execution lock. Empty when unsupported.
+    [[nodiscard]] std::optional<CpuVisionStatus> cpu_vision_status() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;

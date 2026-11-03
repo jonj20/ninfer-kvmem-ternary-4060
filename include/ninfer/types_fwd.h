@@ -131,6 +131,7 @@ struct NgramArchiveStats;
 // ninfer/observability/resources.h
 struct MediaCacheSummary;
 struct ArenaMemorySummary;
+struct CpuVisionStatus;
 struct VisionWorkspaceMemorySummary;
 struct DeviceMemorySummary;
 struct KvmemMemorySummary;
