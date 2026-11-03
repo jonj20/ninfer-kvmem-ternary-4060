@@ -53,6 +53,9 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
 #if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+    // Stored UE4M3 weight scales map 0x7F to zero, like the software table.
+    // Native E4M3 conversion would otherwise inject NaNs into the matrix product.
+    if (scale == 0x7Fu) { scale = 0; }
     // E2M1 times a finite E4M3 scale needs at most six significand bits, so the BF16 product is
     // exact and equals the FP32 expansion below.
     unsigned values, multiplier, result;
@@ -94,6 +97,7 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 __device__ __forceinline__ void nvfp4_scaled_quad_bf16(unsigned codes, std::uint8_t scale,
                                                        unsigned out[4]) {
 #if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+    if (scale == 0x7Fu) { scale = 0; }
     const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
     unsigned multiplier;
     asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));

@@ -213,10 +213,12 @@ set_tests_properties(ninfer_nvfp4_mode_binding PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_stage_runtime_dlls(ninfer_nvfp4_mode_binding)
 
 # Reuse the five relevant oracle objects without building unrelated test families.
+ninfer_add_op_test(ninfer_nvfp4_native_scale_test
+  SOURCES experimental/nvfp4_native_scale.cu LIBRARIES ninfer_ops)
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_nvfp4_fork_tests_PROGRAMS
   ninfer_linear_nvfp4_a16_test ninfer_linear_nvfp4_int8_test
   ninfer_linear_nvfp4_int8_fused_norm_test ninfer_linear_swiglu_nvfp4_test
-  ninfer_linear_add_nvfp4_test)
+  ninfer_linear_add_nvfp4_test ninfer_nvfp4_native_scale_test)
 ninfer_finalize_bundle(ninfer_nvfp4_fork_tests)
 ninfer_stage_runtime_dlls(ninfer_nvfp4_fork_tests)
 
