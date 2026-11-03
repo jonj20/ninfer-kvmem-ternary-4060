@@ -92,6 +92,10 @@ struct Options {
     bool prefill_cublas                 = false;
     bool prefill_cublas_projections     = true;
     bool fast_prefill_kernel            = false;
+    // NVFP4 W4A8 (int8 tensor cores): the family needs the model layer's admission flag, the same
+    // one the CLI exposes. Without it scoring silently runs the A16 route, which is a different
+    // numerical path and cannot answer a route-quality question.
+    bool nvfp4_w4a8_int                 = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -121,6 +125,8 @@ std::string usage_text() {
            "       (--no-prefill-a8 is the opposite: scoring runs the prefill phase, so this is\n"
            "        how the integer prefill routes' perplexity cost is measured)\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]] [--fast-prefill-kernel]\n"
+           "       [--nvfp4-w4a8-int]   (NVFP4 weights on the int8 tensor cores; --linear-routes\n"
+           "        is the NINFER_LINEAR_ROUTES env, legacy=own MMQ, unified=grouped mainloop)\n"
            "       (--prefill-cublas scores through the cuBLAS prefill route, which is how its\n"
            "        perplexity cost is measured; the projections flag keeps the attention and GDN\n"
            "        input projections off it)\n"
@@ -172,6 +178,8 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--fast-prefill-kernel") {
             out.fast_prefill_kernel = true;
+        } else if (option == "--nvfp4-w4a8-int") {
+            out.nvfp4_w4a8_int = true;
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -430,6 +438,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.prefill_cublas   = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
+    engine_options.nvfp4_w4a8_int             = options.nvfp4_w4a8_int;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer        = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));

@@ -44,12 +44,21 @@ enum class LinearPolicy : std::uint8_t {
     /// scales and per-token activation scales, where the integer route carries per-group ones -- so
     /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
     AllowPrefillCublas,
+    /// AllowA8Int's counterpart for block-scaled NVFP4 weights: the stored E2M1 codes widen
+    /// losslessly to s8 and feed the integer tensor cores with s8-quantised activations, one FP32
+    /// scale per (token, 32 columns) and the per-16 E4M3 weight scales rescaling in FP32. It is the
+    /// same A8-activation quality trade the Q4/Q5 integer routes carry, opt-in per engine with
+    /// --nvfp4-w4a8-int. Which mainloop answers follows the route table -- the own table runs MMQ,
+    /// the unified table runs the grouped ladder, and T <= 8 runs the MMVQ-shaped row-form kernel
+    /// under either -- so a calibrated band chooses it (the nvfp4_int8/* keys).
+    AllowNvfp4Int8,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
-           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowNvfp4Int8;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -64,6 +73,12 @@ enum class LinearPolicy : std::uint8_t {
 [[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
            policy == LinearPolicy::AllowPrefillCublas;
+}
+
+/// The NVFP4 int8-grouped route: the same activation trade as allows_a8_int, but for block-scaled
+/// NVFP4 weights against their stored E2M1/E4M3 planes, and never for any other weight format.
+[[nodiscard]] constexpr bool allows_nvfp4_int8(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowNvfp4Int8;
 }
 
 /// The cuBLAS prefill route. Only ever admitted past a width gate, because its dequantise pass is

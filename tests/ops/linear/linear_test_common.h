@@ -14,6 +14,9 @@ enum class ActivationCompute : std::uint8_t {
     A16,
     A8,
     A4,
+    // NVFP4 Tier-2 integer route: per-(token, 32) s8 activations with an FP32 scale plane
+    // against e2m1 weights with per-16 E4M3 group scales. Held to the A8 allowance.
+    Int8Grouped,
 };
 
 enum class CallForm : std::uint8_t {

@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -81,6 +82,18 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
         unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
         return;
     }
+    // This table registers no plain-Linear int8 route at all: an int8 call here would answer by
+    // running the A16 family, which is the hollow-green failure the family exists to avoid -- an
+    // "int8" run that never touched an int8 kernel. Which table a width resolves to is a property
+    // of the device profile's width bands (or NINFER_LINEAR_ROUTES), not of the flag, so the fix
+    // is configuration and the message says so rather than pretending to fall back. The fused
+    // NVFP4 ops are unaffected: each carries an int8 branch on both tables.
+    if (allows_nvfp4_int8(policy))
+        throw std::invalid_argument(
+            "nvfp4 linear: T=" + std::to_string(x.ne[1]) +
+            " resolves to the own (non-unified) shape table, which registers no plain-Linear int8 "
+            "route. Run with NINFER_LINEAR_ROUTES=unified, or widen the device profile's nvfp4 "
+            "width band to cover it");
     validate_nvfp4_weight(weight, "nvfp4 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
     const auto& shape = resolve_shape(weight.n, weight.k, policy);

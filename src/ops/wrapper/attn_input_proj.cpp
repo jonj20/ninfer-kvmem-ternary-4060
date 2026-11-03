@@ -18,6 +18,7 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -110,6 +111,9 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The NVFP4 int8-grouped route is a single-parent concern; its resolvers decide what this Op
+    // admits for it.
+    case LinearPolicy::AllowNvfp4Int8:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
@@ -176,8 +180,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     validate_policy(policy);
     policy = without_integer(policy);
     // The parent's rows are [query; key; gate; value].
-    if (workspace != nullptr && detail::sm70::covers(weight, x.ne[1]) &&
-        weight.n == 2 * q.ne[0] + 2 * k.ne[0] && gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
+    if (policy != LinearPolicy::AllowNvfp4Int8 && workspace != nullptr &&
+        detail::sm70::covers(weight, x.ne[1]) && weight.n == 2 * q.ne[0] + 2 * k.ne[0] &&
+        gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
         sm70_split(x, weight, {&q, &k, &gate, &v}, nullptr, {}, policy, *workspace, stream);
         return;
     }
@@ -314,6 +319,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     const auto routes = [&](std::int32_t lo, std::int32_t hi) {
         return single_parent_route_bytes(parent_qtype, parent_rows, input_rows, policy, lo, hi);
     };
+    // The NVFP4 int8 family keeps its own workspace on every tier.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
     return detail::sm70::capacity(parent_qtype, parent_rows, input_rows, min_tokens, max_tokens,
                                   without_integer(policy), routes);
 }
@@ -567,6 +574,42 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
     detail::validate_nvfp4_weight(projection_weight, "fused rmsnorm attn_input_proj");
     detail::nvfp4_attn_input_fused_rmsnorm_launch(residual, norm_weight, eps, projection_weight, q,
                                                   gate, k, v, workspace, stream);
+}
+
+bool attn_input_proj_fused_rmsnorm_int8_eligible(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the device-profile key, so a caller that
+    // skips its standalone rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::nvfp4_attn_input_int8_fused_norm_eligible(policy, tokens) &&
+           weight.qtype == QType::NVFP4 && weight.layout == QuantLayout::BlockScaleK16M128x4 &&
+           weight.n == 14336 && weight.k == 5120;
+}
+
+void attn_input_proj_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm_weight,
+                                        float eps, const Weight& projection_weight, Tensor& q,
+                                        Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!attn_input_proj_fused_rmsnorm_int8_eligible(projection_weight, policy, tokens)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: eps must be positive and finite");
+    }
+    require_matrix(residual, 5120, tokens, "residual");
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 16)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: invalid norm weight");
+    }
+    require_matrix(q, 6144, tokens, "q");
+    require_matrix(gate, 6144, tokens, "gate");
+    require_matrix(k, 1024, tokens, "k");
+    require_matrix(v, 1024, tokens, "v");
+    detail::validate_nvfp4_weight(projection_weight, "fused int8 attn_input_proj");
+    detail::unified::nvfp4_attn_input_int8_fused_norm_launch(
+        residual, norm_weight, eps, projection_weight, q, gate, k, v, workspace,
+        detail::Nvfp4Int8Mainloop::Grouped, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

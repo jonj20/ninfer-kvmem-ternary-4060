@@ -15,6 +15,7 @@
 #include "ops/linear/sm70/sm70_integer.h"
 #include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
@@ -24,6 +25,7 @@
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -41,6 +43,7 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    case LinearPolicy::AllowNvfp4Int8:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
@@ -154,7 +157,8 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     const auto routes = [&](std::int32_t lo, std::int32_t hi) {
         return linear_swiglu_route_workspace_bytes(qtype, gate_up_rows, input_rows, policy, lo, hi);
     };
-    // Every width of a dense format takes an sm_70 route there.
+    // Every width of a dense format takes an sm_70 route there, except the NVFP4 int8 family.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
     return detail::sm70::capacity(qtype, gate_up_rows, input_rows, min_tokens, max_tokens,
                                   sm70_policy(policy), routes);
 }
@@ -218,7 +222,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
-    if (detail::sm70::covers(gate_up_weight, t)) {
+    if (policy != LinearPolicy::AllowNvfp4Int8 && detail::sm70::covers(gate_up_weight, t)) {
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
             x, gate_up_weight.n, ws, stream,
@@ -364,6 +368,45 @@ std::size_t linear_swiglu_pair_workspace_capacity_bytes(QType gate_qtype, QType 
     const detail::GgufShape gate{gate_qtype, rows, input_rows};
     const detail::GgufShape up{up_qtype, rows, input_rows};
     return detail::gguf_swiglu_workspace_bytes(gate, &up, min_tokens, max_tokens);
+}
+
+bool linear_swiglu_fused_rmsnorm_int8_eligible(const Weight& gate_up_weight, LinearPolicy policy,
+                                               std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the device-profile key, so a caller that skips
+    // its standalone rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::nvfp4_linear_swiglu_int8_fused_norm_eligible(policy, tokens) &&
+           gate_up_weight.qtype == QType::NVFP4 &&
+           gate_up_weight.layout == QuantLayout::BlockScaleK16M128x4 && gate_up_weight.n == 34816 &&
+           gate_up_weight.k == 5120;
+}
+
+void linear_swiglu_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                      const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
+                                      WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!linear_swiglu_fused_rmsnorm_int8_eligible(gate_up_weight, policy, tokens)) {
+        throw std::invalid_argument("fused int8 linear_swiglu: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("fused int8 linear_swiglu: eps must be positive and finite");
+    }
+    if (residual.dtype != DType::BF16 || residual.ne[0] != 5120 || residual.ne[2] != 1 ||
+        residual.ne[3] != 1 || !residual.is_contiguous() || !aligned_to(residual.data, 16)) {
+        throw std::invalid_argument("fused int8 linear_swiglu: invalid residual");
+    }
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 16)) {
+        throw std::invalid_argument("fused int8 linear_swiglu: invalid norm weight");
+    }
+    if (out.dtype != DType::BF16 || out.ne[0] != gate_up_weight.n / 2 || out.ne[1] != tokens ||
+        out.ne[2] != 1 || out.ne[3] != 1 || !out.is_contiguous() || !aligned_to(out.data, 16)) {
+        throw std::invalid_argument("fused int8 linear_swiglu: invalid output");
+    }
+    (void)detail::validate_nvfp4_weight(gate_up_weight, "fused int8 linear_swiglu");
+    detail::unified::nvfp4_linear_swiglu_int8_fused_norm_launch(
+        residual, norm_weight, eps, gate_up_weight, out, workspace,
+        detail::Nvfp4Int8Mainloop::Grouped, stream);
 }
 
 } // namespace ninfer::ops

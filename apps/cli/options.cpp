@@ -259,9 +259,13 @@ std::string usage_text(const char* argv0) {
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
+           "  --nvfp4-w4a8-int              NVFP4 weights on int8 tensor cores (W4A8): the\n"
+           "                                stored E2M1 codes feed an s8 MMA mainloop, prefill\n"
+           "                                and decode alike; the route band picks MMQ (own)\n"
+           "                                or grouped (unified), T<=8 runs the row-form kernel\n"
            "  --nvfp4-w4a16                 on a native-FP4 card, run NVFP4 weights on the\n"
            "                                dequantising A16 routes instead of W4A4 (no-op\n"
-           "                                elsewhere)\n"
+           "                                elsewhere; wins over --nvfp4-w4a8-int)\n"
            "  --prefill-cublas              hand wide prefill GEMMs to cuBLAS: a large\n"
            "                                prefill speedup for a small perplexity cost;\n"
            "                                wants a larger --prefill-chunk\n"
@@ -522,6 +526,8 @@ Options parse_options(int argc, char** argv) {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+        } else if (arg == "--nvfp4-w4a8-int") {
+            options.nvfp4_w4a8_int = true;
         } else if (arg == "--nvfp4-w4a16") {
             options.nvfp4_w4a16 = true;
         } else if (arg == "--lookup-ngram") {

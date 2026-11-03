@@ -13,7 +13,7 @@
 
 namespace ninfer::ops::detail::unified {
 
-// The ue4m3 scale table for the A16 decode path, expanded from the shared scale list
+// The ue4m3 scale table for the A16 decode path, expanded from the same list the int8 routes use
 // (nvfp4_e4m3_scale.h). Over the reachable domain 0x00..0x7E every entry is exactly half the vendor
 // __nv_fp8x2_e4m3 value; both users below compensate with a power-of-two fold (2^15), so every
 // product stays bit-identical.

@@ -1,5 +1,7 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_int8_grouped.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_int8_fused_norm_quant.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
@@ -16,6 +18,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408_unified.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n8192_k4096_unified.cu"
 )
 
 if(TARGET ninfer_nvfp4_non_rdc)

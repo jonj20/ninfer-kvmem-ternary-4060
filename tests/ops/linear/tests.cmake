@@ -54,6 +54,19 @@ ninfer_add_op_test(ninfer_linear_nvfp4_a4_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a4.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+# The int8 route's own gates: the E4M3 scale table against a software reference, the workspace
+# envelopes of both mainloops, the generic-geometry admission, and the grouped-vs-MMQ byte grid
+# that puts the two wide mainloops back to back.
+ninfer_add_op_test(ninfer_linear_nvfp4_int8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_int8.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+# The [RMSNorm -> int8 quantise] edge kernel against the two launches it replaces: plane bytes,
+# narrow-band route bytes, and two negative controls that prove the comparisons have teeth.
+ninfer_add_op_test(ninfer_linear_nvfp4_int8_fused_norm_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_int8_fused_norm.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 # Back-to-back TMA staging race probe for both the plain Linear and fused LinearSwiGLU routes:
 # distinct weights fired without inter-launch sync, each checked against an isolated reference.
 ninfer_add_op_test(ninfer_nvfp4_tma_staging_race_test

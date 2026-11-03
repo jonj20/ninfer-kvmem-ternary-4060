@@ -12,7 +12,8 @@
 
 namespace ninfer::ops::detail {
 
-// The ue4m3 scale table for the A16 group coefficient, expanded from the shared scale list (nvfp4_e4m3_scale.h) and read as a 1KB constant table. Over the reachable domain 0x00..0x7E
+// The ue4m3 scale table for the A16 group coefficient, expanded from the same list the int8 routes
+// use (nvfp4_e4m3_scale.h) and read as a 1KB constant table. Over the reachable domain 0x00..0x7E
 // every entry is exactly half the vendor __nv_fp8x2_e4m3 value; the coefficient folds 2^15 to
 // compensate, so the product stays bit-identical.
 __device__ constexpr float kNvfp4E4M3ScaleA16[256] = {

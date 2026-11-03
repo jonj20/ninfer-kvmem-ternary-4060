@@ -94,6 +94,7 @@ T2Launch select_t2_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    case LinearPolicy::AllowNvfp4Int8: // never admitted by a T2 weight; reads as A16
     case LinearPolicy::AllowPrefillCublas:
         return select_t2_a16_launch(n, k, t);
     case LinearPolicy::AllowA4:

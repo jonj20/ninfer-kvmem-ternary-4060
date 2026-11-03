@@ -4,6 +4,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -13,8 +14,15 @@ namespace ninfer::ops::detail {
 
 namespace {
 
-// The device-profile key this plan consults: the A16 chain's.
-constexpr const char* kRouteKeyA16 = "unified/nvfp4_linear_add";
+// The device-profile key this plan consults: the A16 chain's, or the int8 family's own. The int8
+// band chooses which chain's mainloop answers (own = MMQ, unified = grouped), and keeping it
+// separate means calibrating it does not have to share a band with the A16 chain choice.
+constexpr const char* kRouteKeyA16  = "unified/nvfp4_linear_add";
+constexpr const char* kRouteKeyInt8 = "nvfp4_int8/linear_add";
+
+constexpr const char* route_key(LinearPolicy policy) {
+    return policy == LinearPolicy::AllowNvfp4Int8 ? kRouteKeyInt8 : kRouteKeyA16;
+}
 
 // Widest token count this line's own small-T launcher is instantiated for: its table in
 // nvfp4_linear_add_small_t.cu is make_index_sequence<32 - 2 + 1>, indexed by tokens - 2 with no
@@ -26,6 +34,7 @@ namespace {
 
 enum class Nvfp4LinearAddRoute : std::uint8_t {
     A16,
+    Int8Grouped,
     W4A4,
 };
 
@@ -37,6 +46,11 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
         allows_a8_int(policy)) {
         return Nvfp4LinearAddRoute::A16;
+    }
+    if (policy == LinearPolicy::AllowNvfp4Int8) {
+        // --nvfp4-w4a8-int registers this policy and nothing else switches the family, so the
+        // call takes int8 at every width. This table runs MMQ; the unified table runs grouped.
+        return Nvfp4LinearAddRoute::Int8Grouped;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
     const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
@@ -55,6 +69,9 @@ static std::size_t nvfp4_linear_add_workspace_capacity_bytes_own(std::int32_t ou
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     const Nvfp4LinearAddRoute widest = resolve_route(output_rows, input_rows, policy, max_tokens);
+    if (widest == Nvfp4LinearAddRoute::Int8Grouped) {
+        return unified::nvfp4_int8_grouped_workspace_bytes(max_tokens, input_rows);
+    }
     return widest == Nvfp4LinearAddRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -66,7 +83,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                       std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table(kRouteKeyA16, width); },
+        [policy](std::int32_t width) { return fused_route_table(route_key(policy), width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::nvfp4_linear_add_workspace_capacity_bytes(
@@ -79,9 +96,14 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    if (fused_route_table(kRouteKeyA16, x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table(route_key(policy), x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_add_dispatch(x, weight, residual, unified_policy(policy), workspace,
                                            stream);
+        return;
+    }
+    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::Int8Grouped) {
+        unified::nvfp4_linear_add_int8_launch(x, weight, residual, workspace,
+                                              Nvfp4Int8Mainloop::Mmq, stream);
         return;
     }
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {

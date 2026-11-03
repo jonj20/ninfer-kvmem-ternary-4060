@@ -233,6 +233,14 @@ ninfer_add_op_test(ninfer_gdn_input_proj_parts_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_parts.cpp"
   LIBRARIES ninfer_ops)
 
+# The int8-grouped wrapper routes against real artifact weights; skips unless
+# NINFER_NVFP4_INT8_REAL_FIXTURE points at a fixture from
+# tests/fixtures/nvfp4_int8_real/generate_fixture.py.
+ninfer_add_op_test(ninfer_nvfp4_int8_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_int8_real.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_nvfp4_int8_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

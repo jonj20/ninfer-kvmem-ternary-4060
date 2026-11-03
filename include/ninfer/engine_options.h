@@ -625,6 +625,12 @@ struct EngineOptions {
     // permission to A16Only, so the flag is a no-op there: it only ever trades A4 away and never
     // introduces a compute domain the card lacks.
     bool nvfp4_w4a16                       = false;
+    // NVFP4 weights on the integer tensor cores with s8-quantised activations (W4A8), prefill and
+    // decode alike: the same activation trade the Q4/Q5 integer routes carry, opt-in per engine.
+    // Which wide mainloop answers follows the route profile's nvfp4_int8/* bands; T <= 8 runs the
+    // row-form kernel under either chain. On a native-FP4 card it replaces the A4 permission.
+    // Where both this and nvfp4_w4a16 are set, nvfp4_w4a16 wins.
+    bool nvfp4_w4a8_int                    = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

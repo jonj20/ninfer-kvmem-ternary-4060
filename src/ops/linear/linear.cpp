@@ -87,14 +87,14 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 // The sm_70 routes take every dense format, into BF16 or an FP32 partial sum; they are this Op's
 // only routes that read the panel layout. Without an arena, the widths that need none.
-bool sm70_route(const Tensor& x, const Weight& w, const WorkspaceArena* workspace) {
-    return detail::sm70::covers(w, x.ne[1]) &&
+bool sm70_route(const Tensor& x, const Weight& w, LinearPolicy policy, const WorkspaceArena* workspace) {
+    return policy != LinearPolicy::AllowNvfp4Int8 && detail::sm70::covers(w, x.ne[1]) &&
            (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (sm70_route(x, w, workspace)) {
+    if (sm70_route(x, w, policy, workspace)) {
         detail::sm70::Destination all{nullptr, w.n, 0, 0, w.n, false};
         if (out.dtype == DType::FP32) {
             all.fp32 = static_cast<float*>(out.data);
@@ -235,7 +235,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     const auto routes = [&](std::int32_t lo, std::int32_t hi) {
         return linear_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
     };
-    // Every width of a dense format takes an sm_70 route there.
+    // Every width of a dense format takes an sm_70 route there, except the NVFP4 int8 family.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
     return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
                                   routes);
 }

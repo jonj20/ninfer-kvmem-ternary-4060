@@ -195,7 +195,8 @@ std::optional<LinearRouteTable> scoped_nvfp4_table() {
     return scoped;
 }
 
-// True for every fused key this family owns: the A16 plans pass "unified/nvfp4_<op>". Other families' keys must keep their calibrated schedule, so the
+// True for every fused key this family owns: the A16 plans pass "unified/nvfp4_<op>", the int8
+// plans pass "nvfp4_int8/<op>". Other families' keys must keep their calibrated schedule, so the
 // optional "unified/" prefix is stripped before the match.
 bool is_nvfp4_fused_key(std::string_view key) {
     constexpr std::string_view kUnifiedPrefix = "unified/";

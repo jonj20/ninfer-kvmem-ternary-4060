@@ -1056,15 +1056,17 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
-// The NVFP4 fused projections: the A16 chain choice under the four `unified/nvfp4_*` keys,
-// measured through the same dispatch the serving call takes, so the route table under test
-// decides the kernel in both arms.
+// The NVFP4 fused projections: the A16 chain choice under the four `unified/nvfp4_*` keys, and the
+// mainloop choice of the int8 family under the four `nvfp4_int8_*` keys (--nvfp4-w4a8-int). Both
+// families are measured through the same dispatch the serving call takes, so the route table under
+// test decides the kernel in both arms.
 //
 // Under A16Only every chain is registered at every width a fused launch serves, so the A16 keys
 // are a W4A16 chain choice and nothing else: the own chain's per-width kernels against the unified
 // chain's own, which is a 32-token tiling loop against one launch at prefill widths and two
 // distinct small-T kernel families below them. Past 16 columns both chains resolve to the same wide
 // fused A16 MMA kernel, so the SwiGLU A16 key stops there: above it there is no switch to measure.
+// The int8 keys cover every width -- that family pads rather than stopping at 16.
 void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
                            const CalibrationOptions& options) {
     // A card that cannot select the unified table has no switch onto it to measure.
@@ -1087,8 +1089,9 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
     DeviceBuffer z_plane    = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
     DeviceBuffer residual   = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer swiglu_out = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
-    // The row feeding an input projection is the RMSNorm of the residual; the buffers hold the
-    // norm's weight and the BF16 normed row.
+    // The row feeding an input projection is the RMSNorm of the residual, and the int8 route can
+    // fold that norm into its own quantise pass. Both halves of the comparison therefore need the
+    // norm's weight and the BF16 row the non-folding arm writes.
     DeviceBuffer norm_weight        = bf16_buffer(static_cast<std::size_t>(hidden));
     DeviceBuffer x_normed           = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     constexpr float kNormEps        = 1e-6F;
@@ -1115,6 +1118,25 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
         Tensor gate_out = tensor(gate, 6144, cols);
         Tensor k_out    = tensor(k_plane, 1024, cols);
         Tensor v_out    = tensor(v_plane, 1024, cols);
+        // Under the int8 policy the timed region is the edge: if the fused entry is eligible under
+        // the route state this candidate is timed in it runs, otherwise the standalone rmsnorm is
+        // issued first. Both arms are charged for what they really pay, and an A16 arm is a bare
+        // projection because both of its sides pay the same norm.
+        if (policy == ops::LinearPolicy::AllowNvfp4Int8) {
+            Tensor normed = tensor(x_normed, hidden, cols);
+            if (ops::attn_input_proj_fused_rmsnorm_int8_eligible(attn.weight, policy, cols)) {
+                ops::attn_input_proj_fused_rmsnorm_int8(tensor(residual, hidden, cols),
+                                                        tensor(norm_weight, hidden, 1), kNormEps,
+                                                        attn.weight, q_out, gate_out, k_out, v_out,
+                                                        policy, workspace, stream);
+                return;
+            }
+            ops::rmsnorm(tensor(residual, hidden, cols), tensor(norm_weight, hidden, 1), kNormEps,
+                         true, normed, stream);
+            ops::detail::nvfp4_attn_input_dispatch(normed, attn.weight, q_out, gate_out, k_out,
+                                                   v_out, policy, &workspace, stream);
+            return;
+        }
         ops::detail::nvfp4_attn_input_dispatch(tensor(x_hidden, hidden, cols), attn.weight, q_out,
                                                gate_out, k_out, v_out, policy, &workspace, stream);
     };
@@ -1140,6 +1162,20 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
                                 cudaStream_t stream) {
         auto scope = workspace.scope();
         Tensor o   = tensor(swiglu_out, 17408, cols);
+        if (policy == ops::LinearPolicy::AllowNvfp4Int8) {
+            Tensor normed = tensor(x_normed, hidden, cols);
+            if (ops::linear_swiglu_fused_rmsnorm_int8_eligible(gate_up.weight, policy, cols)) {
+                ops::linear_swiglu_fused_rmsnorm_int8(tensor(residual, hidden, cols),
+                                                      tensor(norm_weight, hidden, 1), kNormEps,
+                                                      gate_up.weight, o, policy, workspace, stream);
+                return;
+            }
+            ops::rmsnorm(tensor(residual, hidden, cols), tensor(norm_weight, hidden, 1), kNormEps,
+                         true, normed, stream);
+            ops::detail::nvfp4_linear_swiglu_dispatch(normed, gate_up.weight, o, policy, workspace,
+                                                      stream);
+            return;
+        }
         ops::detail::nvfp4_linear_swiglu_dispatch(tensor(x_hidden, hidden, cols), gate_up.weight, o,
                                                   policy, workspace, stream);
     };
@@ -1163,12 +1199,27 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
         {"unified/nvfp4_linear_swiglu", small_t_widths,
          bind_policy(swiglu_run, ops::LinearPolicy::A16Only), view(swiglu_out, 17408), {}},
     };
-    for (const Family& family : families) {
-        auto bands = sweep(family, timer, options);
-        if (!bands.empty()) {
-            profile.routes[family.key] = std::move(bands);
-            ops::install_device_route_profile(
-                std::make_shared<const ops::DeviceRouteProfile>(profile));
+    // The int8 family's own four keys: the same weights and buffers, only the policy differs, so
+    // the sweep measures which chain's int8 mainloop answers at each width.
+    const std::vector<Family> int8_families = {
+        {"nvfp4_int8/attn_input", widths,
+         bind_policy(attn_run, ops::LinearPolicy::AllowNvfp4Int8), view(q, 6144), {}},
+        {"nvfp4_int8/gdn_input", widths,
+         bind_policy(gdn_run, ops::LinearPolicy::AllowNvfp4Int8), view(qkv, 10240), {}},
+        {"nvfp4_int8/linear_add", widths,
+         bind_policy(add_run, ops::LinearPolicy::AllowNvfp4Int8), view(residual, hidden),
+         reset_residual},
+        {"nvfp4_int8/linear_swiglu", widths,
+         bind_policy(swiglu_run, ops::LinearPolicy::AllowNvfp4Int8), view(swiglu_out, 17408), {}},
+    };
+    for (const auto* set : {&families, &int8_families}) {
+        for (const Family& family : *set) {
+            auto bands = sweep(family, timer, options);
+            if (!bands.empty()) {
+                profile.routes[family.key] = std::move(bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
         }
     }
 }

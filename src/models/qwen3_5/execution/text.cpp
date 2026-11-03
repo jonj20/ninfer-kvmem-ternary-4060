@@ -926,13 +926,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
+    // The integer route carries the same edge: one pass over the residual row produces the s8 codes
+    // and per-32 scales the grouped or narrow mainloop reads, so the rmsnorm below is skipped
+    // rather than run and then re-read. The policies are disjoint, and the band decides the width.
+    const bool fused_int8 = !fused_nvfp4 && input_basis == InputBasis::Primal && single != nullptr &&
+                            ops::attn_input_proj_fused_rmsnorm_int8_eligible(
+                                single->weight, single->policy, T);
     Tensor h;
-    if (!fused_nvfp4) {
+    if (!fused_nvfp4 && !fused_int8) {
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
         ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
-    } else if (!fused_nvfp4) {
+    } else if (!fused_nvfp4 && !fused_int8) {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
@@ -952,6 +958,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
                                                  single->policy, work_, s);
+    } else if (fused_int8) {
+        ops::attn_input_proj_fused_rmsnorm_int8(x, w.input_norm, config_.rms_norm_eps,
+                                                single->weight, q_flat, gate_flat, k_flat, v_flat,
+                                                single->policy, work_, s);
     } else {
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }
@@ -1357,14 +1367,35 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated, false, experts_, residual_partial_);
+            InputBasis::Rotated, false, experts_, nullptr, residual_partial_);
+        return;
+    }
+    // The integer gate_up route normalises while it quantises, so the BF16 normed row never exists:
+    // the residual goes into the FFN un-normed and carries the norm with it. The predicate is the one
+    // the projection itself asks, evaluated with the policy this phase will pass down.
+    const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
+    const bool fused_int8 =
+        dense != nullptr && !dense->up.has_value() &&
+        ops::linear_swiglu_fused_rmsnorm_int8_eligible(
+            dense->gate_up.weight,
+            phase == Phase::Verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
+            static_cast<std::int32_t>(x.ne[1]));
+    const bool wide =
+        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1]));
+    if (fused_int8) {
+        // The share writes the row it is given and the all-reduce sums those shares, so a deferred
+        // norm has nowhere to go here. Refuse the combination instead of answering from x.
+        if (residual_partial_ != nullptr) {
+            throw std::logic_error("FFN: the fused int8 input norm has no tensor-parallel share");
+        }
+        const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
+        ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
+            InputBasis::Primal, wide, experts_, &norm, nullptr);
         return;
     }
     ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-        InputBasis::Primal,
-        wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1])), experts_,
-        residual_partial_);
+        InputBasis::Primal, wide, experts_, nullptr, residual_partial_);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {

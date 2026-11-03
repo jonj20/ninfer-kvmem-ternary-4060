@@ -12,6 +12,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a16_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_int8_grouped.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"

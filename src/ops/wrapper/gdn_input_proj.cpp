@@ -311,6 +311,9 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The NVFP4 int8-grouped route is a single-parent concern; its resolvers decide what this Op
+    // admits for it.
+    case LinearPolicy::AllowNvfp4Int8:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.

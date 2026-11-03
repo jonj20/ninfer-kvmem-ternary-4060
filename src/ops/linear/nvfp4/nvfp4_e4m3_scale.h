@@ -51,8 +51,8 @@ constexpr float ue4m3_to_fp32(unsigned byte) {
 
 #define NINFER_E4M3_SCALE_VALUE(n) ::ninfer::ops::detail::nvfp4::ue4m3_to_fp32(n)
 
-// One entry per byte, in byte order. The host table below and the device-side tables expand
-// this list, so they cannot drift apart.
+// One entry per byte, in byte order. Both the host table below and the device table in
+// nvfp4_int8_grouped_mma.cuh expand this list, so the two cannot drift apart.
 #define NINFER_E4M3_SCALE_LIST(V)                                                               \
     V(0), V(1), V(2), V(3), V(4), V(5), V(6), V(7),                                           \
     V(8), V(9), V(10), V(11), V(12), V(13), V(14), V(15),                                     \

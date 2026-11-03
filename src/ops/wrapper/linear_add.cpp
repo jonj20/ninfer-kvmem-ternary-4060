@@ -93,6 +93,7 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    case LinearPolicy::AllowNvfp4Int8:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
@@ -219,7 +220,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     const auto routes = [&](std::int32_t lo, std::int32_t hi) {
         return linear_add_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
     };
-    // Every width of a dense format takes an sm_70 route there.
+    // Every width of a dense format takes an sm_70 route there, except the NVFP4 int8 family.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
     return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
                                   routes);
 }
@@ -245,7 +247,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (detail::sm70::covers(w, t)) {
+    if (policy != LinearPolicy::AllowNvfp4Int8 && detail::sm70::covers(w, t)) {
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
             x, w.n, ws, stream, detail::sm70::integer_takes(w, t, policy));

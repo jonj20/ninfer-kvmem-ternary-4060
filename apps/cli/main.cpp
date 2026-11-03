@@ -415,6 +415,7 @@ int main(int argc, char** argv) {
         engine_options.cuda_memory_probe_step_bytes = cli.cuda_memory_probe_step_bytes;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.nvfp4_w4a8_int           = cli.nvfp4_w4a8_int;
         engine_options.nvfp4_w4a16              = cli.nvfp4_w4a16;
         engine_options.prefill_cublas           = cli.prefill_cublas;
         engine_options.prefill_cublas_projections = cli.prefill_cublas_projections;

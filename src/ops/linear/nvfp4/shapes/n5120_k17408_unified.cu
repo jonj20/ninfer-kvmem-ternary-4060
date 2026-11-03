@@ -56,5 +56,7 @@ bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 8; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N5120K17408{5120, 17408, launch_a16, launch_nvfp4_a4<select_a4>,
-                                         uses_a4};
+                                         uses_a4,
+                                         nvfp4_linear_int8_grouped_launch,
+                                         nvfp4_linear_int8_tokens_supported};
 } // namespace ninfer::ops::detail::unified

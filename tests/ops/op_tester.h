@@ -18,6 +18,7 @@
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "cuda_availability.h"
 #include "ops/common/device_tier.h"
+#include "ops/linear/nvfp4/nvfp4_int8_route.h"
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -31,6 +32,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -414,5 +416,24 @@ inline int verify_reduction(std::string_view label, std::span<const double> got,
               << " reference=" << stats.reference_at_maximum << '\n';
     return 1;
 }
+
+// Pin the NVFP4 int8 wide mainloop for one scope. Two reasons a harness needs it rather than the
+// route table alone: (1) the table is what the device profile calibrates, so a case can hold the
+// table's answer while still asking for the other mainloop; (2) the narrow band below the crossover,
+// which runs the legacy chain's port or the unified chain's own narrow kernel by the same answer. So
+// a profile that claims an integer-quantized activation path has to say which kernel it means;
+// otherwise the harness moves with the table and reports green for a kernel that never ran.
+// Nesting-safe: whatever was in force is restored on scope exit.
+class ScopedNvfp4Int8Mainloop {
+public:
+    explicit ScopedNvfp4Int8Mainloop(ops::detail::Nvfp4Int8Mainloop mainloop)
+        : previous_(ops::detail::force_nvfp4_int8_mainloop(mainloop)) {}
+    ~ScopedNvfp4Int8Mainloop() { ops::detail::force_nvfp4_int8_mainloop(previous_); }
+    ScopedNvfp4Int8Mainloop(const ScopedNvfp4Int8Mainloop&)            = delete;
+    ScopedNvfp4Int8Mainloop& operator=(const ScopedNvfp4Int8Mainloop&) = delete;
+
+private:
+    std::optional<ops::detail::Nvfp4Int8Mainloop> previous_;
+};
 
 } // namespace ninfer::test

@@ -846,6 +846,7 @@ std::string format_server_start_json(
         {"auto_resume", engine_options.suspend.auto_resume},
         {"mlp_a8_decode", engine_options.mlp_a8_decode},
         {"prefill_a8", engine_options.prefill_a8},
+        {"nvfp4_w4a8_int", engine_options.nvfp4_w4a8_int},
         {"nvfp4_w4a16", engine_options.nvfp4_w4a16},
         {"prefix_reuse", options.allow_prefix_reuse},
         {"speculative_backend",

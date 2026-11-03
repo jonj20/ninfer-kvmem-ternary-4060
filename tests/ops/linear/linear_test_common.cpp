@@ -48,6 +48,11 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
+    case ActivationCompute::Int8Grouped:
+        // Both operands are integer-quantized (s8 activations at one scale per (token, 32)
+        // block, e2m1 weights at one E4M3 scale per 16 columns), the same structure the A8
+        // allowance was sized for, so the same criterion applies.
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
