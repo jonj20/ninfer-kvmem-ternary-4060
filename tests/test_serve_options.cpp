@@ -156,7 +156,7 @@ int run_serve_option_tests() {
                                "--kvmem-lrfu", "--no-kvmem-lrfu", "--kvmem-disk-mib", "0"});
         failures += check(on.kvmem.selected_tokens == 32768 && on.kvmem.reserve_tokens == 1024 &&
                           on.kvmem.host_bytes == (16384ULL << 20) && on.kvmem.retained_sessions == 4 &&
-                          !on.kvmem.lrfu && !on.kvmem.disk_bytes,
+                          !on.kvmem.lrfu && !on.kvmem.disk_bytes && on.prefill_chunk == 1024,
                           "shared KVMem defaults or explicit off switches were lost");
         for (const auto& args : std::vector<std::vector<std::string>>{
                 {"--no-kvmem", "--kvmem-budget", "128"}, {"--kvmem-budget", "0"},
@@ -190,6 +190,27 @@ int run_serve_option_tests() {
         "--kvmem-budget", "384", "--kvmem-gen-reserve", "128", "--kvmem-host-mib", "16384"};
     const auto kvmem = parse(memory_args);
     const auto kvmem_engine = make_engine_options(kvmem);
+    {
+        const auto boundary = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--max-context", "256",
+            "--kvmem-budget", "129", "--kvmem-gen-reserve", "129", "--prefill-chunk", "128"}));
+        failures += check(boundary.kvmem.selected_tokens == 128 && boundary.kvmem.reserve_tokens == 128 &&
+            boundary.kv_capacity.explicit_tokens == 256,
+            "context admission must use the aligned B+R rather than rejecting the requested sum");
+    }
+    {
+        auto args = memory_args;
+        args.insert(args.end(), {"--prefill-chunk", "0"});
+        failures += check(parse(args).prefill_chunk == 128,
+            "automatic prefill must resolve the engine default within Reserve");
+    }
+    {
+        auto args = memory_args;
+        args.insert(args.end(), {"--kvmem-budget", "385", "--kvmem-gen-reserve", "193", "--prefill-chunk", "999"});
+        const auto normalized = make_engine_options(parse(args));
+        failures += check(normalized.kvmem.selected_tokens == 384 && normalized.kvmem.reserve_tokens == 192 &&
+            normalized.prefill_chunk == 128 && normalized.kv_capacity.explicit_tokens == 576,
+            "KVMem normalization must precede capacity derivation and clamp prefill to aligned R");
+    }
     for (const auto& scorer : {std::string("page-softmax"), std::string("meanq-cosine")}) {
         for (const auto& aggregation : {std::string("mean"), std::string("max")}) {
             auto args = memory_args;
@@ -242,7 +263,7 @@ int run_serve_option_tests() {
     failures += check(kvmem.allow_prefix_reuse && !kvmem_engine.context_cache.enabled &&
         kvmem_engine.kvmem.selected_tokens == 384 && kvmem_engine.kvmem.reserve_tokens == 128 &&
         kvmem_engine.kvmem.host_bytes == (16ULL << 30) &&
-        kvmem_engine.kvmem.sink_tokens == 0 && kvmem_engine.kvmem.recent_tokens == 64 &&
+        kvmem_engine.kvmem.sink_tokens == 64 && kvmem_engine.kvmem.recent_tokens == 64 &&
         kvmem_engine.kvmem.sink_blocks() == 1 && kvmem_engine.kvmem.recent_blocks() == 1 &&
         kvmem_engine.kv_capacity.explicit_tokens == 512,
         "KVMem budgets or independent history reuse were not mapped to Engine");
@@ -252,7 +273,7 @@ int run_serve_option_tests() {
         std::replace(args.begin(), args.end(), std::string("384"), std::string("2048"));
         args.insert(args.end(), {"--kvmem-sink-tokens", "100", "--kvmem-recent-tokens", "1024"});
         const auto kept = make_engine_options(parse(args)).kvmem;
-        failures += check(kept.sink_tokens == 100 && kept.sink_blocks() == 1 &&
+        failures += check(kept.sink_tokens == 64 && kept.sink_blocks() == 1 &&
             kept.recent_tokens == 1024 && kept.recent_blocks() == 16,
             "KVMem sink/recent did not round down to 64-token pages");
     }
@@ -335,8 +356,8 @@ int run_serve_option_tests() {
     }
     for (const auto& extra : std::vector<std::vector<std::string>>{
              {"--kv-capacity", "1024"}, {"--max-concurrency", "9"},
-             {"--kvmem-budget", "385"}, {"--kvmem-host-mib", "0"},
-             {"--prefill-chunk", "256"}, {"--kvmem-host-mib", "18446744073709551615"}}) {
+             {"--kvmem-budget", "127"}, {"--kvmem-host-mib", "0"},
+             {"--prefill-chunk", "127"}, {"--kvmem-host-mib", "18446744073709551615"}}) {
         auto args = memory_args; args.insert(args.end(), extra.begin(), extra.end());
         bool rejected = false;
         try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }

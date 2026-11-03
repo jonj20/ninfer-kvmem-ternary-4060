@@ -3,6 +3,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "kvmem/cli_options.h"
+#include "kvmem/token_options.hpp"
 #include "runtime/speculative_limits.h"
 #include "product/cuda_memory_options.h"
 #include "product/post_thinking_options.h"
@@ -117,7 +118,7 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "MODEL & CONTEXT\n"
            "  --kvmem / --no-kvmem          enable/disable KVMem (default off; positive B enables)\n"
-           "  --kvmem-budget N              positive selected history B (default 32768), aligned to 64\n"
+           "  --kvmem-budget N              positive selected history B (default 32768), rounded down to 64\n"
            "  --kvmem-query-replay-max-tokens N  bound complete Query replay (default 2048)\n"
             "  --kvmem-query-scorer NAME    page-softmax (default) | meanq-cosine\n"
             "  --kvmem-score-agg MODE       mean | max (default: page-softmax mean, cosine max)\n"
@@ -127,7 +128,7 @@ std::string serve_usage_text(const char* argv0) {
             "  --kvmem-graph-alpha X        Query propagation in [0,1] (default: page-softmax 0.2; cosine 0)\n"
             "  --kvmem-capabilities         Print model-free console capability JSON and exit\n"
            "  --kvmem-query-max-tokens N  cap per-token Query capture to its tail (default 512)\n"
-            "  --kvmem-gen-reserve N         positive append workspace R (default 1024), aligned to 64\n"
+            "  --kvmem-gen-reserve N         positive append workspace R (default 1024), rounded down to 64\n"
            "  --kvmem-host-mib N            positive Host native KV payload budget H, MiB (default 16384)\n"
            "  --kvmem-sink-tokens N         always-kept prefix; default 0 = one 64-token\n"
            "                                page; positive values round down, minimum one page\n"
@@ -150,7 +151,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
-           "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
+           "  --prefill-chunk N             prefill chunk in tokens, rounded down to 128 (and KVMem R)\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
@@ -1744,6 +1745,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                     "' does not name a --graft");
     }
     memory.resolve();
+    if (memory.enabled) {
+        kvmem::normalize_memory_tokens(memory.budget, memory.gen_reserve, memory.sink_tokens,
+                                      memory.recent_tokens, 64, false, false);
+        // Zero selects the device-resident engine default. Resolve it before applying R.
+        const auto requested_prefill = options.prefill_chunk ? options.prefill_chunk : 1024U;
+        options.prefill_chunk = kvmem::normalize_prefill(requested_prefill, memory.gen_reserve, 128);
+    } else if (options.prefill_chunk) {
+        options.prefill_chunk = kvmem::normalize_prefill(options.prefill_chunk, options.prefill_chunk, 128);
+    }
     options.kvmem.selected_tokens = memory.budget;
     options.kvmem.reserve_tokens = memory.gen_reserve;
     options.kvmem.host_bytes = static_cast<std::size_t>(memory.payload_host_bytes);
