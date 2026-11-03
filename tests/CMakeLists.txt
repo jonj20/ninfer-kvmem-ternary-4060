@@ -235,3 +235,8 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_ptq1_tests_PROGRAMS
   ninfer_linear_topk_test ninfer_linear_t2_a16_test ninfer_linear_t2_a8_test)
 ninfer_finalize_bundle(ninfer_ptq1_tests)
 ninfer_stage_runtime_dlls(ninfer_ptq1_tests)
+
+# Focused serving contract bundle; does not pull in GPU numerical tests.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_monitor_tests_PROGRAMS ninfer_openai_schema_test)
+ninfer_finalize_bundle(ninfer_monitor_tests)
+ninfer_stage_runtime_dlls(ninfer_monitor_tests)

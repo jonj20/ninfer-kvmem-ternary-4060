@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 #include "serve/openai_chat.h"
+#include "serve/kvmem_metrics.h"
 #include "kvmem/monitor.hpp"
 #include "kvmem/monitor_hardware.hpp"
 #include "serve/slot_files.h"
@@ -385,12 +386,7 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    const auto cached = std::min<int>(outcome.prompt_tokens, outcome.metrics.prefix_cache_hit_tokens);
-    const auto native_timings = completion_timings_json(outcome);
-    monitor_->update(std::to_string(context.id), {{"prompt_tokens", outcome.prompt_tokens}, {"cached_tokens", cached},
-        {"generated_tokens", outcome.completion_tokens},
-        {"prefill_tps", native_timings.at("prompt_per_second")},
-        {"decode_tps", native_timings.at("predicted_per_second")}});
+    monitor_->update(std::to_string(context.id), kvmem_monitor_outcome(outcome));
     monitor_->finish(std::to_string(context.id), "completed");
     request_jsonl_.write_request_done(context, outcome);
     metrics_.record_done(outcome);
@@ -400,6 +396,8 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
+    monitor_->update(std::to_string(context.id), {{"finish_reason",
+        failure.classification == RequestFailureClass::ClientDisconnected ? "disconnect" : "error"}});
     monitor_->finish(std::to_string(context.id), failure.classification == RequestFailureClass::ClientDisconnected ? "disconnected" : "error");
     request_jsonl_.write_request_error(context, failure.machine_message);
     metrics_.record_failure();

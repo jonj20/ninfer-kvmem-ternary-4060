@@ -1,4 +1,5 @@
 #include "serve/generation_service.h"
+#include "serve/kvmem_metrics.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/structured_output.h"
@@ -1237,6 +1238,34 @@ OpenAIChatResponseIdentity identity() {
     return OpenAIChatResponseIdentity{.id = "chatcmpl-test", .model = "qwen", .created = 42};
 }
 
+int test_monitor_outcome() {
+    int failures = 0;
+    auto outcome = sample_outcome();
+    outcome.metrics.ttft_seconds = 0.8;
+    outcome.metrics.prompt_wall_seconds = 0.2;
+    outcome.metrics.generation_wall_seconds = 0.3;
+    outcome.metrics.speculative_backend = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_draft_tokens = 40;
+    outcome.metrics.speculative_accepted_tokens = 25;
+    outcome.metrics.ngram_drafted_tokens = 10;
+    outcome.metrics.ngram_accepted_tokens = 5;
+    outcome.finish_reason = ninfer::FinishReason::OutputLimit;
+    outcome.tool_calls.clear();
+    const auto row = kvmem_monitor_outcome(outcome);
+    const auto timings = completion_timings_json(outcome);
+    failures += check(row["prefill_ms"] == timings["prompt_ms"] && row["decode_ms"] == timings["predicted_ms"], "monitor uses native phase timings");
+    failures += check(row["ttft_ms"] == 200 && row["ttft_request_ms"] == 800 && row["ttft_scope"] == "execution", "monitor separates execution and queued TTFT");
+    failures += check(row["finish_reason"] == "length" && row["drafts_offered"] == 40 && row["mtp_drafts_offered"] == 30 && row["mtp_drafts_accepted"] == 20, "monitor reports actual MTP separately from copy drafts");
+    failures += check(row["decode_tps_mean"] == timings["predicted_per_second"], "monitor retains native request mean");
+    outcome.finish_reason = ninfer::FinishReason::Cancelled;
+    failures += check(kvmem_monitor_outcome(outcome)["finish_reason"] == "cancelled", "monitor retains cancellation");
+    outcome.completion_tokens = 0;
+    failures += check(kvmem_monitor_outcome(outcome)["ttft_ms"].is_null(), "no first token means unavailable TTFT");
+    outcome.metrics.speculative_backend = ninfer::SpeculativeBackend::None;
+    failures += check(!kvmem_monitor_outcome(outcome).contains("mtp_drafts_offered"), "copy-only runs do not claim MTP");
+    return failures;
+}
+
 int test_aggregate_response() {
     int failures              = 0;
     GenerationOutcome outcome = sample_outcome();
@@ -1735,6 +1764,7 @@ int main(int argc, char** argv) {
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
+    failures += test_monitor_outcome();
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();

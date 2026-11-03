@@ -1,4 +1,7 @@
 #include "serve/generation_service.h"
+#include "serve/openai_chat.h"
+#include "kvmem/monitor.hpp"
+#include "kvmem/monitor_rate.hpp"
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
@@ -251,17 +254,29 @@ public:
     void progress(ninfer::PromptProgress progress) override {
         cached_ = progress.reused_prompt_tokens;
         if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", progress.total_prompt_tokens}, {"cached_tokens", cached_}});
+        if (monitor_) monitor_({{"prompt_processed_tokens", progress.processed_prompt_tokens},
+            {"prefill_elapsed_ms", progress.elapsed_ns / 1e6}});
         if (sink_->on_progress) { sink_->on_progress(progress); }
     }
 
     void timing(ninfer::GenerationTimingObservation timing) override {
-        if (monitor_) monitor_({{"status", "generating"}, {"generated_tokens", timing.generated_tokens},
-            {"decode_tps", timing.generation_elapsed_ns ? nlohmann::json(1e9 * timing.generated_tokens / timing.generation_elapsed_ns) : nlohmann::json(nullptr)},
-            {"prefill_tps", timing.prompt_elapsed_ns ? nlohmann::json(1e9 * (prompt_ - cached_) / timing.prompt_elapsed_ns) : nlohmann::json(nullptr)}});
+        const auto native = completion_timings_json(prompt_, cached_, timing);
+        nlohmann::json values{{"status", "generating"}, {"generated_tokens", timing.generated_tokens},
+            {"decode_tps", native.at("predicted_per_second")},
+            {"decode_tps_mean", native.at("predicted_per_second")},
+            {"prefill_tps", native.at("prompt_per_second")}, {"prefill_ms", native.at("prompt_ms")},
+            {"ttft_ms", native.at("prompt_ms")}, {"ttft_scope", "execution"},
+            {"decode_ms", native.at("predicted_ms")}, {"prompt_new_tokens", prompt_ - cached_}};
+        values.update(rate_.sample(timing.generated_tokens, timing.generation_elapsed_ns, kvmem::monitor::now_ms()));
+        if (monitor_) monitor_(values);
         if (sink_->on_timing) { sink_->on_timing(timing); }
     }
 
     void publish(ninfer::OutputDelta delta) override {
+        if (monitor_ && !delta.text.empty()) {
+            const auto phase = delta.channel == ninfer::OutputChannel::Reasoning ? "thinking" : "answering";
+            if (phase_ != phase) { phase_ = phase; monitor_({{"phase", phase}}); }
+        }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
             return;
@@ -274,6 +289,8 @@ private:
     const StreamSink* sink_ = nullptr;
     std::function<void(const nlohmann::json&)> monitor_;
     int prompt_ = 0, cached_ = 0;
+    kvmem::monitor_rate_window rate_;
+    std::string phase_;
 };
 
 } // namespace
