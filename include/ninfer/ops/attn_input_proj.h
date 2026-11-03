@@ -12,6 +12,11 @@
 
 namespace ninfer::ops {
 
+/** Native ternary weights use T2_G128_FP16 or PTQ1_G128_FP16 RowSplit, group 128,
+ * FP16 multipliers. Their exact decoding is defined in docs/maintainer/tensor-formats.md.
+ * Both packings support the same registered Bonsai 27B geometries. A split projection requires
+ * both parents to use the same packing. PTQ1 has a required high plane; T2 has none.
+ */
 /**
  * Computes four independent linear projections for each token:
  *

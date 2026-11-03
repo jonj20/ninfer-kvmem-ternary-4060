@@ -52,10 +52,36 @@ enum class QType : std::uint16_t {
     // itself (an STQ matrix's trellis; its sign vectors are FP16).
     FP16   = 31,
     UINT16 = 32,
+    // Native Prism PTQ1_0: 24 base-3 bytes + 2 tail bytes + FP16 scale per 128 weights.
+    PTQ1_G128_FP16 = 33,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) || format == QType::GGUF_MXFP4;
+}
+
+[[nodiscard]] constexpr bool is_ternary(QType format) {
+    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16;
+}
+
+struct RowSplitFormat {
+    int group = 0;
+    int code_bytes = 0;
+    int high_bytes = 0;
+    int scale_bytes = 0;
+};
+
+[[nodiscard]] constexpr RowSplitFormat row_split_format(QType format) {
+    switch (format) {
+    case QType::Q2_G64_FP16: return {64, 16, 0, 2};
+    case QType::Q4_G64_FP16: return {64, 32, 0, 2};
+    case QType::Q5_G64_FP16: return {64, 32, 8, 2};
+    case QType::Q6_G64_FP16: return {64, 32, 16, 2};
+    case QType::Q8_G32_FP16: return {32, 32, 0, 2};
+    case QType::T2_G128_FP16: return {128, 32, 0, 2};
+    case QType::PTQ1_G128_FP16: return {128, 24, 2, 2};
+    default: return {};
+    }
 }
 
 struct GgufBlockShape {

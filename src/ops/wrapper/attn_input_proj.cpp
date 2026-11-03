@@ -51,12 +51,16 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
     const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
-    const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
+    const bool ternary = is_ternary(qtype);
+    const bool t2_planes = !ternary ||
+        (weight.qtype == QType::T2_G128_FP16 ? no_high
+         : (weight.qhigh != nullptr && weight.high_plane_bytes != 0));
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
+    const std::int32_t group = ternary ? 128 : 64;
     // The panel layout is RowSplit's bytes permuted (sm_70 loads, read by its routes).
-    if (weight.qtype != qtype || !is_row_split(weight.layout) ||
+    if ((weight.qtype != qtype && !(ternary && is_ternary(weight.qtype))) ||
+        !is_row_split(weight.layout) ||
         weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
         !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
@@ -337,9 +341,10 @@ void require_split_profile(const Tensor& x, const Weight& query_key_weight,
 bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    const bool qk = query_key_weight.qtype == QType::T2_G128_FP16;
-    if (qk != (gate_value_weight.qtype == QType::T2_G128_FP16)) {
-        throw std::invalid_argument("attn_input_proj: the two parents must share the T2 format");
+    const bool qk = is_ternary(query_key_weight.qtype);
+    if (qk != is_ternary(gate_value_weight.qtype) ||
+        (qk && query_key_weight.qtype != gate_value_weight.qtype)) {
+        throw std::invalid_argument("attn_input_proj: the two ternary parents must share one format");
     }
     if (!qk) { return false; }
     constexpr std::int32_t kQRows  = 6144;
@@ -363,7 +368,7 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
         detail::t2_a8_supported(gate_value_weight, cols)) {
         // One quantisation of x and one pass over each parent, split into its two destinations.
         auto scope             = workspace->scope();
-        const auto activations = detail::t2_a8_quantize(x, *workspace, stream);
+        const auto activations = detail::t2_a8_quantize(x, *workspace, stream, query_key_weight.qtype == QType::PTQ1_G128_FP16);
         detail::t2_a8_project_split_pair(activations, {query_key_weight, q, 0, kQRows, k, 0},
                                          {gate_value_weight, gate, 0, kQRows, v, 0}, stream);
         return true;
@@ -433,7 +438,7 @@ std::size_t split_route_bytes(QType query_key_qtype, std::int32_t query_key_rows
                               QType gate_value_qtype, std::int32_t gate_value_rows,
                               std::int32_t input_rows, LinearPolicy policy, std::int32_t min_tokens,
                               std::int32_t max_tokens) {
-    if (query_key_qtype == QType::T2_G128_FP16 || gate_value_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(query_key_qtype) || is_ternary(gate_value_qtype)) {
         if (query_key_qtype != gate_value_qtype || query_key_rows != 7168 ||
             gate_value_rows != 7168 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unregistered T2 pair");
@@ -441,7 +446,7 @@ std::size_t split_route_bytes(QType query_key_qtype, std::int32_t query_key_rows
         std::size_t bytes = 0;
         for (const std::int32_t rows : {6144, 1024}) {
             bytes = std::max(bytes,
-                             linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, input_rows,
+                             linear_workspace_capacity_bytes(query_key_qtype, rows, input_rows,
                                                              policy, min_tokens, max_tokens));
         }
         return bytes;

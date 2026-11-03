@@ -110,7 +110,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 
 /**
  * Two-parent snapshot capacity keyed by the parents' formats. The Q4/Q5 pair answers as the
- * row-count query above; a T2 pair (ternary checkpoints, both parents T2_G128_FP16) projects every
+ * row-count query above; a T2 pair (ternary checkpoints, both parents the same T2_G128_FP16 or PTQ1_G128_FP16) projects every
  * part through the T2 linear routes, so it adds its private projection planes to the materialized
  * convolution path at every batch size.
  */

@@ -87,6 +87,9 @@ def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
 def _pack_codes(
     codes: torch.Tensor, spec: QuantFormat
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.name == "ptq1_g128_fp16":
+        from .ptq1 import pack
+        return pack(codes)
     if spec.bits == 2:
         return (
             _pack_two_bit(codes + spec.code_bias),
@@ -133,8 +136,8 @@ def encode_row_split(
         raise ValueError("codes and scales must be on the same device")
     if spec.code_bias and bool(((codes < spec.qmin) | (codes > spec.qmax)).any()):
         raise ValueError("Q2 codes must be in [-1, 2]")
-    if spec.code_bias and not bool(torch.isfinite(scales).all()):
-        raise ValueError("Q2 scales must be finite binary16 words")
+    if (spec.code_bias or spec.name == "ptq1_g128_fp16") and not bool(torch.isfinite(scales).all()):
+        raise ValueError("grouped scales must be finite binary16 words")
     grouped = codes.reshape(-1, spec.group_size)
     base, high = _pack_codes(grouped, spec)
     planes = RowPlanes(
@@ -404,6 +407,10 @@ def _unpack_codes(
     scales = planes.scale.view(torch.float16).reshape(
         geometry.n, geometry.groups_per_row
     )
+    if spec.name == "ptq1_g128_fp16":
+        from .ptq1 import unpack
+        return scales, unpack(planes.base, planes.high).reshape(
+            geometry.n, geometry.groups_per_row, spec.group_size)
     if spec.bits == 8:
         codes = planes.base.view(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
@@ -557,7 +564,7 @@ def dequantize_row_split(
     geometry = row_split_geometry(spec, shape)
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
-    if dtype == torch.bfloat16:
+    if dtype == torch.bfloat16 and spec.name != "ptq1_g128_fp16":
         byte_indices, shifts = _high_indices(
             target.type, target.index, spec.bits, spec.group_size
         )

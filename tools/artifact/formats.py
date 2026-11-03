@@ -83,6 +83,8 @@ Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 # Ternary: two-bit two's-complement codes over {-1, 0, +1} (0b10 is outside the language),
 # one binary16 multiplier per 128 columns; the native form of ternary checkpoints.
 T2_G128_FP16 = QuantFormat("t2_g128_fp16", 2, 128, -1, 1)
+# bits describes the logical ternary code domain; PTQ1 uses its own base-3 codec.
+PTQ1_G128_FP16 = QuantFormat("ptq1_g128_fp16", 2, 128, -1, 1)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 FP8_E4M3FN_ROW_FP16 = Fp8RowFormat("fp8_e4m3fn_row_fp16", "fp16")
@@ -117,7 +119,7 @@ DIRECT_FORMATS = MappingProxyType(
 QUANT_FORMATS = MappingProxyType(
     {
         item.name: item
-        for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16)
+        for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16, PTQ1_G128_FP16)
     }
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})

@@ -225,7 +225,7 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool t2 = profile.qtype == QType::T2_G128_FP16 && profile.gate_up_rows == 34816 &&
+    const bool t2 = is_ternary(profile.qtype) && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&

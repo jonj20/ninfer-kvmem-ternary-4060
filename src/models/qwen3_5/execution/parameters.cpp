@@ -33,7 +33,7 @@ public:
     void integer_route(LinearParameters& p, QType format, std::int32_t n, std::int32_t k) const {
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
-        if (p.policy == ops::LinearPolicy::A16Only && p.weight.qtype == format &&
+        if (p.policy == ops::LinearPolicy::A16Only && (p.weight.qtype == format || (is_ternary(format) && is_ternary(p.weight.qtype))) &&
             p.weight.n == n && p.weight.k == k) {
             // The cuBLAS route is a superset: it admits everything AllowA8Int does and adds the
             // materialise-and-call-cuBLAS path above its width gate, so the resolver still picks
@@ -55,8 +55,8 @@ public:
         if (!model_.options().prefill_a8) { return; }
         auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);
         if (pair == nullptr || pair->policy != ops::LinearPolicy::A16Only) { return; }
-        if (pair->first.qtype == first_format && pair->first.n == first_rows &&
-            pair->first.k == input_rows && pair->second.qtype == second_format &&
+        if ((pair->first.qtype == first_format || (is_ternary(first_format) && is_ternary(pair->first.qtype))) && pair->first.n == first_rows &&
+            pair->first.k == input_rows && (pair->second.qtype == second_format || (is_ternary(second_format) && is_ternary(pair->second.qtype))) &&
             pair->second.n == second_rows && pair->second.k == input_rows) {
             // The split projections are the separable half of the trade, so they take the cuBLAS
             // policy only when both settings ask for it.
@@ -528,7 +528,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.head(w.text.output_head_use);
-    if (text.token_embedding.qtype == QType::T2_G128_FP16) {
+    if (is_ternary(text.token_embedding.qtype)) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
         if (!rotated(text.output_head.hadamard_signs) ||

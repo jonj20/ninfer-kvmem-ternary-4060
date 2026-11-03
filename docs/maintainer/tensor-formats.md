@@ -30,6 +30,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
 | `t2_g128_fp16` | 2 | 128 | `[-1, 1]` | one binary16 scale/group | 2.125 |
+| `ptq1_g128_fp16` | base 3 | 128 | `[-1, 1]` | one binary16 scale/group | 1.75 |
 
 The block-scaled floating-point weight format is:
 
@@ -466,6 +467,21 @@ the word `0b10` (`-2`) is outside the valid artifact language, and one binary16 
 columns. It is the native representation of ternary checkpoints, whose values are exactly
 `scale * {-1, 0, +1}`; a converter repacks them without rounding. The format is defined only in
 the row-split layout.
+
+### 5.2.1 Native PTQ1
+
+`ptq1_g128_fp16` represents the same ternary values as T2 while preserving Prism PTQ1_0
+packing: every 128-column group has 24 base bytes, two tail bytes and one FP16 multiplier.
+It is supported only in `row_split_k128_v1`, with K a multiple of 128. It is a distinct codec;
+PTQ1 bytes must never be interpreted as T2's two-bit fields.
+
+The first 16 base bytes contain coordinates `16*s + b` for `s=0..4`, `b=0..15`.
+The next eight contain coordinates `80 + 8*s + b`; the two tail bytes contain coordinates
+`120 + 2*s + b` for `s=0..3`. A byte `u` at stage `s` decodes to
+`q = floor(3 * ((u * 3**s) mod 256) / 256) - 1`; the exact weight is `q * scale`.
+The encoder maps five digits (each `q+1`) to their base-3 integer `a` and stores
+`ceil(256*a/243)`. A tail byte uses four digits and `ceil(256*a/81)`.
+Finite signed FP16 scales, zeros and subnormals are preserved bit for bit on import.
 
 ### 5.3 Q8
 

@@ -16,6 +16,8 @@ class EncodedRows:
     scales: torch.Tensor
     weight_divisor: bytes | None = None
     # Native Q2/Q8 may supply complete packed code rows instead of logical integer codes.
+    # Native PTQ1 packed rows contain 26-byte (24 base + 2 tail) records per 128-group;
+    # the binary16 scales remain in `scales`.
     packed: bool = False
 
 

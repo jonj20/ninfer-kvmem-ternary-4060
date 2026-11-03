@@ -148,13 +148,14 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
         const detail::GgufShape shape{qtype, output_rows, input_rows};
         return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
     }
-    if (qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qtype)) {
         (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16Only,
                                               min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
         return std::max(layout.peak_bytes(1),
-                        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens));
+                        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens,
+                                                       qtype == QType::PTQ1_G128_FP16));
     }
     if (qtype == QType::BF16) {
         (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
@@ -248,7 +249,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::T2_G128_FP16) {
+    if (is_ternary(w.qtype)) {
         if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, t)) {
             detail::t2_a8_linear_add(x, w, residual_out, ws, stream);
             return;

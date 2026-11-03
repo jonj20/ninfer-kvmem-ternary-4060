@@ -92,11 +92,23 @@ class TensorOutput:
         rows, k = codes.shape[0], obj.shape[1]
         if rows <= 0 or row_begin + rows > obj.shape[0]:
             raise ValueError(f"{obj.id}: encoded rows exceed parent")
-        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16"):
+        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16", "ptq1_g128_fp16"):
             raise ValueError("packed code planes require native Q2 or Q8")
         self._padding()
         if isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
+            if packed and self.format.name == "ptq1_g128_fp16":
+                if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.groups_per_row * 26)
+                        or scales.dtype != torch.float16 or tuple(scales.shape) != (rows, g.groups_per_row)):
+                    raise ValueError("packed PTQ1 rows require 26 code/tail bytes per group and FP16 scales")
+                records = codes.detach().cpu().contiguous().numpy().reshape(rows, g.groups_per_row, 26)
+                scale_words = scales.detach().cpu().contiguous().numpy()
+                if not np.isfinite(scale_words).all():
+                    raise ValueError("PTQ1 scales must be finite binary16 words")
+                self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, records[:, :, :24].tobytes())
+                self.write_bytes(g.high_offset + row_begin * g.high_row_bytes, records[:, :, 24:].tobytes())
+                self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes, scale_words.tobytes())
+                return
             if packed:
                 if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.base_row_bytes)
                         or scales.dtype != torch.float16 or

@@ -824,3 +824,14 @@ Cold prefills are serialized, so `ninfer_memory_ngram` records their actual over
 requiring it. Each of the three restored phases still requires full configured concurrency
 and more decode row-rounds than decode rounds; exact token/byte/resource checks remain unchanged.
 See the [fast-prefill report](../../../docs/fast-prefill-admission-validation-20261006.md).
+
+Native PTQ1 qualification: `ninfer_linear_ptq1_test` and `ninfer_linear_ptq1_a8_test` compare
+public Linear against the CPU FP64 oracle over real Bonsai shapes, route boundaries and graph
+replay. `ninfer_attn_input_proj_test --ptq1-only`, `ninfer_gdn_input_proj_test --ptq1-only`, and
+`ninfer_hadamard_transform_test --ptq1-only` cover native split parents and rotated embeddings.
+`python -m pytest tests/artifact/test_ptq1.py` verifies the codec against the GGUF reference,
+including all canonical base-3 bytes, scales and invalid group geometry.
+
+Build this focused set with `cmake --build build --parallel 8 --target ninfer_ptq1_tests`;
+run a program with `build/tests/ninfer_ptq1_tests <program> [args]` (Windows: `.exe`).
+The bundle also includes the existing T2 A16/A8 suites for regression checks.

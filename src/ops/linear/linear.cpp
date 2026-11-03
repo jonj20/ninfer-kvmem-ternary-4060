@@ -128,6 +128,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::Q8_G32_FP16:
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::PTQ1_G128_FP16:
+        if (workspace != nullptr && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
+            detail::t2_a8_linear(x, w, out, *workspace, stream);
+            return;
+        }
+        detail::t2_dispatch(x, w, out, policy, stream);
+        return;
     case QType::T2_G128_FP16:
         if (workspace != nullptr && out.dtype == DType::BF16 && detail::t2_a8_admits(policy) &&
             detail::t2_a8_supported(w, x.ne[1])) {
@@ -173,6 +180,10 @@ std::size_t linear_route_workspace_bytes(QType qtype, std::int32_t output_rows,
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
+    case QType::PTQ1_G128_FP16:
+        (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
+        return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens, true);
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);

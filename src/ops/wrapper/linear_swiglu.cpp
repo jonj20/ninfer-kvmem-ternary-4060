@@ -62,7 +62,7 @@ std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_u
         const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
         return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
     }
-    if (qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qtype)) {
         (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows,
                                               LinearPolicy::A16Only, min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
@@ -200,9 +200,11 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    const bool t2_weight    = large_shape && gate_up_weight.qtype == QType::T2_G128_FP16 &&
-                              gate_up_weight.qhigh == nullptr &&
-                              gate_up_weight.high_plane_bytes == 0 && common_row_split;
+    const bool t2_weight    = large_shape && is_ternary(gate_up_weight.qtype) &&
+                              (gate_up_weight.qtype == QType::T2_G128_FP16
+                                   ? gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0
+                                   : gate_up_weight.qhigh != nullptr && gate_up_weight.high_plane_bytes != 0) &&
+                              common_row_split;
     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !t2_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }

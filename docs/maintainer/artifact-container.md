@@ -325,6 +325,7 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | q6_g64_fp16 | Signed 6-bit codes，G64，FP16 multiplier |
 | q8_g32_fp16 | Codes `[-127,127]`，G32，FP16 multiplier |
 | t2_g128_fp16 | Ternary codes `[-1,1]`，2-bit two's complement，G128，FP16 multiplier |
+| ptq1_g128_fp16 | Native Prism base-3 ternary packing，G128，FP16 multiplier |
 | nvfp4 | E2M1 codes、G16 E4M3FN block scale、FP32 weight divisor |
 | fp8_e4m3fn_row_bf16 | E4M3FN codes，每行一个 BF16 multiplier |
 
@@ -340,7 +341,7 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 | 名称 | 当前允许的 format / shape | 对象对齐 |
 |---|---|---:|
 | contiguous_le_v1 | bf16/fp32/int32/fp16/uint16，rank 0..16 | 256 |
-| row_split_k128_v1 | q2_g64_fp16、q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16、t2_g128_fp16，正 rank-2 `[N,K]` | 256 |
+| row_split_k128_v1 | q2_g64_fp16、q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16、t2_g128_fp16、ptq1_g128_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |
 | raw_bytes_v1 | Resource，非空字节串 | 1 |

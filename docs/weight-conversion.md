@@ -168,7 +168,13 @@ backend. Component availability and startup selection are independent.
 `bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
 whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
 except the GDN A/B controls, the output head and the token-embedding table are stored as
-`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding. Those
+`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding.
+For native Prism PTQ1 storage, select `--recipe bonsai2_27b_ptq1` instead: it emits
+`ptq1_g128_fp16` (28 bytes per 128 weights, versus T2's 34), with unchanged ternary coordinates,
+scales, Hadamard signs and row ordering. Both recipes use the same frontend companion and optional
+Vision/MTP component selection. The native recipe writes a v3 artifact; legacy v2 containers from
+other forks still require conversion. Weight packing does not by itself guarantee that a selected
+model, context and optional components fit a particular GPU. Those
 matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry the
 `hadamard_signs` auxiliary of its input width (three shared vectors in total), and the runtime
 rotates the matching activations. The token table has no Use of its own: the runtime restores each

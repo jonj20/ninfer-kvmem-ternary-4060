@@ -190,3 +190,12 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_cpu_vision_tests_PROGRAMS
   ninfer_qwen3_5_loading_test ninfer_request_log_test)
 ninfer_finalize_bundle(ninfer_cpu_vision_tests)
 ninfer_stage_runtime_dlls(ninfer_cpu_vision_tests)
+
+# Native PTQ1 qualification reuses the public test objects without linking every numerical suite.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_ptq1_tests_PROGRAMS
+  ninfer_artifact_ptq1_test ninfer_linear_ptq1_test ninfer_linear_ptq1_a8_test
+  ninfer_linear_swiglu_ptq1_test ninfer_linear_add_ptq1_test
+  ninfer_attn_input_proj_test ninfer_gdn_input_proj_test ninfer_hadamard_transform_test
+  ninfer_linear_topk_test ninfer_linear_t2_a16_test ninfer_linear_t2_a8_test)
+ninfer_finalize_bundle(ninfer_ptq1_tests)
+ninfer_stage_runtime_dlls(ninfer_ptq1_tests)
