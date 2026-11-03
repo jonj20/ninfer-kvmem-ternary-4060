@@ -3,6 +3,7 @@
 #include "kvmem/host_kv_storage.hpp"
 #include "kvmem/spill_io.hpp"
 #include "kvmem/memory_contract.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -180,8 +181,16 @@ void checkpoint_fork(const char* artifact) {
     options.kv_capacity=ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.kvmem={.selected_tokens=3968,.reserve_tokens=128,.host_bytes=256ULL<<20,
         .retained_sessions=4,.verify_transfers=true};
-    options.kvmem.disk_bytes=2048ULL<<20;
+    // This fixture retains several owners and full native StateImages. On 27B,
+    // one image is about 147 MiB: the old 2 GiB quota filled before the cancel
+    // case, leaving the selected checkpoint hot instead of exercising ReadFile.
+    // This is an upper bound; SpillFile allocates/writes extents on demand.
+    options.kvmem.disk_bytes=8ULL<<30;
     options.kvmem.disk_path=std::filesystem::current_path()/"fork-fault-spill";
+    const auto available_disk=std::filesystem::space(std::filesystem::current_path()).available;
+    require(available_disk>options.kvmem.disk_bytes,"fork fixture lacks SSD quota headroom");
+    std::cout<<"FORK_STORAGE quota="<<options.kvmem.disk_bytes
+             <<" available="<<available_disk<<std::endl;
     options.context_cache.enabled=false;
     ninfer::PromptInput document;
     document.options.enable_thinking=false;
@@ -198,6 +207,45 @@ void checkpoint_fork(const char* artifact) {
     add(document,ninfer::ChatRole::User,text);
     {
         ninfer::Engine engine(options);
+        const auto image_bytes=engine.memory_summary().host_state_image_bytes;
+        require(image_bytes>0,"fork fixture requires native StateImages");
+        std::uint64_t observed_disk_payload=0;
+        const auto wait_cold=[&](const char* stage) {
+            // Idle maintenance demotes all retained images, including execution
+            // slots. The checkpoint pool caches one released image; metadata is
+            // still counted. Wait for that bounded idle state rather than assume
+            // a one-second sleep makes the next owner's restore cold. ReadFile's
+            // entered gate below remains the decisive proof of a cold restore.
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+            auto quiet_since=std::chrono::steady_clock::now();
+            auto memory=engine.memory_summary().kvmem;
+            while(std::chrono::steady_clock::now()<deadline) {
+                auto next=engine.memory_summary().kvmem;
+                observed_disk_payload=std::max(observed_disk_payload,next.disk_payload_bytes);
+                if(next.checkpoint_bytes!=memory.checkpoint_bytes ||
+                   next.disk_written_bytes!=memory.disk_written_bytes)
+                    quiet_since=std::chrono::steady_clock::now();
+                memory=next;
+                require(memory.disk_payload_bytes<=options.kvmem.disk_bytes &&
+                        memory.host_payload_bytes<=options.kvmem.host_bytes,
+                        "fork preparation exceeded storage quota");
+                if(!memory.active_sessions && memory.disk_payload_bytes>=image_bytes &&
+                   memory.checkpoint_bytes<2*image_bytes &&
+                   std::chrono::steady_clock::now()-quiet_since>=std::chrono::milliseconds(200)) {
+                    std::cout<<"FORK_COLD_READY stage="<<stage<<" image_bytes="<<image_bytes
+                             <<" checkpoint_ram="<<memory.checkpoint_bytes
+                             <<" disk_payload="<<memory.disk_payload_bytes
+                             <<" written="<<memory.disk_written_bytes<<std::endl;
+                    return memory;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::cerr<<"FORK_COLD_NOT_READY stage="<<stage<<" image_bytes="<<image_bytes
+                     <<" checkpoint_ram="<<memory.checkpoint_bytes
+                     <<" disk_payload="<<memory.disk_payload_bytes
+                     <<" quota="<<options.kvmem.disk_bytes<<std::endl;
+            throw std::runtime_error("fork fixture did not drain retained StateImages to SSD");
+        };
         auto ack_options=request(8); ack_options.stop.include_model_defaults=true;
         const auto ack=engine.submit(engine.prepare(document),ack_options).wait();
         auto question=document;
@@ -224,17 +272,19 @@ void checkpoint_fork(const char* artifact) {
             require(result.generated_token_ids==reference.generated_token_ids,"fork/fallback output differs from fresh prefill");
             require(engine.is_available(),"fork disabled Engine");
             const auto memory=engine.memory_summary().kvmem;
+            observed_disk_payload=std::max(observed_disk_payload,memory.disk_payload_bytes);
             require(memory.host_payload_bytes<=options.kvmem.host_bytes &&
                 memory.disk_payload_bytes<=options.kvmem.disk_bytes && !memory.resident_pages,
                 "fork leaked quota or native pages");
             std::cout<<"FORK_CASE "<<key<<" reused="<<result.reused_prompt_tokens
                      <<" native_hits="<<memory.history_hits<<" reads="<<memory.disk_read_bytes
-                     <<" errors="<<memory.disk_errors<<" exact=1"<<std::endl;
+                     <<" errors="<<memory.disk_errors<<" disk_payload="<<memory.disk_payload_bytes
+                     <<" exact=1"<<std::endl;
             return result;
         };
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        wait_cold("initial-fork");
         run("child"); run("parent");
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        wait_cold("read-failure");
         FileFailure<true> failure;
         const auto before=engine.memory_summary().kvmem;
         failure.arm();
@@ -244,7 +294,7 @@ void checkpoint_fork(const char* artifact) {
                 "fork did not exercise injected cold read failure");
         require(failed.history_hits==before.history_hits,"failed restore published a native hit");
         run("parent");
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const auto before_cancel=wait_cold("cancel-read");
         auto cancelled_input=question; cancelled_input.context_cache.session_key="cancelled-child";
         failure.arm(true);
         std::atomic<bool> cancel{false};
@@ -257,8 +307,17 @@ void checkpoint_fork(const char* artifact) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         failure.release();
         const auto result=cancelled.get();
-        require(entered && result.finish_reason==ninfer::FinishReason::Cancelled,
+        require(entered,"fork cancellation fixture did not enter a cold ReadFile");
+        require(result.finish_reason==ninfer::FinishReason::Cancelled,
                 "fork cancellation did not settle while reading cold state");
+        const auto after_cancel=engine.memory_summary().kvmem;
+        require(after_cancel.history_hits==before_cancel.history_hits &&
+                after_cancel.disk_errors==before_cancel.disk_errors,
+                "cancelled cold restore published a hit or an I/O error");
+        require(!after_cancel.active_payload_reservation_bytes && !after_cancel.resident_pages &&
+                !after_cancel.mtp_resident_pages && result.generated_token_ids.empty(),
+                "cancelled cold restore generated output or leaked native resources");
+        std::cout<<"FORK_CANCEL entered=1 cancelled=1 unpublished=1 resources_released=1"<<std::endl;
         run("parent"); run("child");
         auto edited=question;
         edited.context_cache.session_key="edited";
@@ -270,6 +329,8 @@ void checkpoint_fork(const char* artifact) {
         require(!engine.submit(engine.prepare(no_update),request(4)).wait().reused_prompt_tokens,
                 "no-update request consumed named history");
         run("parent");
+        std::cout<<"FORK_STORAGE observed_max_payload="<<observed_disk_payload
+                 <<" quota="<<options.kvmem.disk_bytes<<std::endl;
         std::cout<<"CHECKPOINT_FORK cold_read_failure=1 cancel=1 parent_preserved=1 fresh_exact=1 PASS"<<std::endl;
     }
     require(std::filesystem::is_empty(options.kvmem.disk_path),"fork leaked spill file");

@@ -40,9 +40,17 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     if (gate.dtype == DType::FP32) {
         const int grid = static_cast<int>(
             std::min<std::int64_t>(div_up(n, static_cast<std::int64_t>(kBlock)), 65535));
-        silu_and_mul_fp32_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const float*>(gate.data), static_cast<const float*>(up.data),
-            static_cast<__nv_bfloat16*>(out.data), n);
+        if (gate.is_contiguous() && up.is_contiguous()) {
+            silu_and_mul_fp32_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const float*>(gate.data), static_cast<const float*>(up.data),
+                static_cast<__nv_bfloat16*>(out.data), n);
+        } else {
+            silu_and_mul_strided_input_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const float*>(gate.data), static_cast<const float*>(up.data),
+                static_cast<__nv_bfloat16*>(out.data), n, gate.ne[0], gate.ne[1], gate.ne[2],
+                gate.nb[0], gate.nb[1], gate.nb[2], gate.nb[3],
+                up.nb[0], up.nb[1], up.nb[2], up.nb[3]);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

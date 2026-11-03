@@ -2,13 +2,18 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
+#include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <type_traits>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -191,9 +196,91 @@ public:
                is_gguf(input.weight.parts.front().parent->geometry.format);
     }
 
+    // Rank-local projections do not pass through the whole-model shape promotions.
+    // Honour explicit NVFP4 precision here as well: an FP32 partial (or an
+    // unregistered BF16 shape) has no integer route and must stay A16 under the
+    // int8 option, rather than inherit the artifact's A4 permission.
+    void share_policy(ops::LinearPolicy& policy, std::span<const Weight* const> weights,
+                      bool fp32, bool combined_gate_up = false) const {
+        if (weights.empty()) { return; }
+        const bool nvfp4 = std::all_of(weights.begin(), weights.end(), [](const Weight* w) {
+            return w->qtype == QType::NVFP4;
+        });
+        if (!nvfp4 && (model_.options().nvfp4_w4a16 || model_.options().nvfp4_w4a8_int) &&
+            std::any_of(weights.begin(), weights.end(), [](const Weight* w) {
+                return w->qtype == QType::NVFP4;
+            })) {
+            throw std::invalid_argument("tensor-parallel mixed NVFP4 projection cannot apply "
+                "--nvfp4-w4a16/--nvfp4-w4a8-int through one shared compute policy");
+        }
+        if (nvfp4 && (model_.options().nvfp4_w4a16 || model_.options().nvfp4_w4a8_int)) {
+            const bool integer = !fp32 && !model_.options().nvfp4_w4a16 &&
+                std::all_of(weights.begin(), weights.end(), [combined_gate_up](const Weight* w) {
+                    return combined_gate_up
+                        ? w->n > 0 && w->n % 256 == 0 && w->k == 5120
+                        : ops::detail::nvfp4_registered(w->n, w->k);
+                });
+            policy = integer ? ops::LinearPolicy::AllowNvfp4Int8 : ops::LinearPolicy::A16Only;
+            return;
+        }
+        // PTQ1 A8 consumes BF16 outputs and only its qualified 128-row/K shapes.
+        // The FP32 gate/up pair and down partial use the native A16 implementation.
+        if (fp32 && ops::allows_a8_int(policy) &&
+            std::all_of(weights.begin(), weights.end(), [](const Weight* w) {
+                return w->qtype == QType::PTQ1_G128_FP16;
+            })) {
+            policy = ops::LinearPolicy::A16Only;
+            return;
+        }
+        if (!fp32 && model_.options().prefill_a8 && policy == ops::LinearPolicy::A16Only &&
+            std::all_of(weights.begin(), weights.end(), [](const Weight* w) {
+                return w->qtype == QType::PTQ1_G128_FP16 &&
+                       ops::detail::ptq1_a8_shape_supported(w->n, w->k);
+            })) {
+            policy = ops::LinearPolicy::AllowA8Int;
+        }
+    }
+
+    void share_linear_policy(LinearParameters& p, bool fp32, bool combined_gate_up = false) const {
+        const Weight* weights[]{&p.weight};
+        share_policy(p.policy, weights, fp32, combined_gate_up);
+    }
+
+    void share_dense_policy(DenseParameters& p) const {
+        const bool fp32_gate_up = p.up.has_value() ||
+            (p.gate_up.weight.qtype == QType::PTQ1_G128_FP16 &&
+             (p.gate_up.weight.n != 34816 || p.gate_up.weight.k != 5120));
+        if (p.up) {
+            const Weight* weights[]{&p.gate_up.weight, &p.up->weight};
+            share_policy(p.gate_up.policy, weights, true);
+            if (p.gate_up.weight.qtype == QType::NVFP4 && p.up->weight.qtype == QType::NVFP4) {
+                p.up->policy = p.gate_up.policy;
+            }
+        } else {
+            share_linear_policy(p.gate_up, fp32_gate_up, true);
+        }
+        share_linear_policy(p.down, true);
+        p.verify_gate_up_policy = p.gate_up.policy;
+    }
+
+    void share_projection_policy(ops::ProjectionWeights& projection) const {
+        std::visit([&](auto& p) {
+            using Kind = std::decay_t<decltype(p)>;
+            std::vector<const Weight*> weights;
+            if constexpr (std::is_same_v<Kind, ops::SingleProjectionWeight>) {
+                weights.push_back(&p.weight);
+            } else if constexpr (std::is_same_v<Kind, ops::PairedProjectionWeights>) {
+                weights = {&p.first, &p.second};
+            } else {
+                for (const auto& part : p.parts) { weights.push_back(&part.weight); }
+            }
+            share_policy(p.policy, weights, false);
+        }, projection);
+    }
+
     // GGUF gate and up, joined or two parents; or a tensor-parallel rank's rows of gate and up,
     // two device objects of any format (ops::linear_swiglu's two-parent form).
-    DenseParameters dense(const DenseWeights& w) const {
+    DenseParameters dense(const DenseWeights& w, bool partial = false) const {
         const auto gate = model_.rotated_input(w.gate);
         const auto up   = model_.rotated_input(w.up);
         if (const std::array inputs{gate, up}; gguf(gate) || !ops::joins(inputs)) {
@@ -207,6 +294,7 @@ public:
                 }
                 out.down                  = rotated_linear(w.down);
                 out.verify_gate_up_policy = out.gate_up.policy;
+                if (partial) { share_dense_policy(out); }
                 return out;
             });
         }
@@ -233,11 +321,12 @@ public:
             out.verify_gate_up_policy = ops::LinearPolicy::AllowA8IntDecode;
         }
 #endif
+        if (partial) { share_dense_policy(out); }
         return out;
     }
 
-    FfnParameters ffn(const std::variant<DenseWeights, MoeWeights>& w) const {
-        if (const auto* d = std::get_if<DenseWeights>(&w)) { return dense(*d); }
+    FfnParameters ffn(const std::variant<DenseWeights, MoeWeights>& w, bool partial = false) const {
+        if (const auto* d = std::get_if<DenseWeights>(&w)) { return dense(*d, partial); }
         const auto& moe = std::get<MoeWeights>(w);
         if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
             throw std::invalid_argument("SparseMoe implements top-8 routing");
@@ -344,11 +433,11 @@ public:
         });
     }
 
-    BlockParameters block(const BlockWeights& w) const {
+    BlockParameters block(const BlockWeights& w, bool partial = false) const {
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w.ffn);
+        out.ffn                 = ffn(w.ffn, partial);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
             integer_route(attention_output, QType::Q4_G64_FP16, 5120, 6144);
@@ -398,6 +487,14 @@ public:
             out.projection_prefetch =
                 prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
         }
+        if (partial) {
+            // rank 0 uses BlockWeights too, but its text projections are actual TP shards.
+            // Apply the same policies as the other ranks after whole-matrix promotions.
+            std::visit([&](auto& mixer) {
+                share_projection_policy(mixer.projection);
+                share_linear_policy(mixer.output, true);
+            }, out.mixer);
+        }
         return out;
     }
 
@@ -407,7 +504,7 @@ public:
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w.ffn);
+        out.ffn                 = ffn(w.ffn, true);
         if (w.attention) {
             const AttentionWeights& a = *w.attention;
             out.mixer                 = AttentionParameters{
@@ -415,6 +512,9 @@ public:
                     model_.rotated_input(a.query), model_.rotated_input(a.key),
                     model_.rotated_input(a.gate), model_.rotated_input(a.value)),
                 tensor(a.query_norm), tensor(a.key_norm), rotated_linear(a.output)};
+            auto& mixer = std::get<AttentionParameters>(out.mixer);
+            share_projection_policy(mixer.projection);
+            share_linear_policy(mixer.output, true);
         }
         if (w.gdn) {
             const GdnWeights& g = *w.gdn;
@@ -430,6 +530,9 @@ public:
                 tensor(g.convolution),
                 tensor(g.norm),
                 rotated_linear(g.output)};
+            auto& mixer = std::get<GdnParameters>(out.mixer);
+            share_projection_policy(mixer.projection);
+            share_linear_policy(mixer.output, true);
         }
         return out;
     }
@@ -622,9 +725,10 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.stage_begin.push_back(w.text.stages.stage_begin(stage));
     }
     text.layers.reserve(w.text.layers.size());
+    const bool partial_text = !w.text.rank_layers.empty();
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
-                                           [&] { return prepare.block(w.text.layers[i]); }));
+                                           [&] { return prepare.block(w.text.layers[i], partial_text); }));
         text.layers.back().rank = w.text.stages.placement(static_cast<std::uint32_t>(i)).stage;
     }
     if (!w.text.rank_layers.empty()) {

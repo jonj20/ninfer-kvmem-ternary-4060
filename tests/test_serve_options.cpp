@@ -407,7 +407,7 @@ int run_serve_option_tests() {
         }
     }
     for (const auto& extra : std::vector<std::vector<std::string>>{
-             {"--max-concurrency", "9"}, {"--devices", "0,1", "--tensor-parallel"},
+             {"--max-concurrency", "9"},
              {"--draft-tokens", "0"}, {"--draft-tokens", "16"}}) {
         auto args = memory_args;
         args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
@@ -1745,6 +1745,19 @@ int run_serve_option_tests() {
     failures += check(zero_stage_rejected, "a stage with no layers was accepted");
 
     // --tensor-parallel shares every layer over the --devices, so it needs more than one.
+    for (const auto mode : {"none", "mtp", "dflash2"}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--devices", "1,0", "--tensor-parallel", "--tensor-split", "3,1",
+            "--spec", mode, "--draft-tokens", std::string(mode) == "none" ? "0" : "3"});
+        const auto parsed = make_engine_options(parse(args));
+        failures += check(parsed.tensor_parallel && parsed.tensor_attention == ninfer::TensorAttention::Heads &&
+            parsed.devices == std::vector<int>({1, 0}) && parsed.tensor_split == std::vector<double>({3, 1}),
+            "KVMem heads TP lost its default mode, ordered ranks or weights");
+        args.insert(args.end(), {"--tensor-attention", "positions"});
+        bool rejected = false;
+        try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "KVMem accepted unsupported positions attention");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel"})
                           .tensor_parallel,
                       "--tensor-parallel did not reach serving options");

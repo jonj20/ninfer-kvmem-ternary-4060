@@ -1121,9 +1121,14 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {{kvmem::SpeculativeAlgorithm::Mtp, 15, true, true, 8, 8, "embedded"},
          {kvmem::SpeculativeAlgorithm::DFlash2, 15, false, true, kMaximumConcurrency, 8, "embedded"}}, metrics_.speculative_statistics());
     const auto& execution = service.engine_options();
-    props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
+    props["execution"] = {{"mode", execution.tensor_parallel ? "tensor" : execution.devices.size() > 1 ? "layer" : "single"},
         {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},
         {"stage_layers", execution.stage_layers}, {"monitor_devices", facts.monitor_devices}};
+    if (execution.tensor_parallel) {
+        props["execution"]["tensor_attention"] = execution.tensor_attention == TensorAttention::Heads ? "heads" : "positions";
+        props["execution"]["tensor_split"] = execution.tensor_split;
+        props["execution"]["tensor_shares"] = facts.tensor_shares;
+    }
     if (options.enable_vision && options.vision_residency == VisionResidency::Cpu) {
         // Full memory_summary() takes the Engine execution lock. This endpoint is polled
         // during decode, so observe the independently synchronized Host cache instead.
@@ -1479,6 +1484,12 @@ HttpServer::ModelFacts HttpServer::model_facts(const ModelRegistry::Lease& lease
     facts.vision                       = service.engine_options().enable_vision;
     facts.max_context                  = service.options().max_context;
     const ninfer::MemorySummary memory = service.memory_summary();
+    for (const auto& share : memory.tensor_shares) {
+        facts.tensor_shares.push_back({{"rank", share.rank},
+            {"kv_heads", {share.kv_head_begin, share.kv_head_end}},
+            {"gdn_key_heads", {share.gdn_key_head_begin, share.gdn_key_head_end}},
+            {"ffn_columns", {share.ffn_begin, share.ffn_end}}});
+    }
     facts.capacity = make_load_capacity(lease.model(), service.engine_options(), memory);
     request_jsonl_.write_server_start(service.options(), service.engine_options(),
                                       service.sampling_defaults(), lease.model(),

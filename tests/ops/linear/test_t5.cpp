@@ -182,22 +182,37 @@ std::vector<double> oracle(const Ternary& w, std::int32_t first, std::int32_t ro
 }
 
 int linear_case(const Ternary& w, std::int32_t first, std::int32_t rows, std::int32_t t,
-                bool graph, ops::LinearPolicy policy = ops::LinearPolicy::AllowA8) {
+                bool graph, ops::LinearPolicy policy = ops::LinearPolicy::AllowA8,
+                DType output_type = DType::BF16, std::int32_t padding = 0) {
+    const std::string label = "t5 linear [" + std::to_string(rows) + "," + std::to_string(w.k) +
+                              "] rows+" + std::to_string(first) + " T=" + std::to_string(t) +
+                              policy_name(policy) + (output_type == DType::FP32 ? " FP32" : " BF16") +
+                              " padding=" + std::to_string(padding) + (graph ? " graph" : " eager");
+    std::cout << "START " << label << std::endl;
     auto x = activation(w.k, t, 17u * t + rows);
     auto device_x = to_device_bf16(x);
-    GuardedDeviceBuffer out(std::size_t(rows) * t * 2);
+    GuardedDeviceBuffer out(std::size_t(rows + padding) * t * (output_type == DType::FP32 ? 4 : 2));
+    out.fill(0);
     Tensor tx(device_x.p, DType::BF16, {w.k, t});
-    Tensor to(out.data(), DType::BF16, {rows, t});
+    Tensor to = Tensor(out.data(), output_type, {rows + padding, t}).slice(0, 0, rows);
     const Weight view = w.rows(first, rows);
     DeviceArena workspace(
         ops::linear_workspace_capacity_bytes(QType::T5_G128_FP16, rows, w.k, policy, 1, t));
+    const auto launch = [&](cudaStream_t stream) {
+        if (padding != 0) {
+            Tensor* outputs[]{&to};
+            ops::detail::t5_project(tx, view, outputs, false, policy, &workspace, stream);
+        } else {
+            ops::linear(tx, view, to, policy, workspace, stream);
+        }
+    };
     if (graph) {
         cudaStream_t stream;
         cudaGraph_t captured;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::linear(tx, view, to, policy, workspace, stream);
+        launch(stream);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -212,16 +227,58 @@ int linear_case(const Ternary& w, std::int32_t first, std::int32_t rows, std::in
         CUDA_CHECK(cudaGraphDestroy(captured));
         CUDA_CHECK(cudaStreamDestroy(stream));
     } else {
-        ops::linear(tx, view, to, policy, workspace, nullptr);
+        launch(nullptr);
         cuda_synchronize();
     }
     if (workspace.used() != 0) throw std::runtime_error("workspace leak");
-    const std::string label = "t5 linear [" + std::to_string(rows) + "," + std::to_string(w.k) +
-                              "] rows+" + std::to_string(first) + " T=" + std::to_string(t) +
-                              policy_name(policy);
-    return verify_reduction(label, from_device_bf16(out.data(), std::size_t(rows) * t),
+    std::vector<double> actual;
+    if (output_type == DType::FP32) {
+        std::vector<float> padded(std::size_t(rows + padding) * t);
+        out.copy_to_host(padded.data(), padded.size() * sizeof(float));
+        actual.resize(std::size_t(rows) * t);
+        for (int token = 0; token < t; ++token) {
+            std::copy_n(padded.begin() + std::size_t(token) * (rows + padding), rows,
+                        actual.begin() + std::size_t(token) * rows);
+            for (int row = rows; row < rows + padding; ++row) {
+                if (padded[std::size_t(token) * (rows + padding) + row] != 0) {
+                    throw std::runtime_error("t5 FP32 stride padding overwritten");
+                }
+            }
+        }
+    } else {
+        actual = from_device_bf16(out.data(), std::size_t(rows) * t);
+    }
+    return verify_reduction(label, actual,
                             oracle(w, first, rows, x, t), criterion(policy)) +
            out.verify_guards(label.c_str());
+}
+
+int swiglu_share_case(const Ternary& w, std::int32_t t) {
+    const std::string label = "T5 heads SwiGLU [" + std::to_string(w.n) + "," +
+                              std::to_string(w.k) + "] T=" + std::to_string(t);
+    std::cout << "START " << label << std::endl;
+    const auto x = activation(w.k, t, 20261030U + t);
+    auto device_x = to_device_bf16(x);
+    GuardedDeviceBuffer out(std::size_t(w.n / 2) * t * 2);
+    Tensor tx(device_x.p, DType::BF16, {w.k, t});
+    Tensor to(out.data(), DType::BF16, {w.n / 2, t});
+    DeviceArena workspace(ops::linear_swiglu_workspace_capacity_bytes(
+        QType::T5_G128_FP16, w.n, w.k, ops::LinearPolicy::AllowA8, t, t));
+    ops::linear_swiglu(tx, w.rows(0, w.n), to, ops::LinearPolicy::AllowA8, workspace, nullptr);
+    cuda_synchronize();
+    const auto projected = oracle(w, 0, w.n, x, t);
+    std::vector<double> expected(std::size_t(w.n / 2) * t);
+    for (int token = 0; token < t; ++token) {
+        for (int row = 0; row < w.n / 2; ++row) {
+            const auto at = std::size_t(token) * w.n + row;
+            const double gate = projected[at];
+            expected[std::size_t(token) * (w.n / 2) + row] =
+                gate / (1.0 + std::exp(-gate)) * projected[at + w.n / 2];
+        }
+    }
+    if (workspace.used() != 0) throw std::runtime_error("t5 SwiGLU workspace leak");
+    return verify_reduction(label, from_device_bf16(out.data(), expected.size()),
+                            expected, {0.08, 0.01, 0.12}) + out.verify_guards(label.c_str());
 }
 
 int linear_add_case(const Ternary& w, std::int32_t t,
@@ -287,9 +344,26 @@ int embedding_case(const Ternary& w, const std::vector<std::int32_t>& ids) {
 } // namespace
 
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     if (cuda_unavailable()) return 77;
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--heads") {
+        for (const auto k : {1024, 3072, 4096, 13312}) {
+            std::cout << "START T5 heads fixture [256," << k << "]" << std::endl;
+            const Ternary share(256, k, 20261030U + k);
+            for (const auto t : {1, 4, 8, 9, 16, 17, 32, 33, 65, 129}) {
+                failures += linear_case(share, 0, 256, t, t == 9 || t == 65,
+                                        ops::LinearPolicy::AllowA8, DType::FP32);
+            }
+            for (const auto t : {1, 9, 65}) {
+                failures += linear_case(share, 64, 128, t, t == 9,
+                                        ops::LinearPolicy::AllowA8, DType::FP32, 3);
+                failures += swiglu_share_case(share, t);
+            }
+        }
+        std::cout << (failures ? "FAIL" : "OK") << " T5 heads" << std::endl;
+        return failures ? 1 : 0;
+    }
     // First use of a wide projection occurs inside graph capture. On SM75 every length must
     // stay within 64 KiB, including a partial last tile, strided destinations and accumulation.
     // The FP64 oracle and output guards validate the smaller GEMM over multiple token tiles.
@@ -433,4 +507,10 @@ int main(int argc, char** argv) {
     }
     std::cout << (failures ? "FAIL" : "OK") << " T5 A8\n";
     return failures ? 1 : 0;
+} catch (const std::exception& error) {
+    std::cerr << "FAIL T5: " << error.what() << std::endl;
+    return 1;
+} catch (...) {
+    std::cerr << "FAIL T5: unknown exception" << std::endl;
+    return 1;
 }

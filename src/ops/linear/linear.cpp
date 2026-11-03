@@ -137,7 +137,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         return;
     }
     case QType::PTQ1_G128_FP16:
-        if (workspace != nullptr && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
+        if (workspace != nullptr && out.dtype == DType::BF16 && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
             return;
         }
@@ -260,6 +260,8 @@ bool linear_writes_fp32(QType format) noexcept {
     case QType::Q6_G64_FP16:
     case QType::Q8_G32_FP16:
     case QType::T2_G128_FP16:
+    case QType::PTQ1_G128_FP16:
+    case QType::T5_G128_FP16:
     case QType::FP8_E4M3FN_ROW_BF16:
     case QType::NVFP4:
         return true;
@@ -272,6 +274,10 @@ LinearShareUnits linear_share_units(QType format) noexcept {
     switch (format) {
     case QType::T2_G128_FP16:
         return {32, detail::kT2RuntimeShapeK};
+    case QType::PTQ1_G128_FP16:
+        return {64, 512};
+    case QType::T5_G128_FP16:
+        return {128, 1024};
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::kFp8ShareUnits;
     case QType::NVFP4:

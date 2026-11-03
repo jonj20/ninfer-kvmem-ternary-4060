@@ -1383,14 +1383,9 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
     const bool wide =
         wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1]));
     if (fused_int8) {
-        // The share writes the row it is given and the all-reduce sums those shares, so a deferred
-        // norm has nowhere to go here. Refuse the combination instead of answering from x.
-        if (residual_partial_ != nullptr) {
-            throw std::logic_error("FFN: the fused int8 input norm has no tensor-parallel share");
-        }
         const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
         ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Primal, wide, experts_, &norm, nullptr);
+            InputBasis::Primal, wide, experts_, &norm, residual_partial_);
         return;
     }
     ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);

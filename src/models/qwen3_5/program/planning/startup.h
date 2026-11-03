@@ -1,5 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/planning/memory_statistics_layout.h"
 
 #include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
@@ -33,20 +34,6 @@ struct DFlashPersistentLayout {
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return full ? full->payload_bytes() : 0;
     }
-};
-
-struct MemoryStatisticsLayout {
-    std::uint32_t first_layer = 0;
-    std::uint32_t layers = 0;
-    TensorLayout key_sums;
-    TensorLayout candidate_keys;
-    TensorLayout candidate_origin;
-    TensorLayout prefill_origin;
-    TensorLayout query_values;
-    TensorLayout attention_queries;
-    TensorLayout attention_tokens;
-    TensorLayout attention_rows, attention_positions, attention_scratch, attention_norms, attention_output;
-    TensorLayout ranges;
 };
 
 struct PersistentLayout {

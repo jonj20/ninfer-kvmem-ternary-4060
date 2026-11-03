@@ -139,10 +139,18 @@ int main() {
                 throw std::runtime_error("KVMem DFlash2 layer pipeline changed its placement or window");
             staged.stage_layers.clear();
             staged.tensor_parallel = true;
+            staged.tensor_attention = ninfer::TensorAttention::Heads;
+            staged.tensor_split = {3, 1};
+            const auto tensor = ninfer::runtime::normalize_engine_options(staged);
+            if (!tensor.tensor_parallel || tensor.tensor_attention != ninfer::TensorAttention::Heads ||
+                tensor.devices != staged.devices || tensor.tensor_split != staged.tensor_split ||
+                tensor.kvmem.device_tokens() != 256)
+                throw std::runtime_error("KVMem DFlash2 heads TP changed placement or window");
+            staged.tensor_attention = ninfer::TensorAttention::Positions;
             bool rejected = false;
             try { (void)ninfer::runtime::normalize_engine_options(staged); }
             catch (const std::invalid_argument&) { rejected = true; }
-            if (!rejected) throw std::runtime_error("KVMem DFlash2 accepted unsupported tensor parallelism");
+            if (!rejected) throw std::runtime_error("KVMem DFlash2 accepted unsupported positions TP");
         }
         auto vision = base;
         vision.enable_vision = true;

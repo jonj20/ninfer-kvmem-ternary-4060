@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -179,13 +180,19 @@ static_assert(sizeof(TernaryWideStorage) * kTernaryWideMinBlocksPerSm <= 100 * 1
 //                 verified decoders (exp\reader-candidates\verify_pq2_repack.py -> 0 / 122,880
 //                 mismatches) and the convention relabelling it then applies is the one this
 //                 container requires.
-template <bool kPtq1>
+template <class Out>
+__device__ __forceinline__ Out ternary_wide_store(float value) {
+    if constexpr (std::is_same_v<Out, float>) return value;
+    else return __float2bfloat16_rn(value);
+}
+
+template <bool kPtq1, class Out = __nv_bfloat16>
 __global__ __launch_bounds__(kTernaryWideThreads, kTernaryWideMinBlocksPerSm)
 void ternary_wide_t_kernel(const __nv_bfloat16* __restrict__ x,
                            const std::uint8_t* __restrict__ codes,
                            const std::uint8_t* __restrict__ high,
                            const std::uint8_t* __restrict__ scales,
-                           __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                           Out* __restrict__ out, std::int32_t rows,
                            std::int32_t k, std::int32_t tokens,
                            std::int32_t out_row_stride) {
     __shared__ TernaryWideStorage staging;
@@ -524,21 +531,21 @@ void ternary_wide_t_kernel(const __nv_bfloat16* __restrict__ x,
             if (row_lo < rows) {
                 if (token_a < tokens) {
                     out[static_cast<std::int64_t>(token_a) * out_row_stride + row_lo] =
-                        __float2bfloat16_rn(acc[sub][0]);
+                        ternary_wide_store<Out>(acc[sub][0]);
                 }
                 if (token_b < tokens) {
                     out[static_cast<std::int64_t>(token_b) * out_row_stride + row_lo] =
-                        __float2bfloat16_rn(acc[sub][1]);
+                        ternary_wide_store<Out>(acc[sub][1]);
                 }
             }
             if (row_hi < rows) {
                 if (token_a < tokens) {
                     out[static_cast<std::int64_t>(token_a) * out_row_stride + row_hi] =
-                        __float2bfloat16_rn(acc[sub][2]);
+                        ternary_wide_store<Out>(acc[sub][2]);
                 }
                 if (token_b < tokens) {
                     out[static_cast<std::int64_t>(token_b) * out_row_stride + row_hi] =
-                        __float2bfloat16_rn(acc[sub][3]);
+                        ternary_wide_store<Out>(acc[sub][3]);
                 }
             }
         }

@@ -39,7 +39,8 @@ int root_code(unsigned root,unsigned radius_axis,int dimension) {
 
 // Independent dense FP64 oracle from public BF16 Q and independently decoded
 // persistent K bytes/scales. H256 is a dense sign matrix, not a warp butterfly.
-void qualify(KvCacheStorage storage,int heads,int kvheads,int pages,int samples=4,bool scale_edges=false) {
+void qualify(KvCacheStorage storage,int heads,int kvheads,int pages,int samples=4,bool scale_edges=false,
+             const std::vector<int>& kv_parts={}) {
     constexpr int dim=256,tokens=7;
     const bool bf16=storage==KvCacheStorage::BFloat16;
     const bool fp8=storage==KvCacheStorage::Fp8E4M3Row256 || storage==KvCacheStorage::Fp8KeyNvfp4Value;
@@ -110,7 +111,61 @@ void qualify(KvCacheStorage storage,int heads,int kvheads,int pages,int samples=
     cache.block_tables=Tensor(dt.p,DType::I32,{output_pages,1});
     ops::attention_page_mass(query,row,position,0,cache,scratch,norm,output,nullptr);
     cuda_check(cudaDeviceSynchronize(),"sample");
-    const auto actual=from_device<float>(dy,output.numel());std::vector<double> expected(actual.size());
+    auto actual=from_device<float>(dy,output.numel());
+    std::vector<double> equal_rank_average;
+    if(!kv_parts.empty()) {
+        // Pack the same represented Q/K rows into independent head shards. Each
+        // invocation returns a local head mean; KVMem must weight it by the
+        // number of heads, rather than treating unequal ranks as equal votes.
+        actual.assign(actual.size(),0);
+        equal_rank_average.assign(actual.size(),0);
+        int first_kv=0;
+        for(const int local_kv:kv_parts) {
+            if(local_kv<=0 || first_kv+local_kv>kvheads)
+                throw std::invalid_argument("invalid oracle head partition");
+            const int local_heads=local_kv*(heads/kvheads);
+            const int first_head=first_kv*(heads/kvheads);
+            std::vector<std::uint16_t> local_q(size_t(dim)*local_heads*tokens);
+            for(int t=0;t<tokens;++t)
+                std::copy_n(q.data()+(size_t(t)*heads+first_head)*dim,
+                            size_t(local_heads)*dim,local_q.data()+size_t(t)*local_heads*dim);
+            const size_t key_head_bytes=size_t(64)*leading*(bf16?2:1);
+            const size_t scale_head_bytes=size_t(64)*groups*(fp4?1:2);
+            std::vector<std::uint8_t> local_k(size_t(pages)*local_kv*key_head_bytes);
+            std::vector<std::uint8_t> local_s(size_t(pages)*local_kv*scale_head_bytes);
+            for(int p=0;p<pages;++p) {
+                std::copy_n(bytes.data()+(size_t(p)*kvheads+first_kv)*key_head_bytes,
+                            size_t(local_kv)*key_head_bytes,
+                            local_k.data()+size_t(p)*local_kv*key_head_bytes);
+                std::copy_n(scales.data()+(size_t(p)*kvheads+first_kv)*scale_head_bytes,
+                            size_t(local_kv)*scale_head_bytes,
+                            local_s.data()+size_t(p)*local_kv*scale_head_bytes);
+            }
+            auto lq=to_device(local_q),lk=to_device(local_k),ls=to_device(local_s);
+            DeviceBuffer lb(size_t(output_pages)*local_heads*samples*4);
+            DeviceBuffer ln(size_t(2)*local_heads*samples*4),ly(size_t(output_pages)*samples*4);
+            Tensor local_query(lq.p,DType::BF16,{dim,local_heads,tokens});
+            Tensor local_scratch(lb.p,DType::FP32,{output_pages,local_heads,samples});
+            Tensor local_norm(ln.p,DType::FP32,{2,local_heads,samples});
+            Tensor local_output(ly.p,DType::FP32,{output_pages,samples});
+            auto local_cache=cache;
+            local_cache.num_kv_heads=local_kv;
+            local_cache.k_pages=Tensor(lk.p,dtype,{leading,64,local_kv,pages});
+            local_cache.k_scale_pages=Tensor(ls.p,fp4?DType::U8:DType::FP16,
+                                             {groups,64,local_kv,pages});
+            ops::attention_page_mass(local_query,row,position,0,local_cache,
+                                     local_scratch,local_norm,local_output,nullptr);
+            cuda_check(cudaDeviceSynchronize(),"sharded sample");
+            const auto mass=from_device<float>(ly,local_output.numel());
+            for(size_t i=0;i<mass.size();++i) {
+                actual[i]+=float(double(mass[i])*local_heads/heads);
+                equal_rank_average[i]+=double(mass[i])/kv_parts.size();
+            }
+            first_kv+=local_kv;
+        }
+        if(first_kv!=kvheads) throw std::invalid_argument("oracle head partition is incomplete");
+    }
+    std::vector<double> expected(actual.size());
     for(int s=0;s<samples;++s) for(int h=0;h<heads;++h) {
         std::vector<double> represented_q(dim);
         for(int d=0;d<dim;++d) {
@@ -138,8 +193,16 @@ void qualify(KvCacheStorage storage,int heads,int kvheads,int pages,int samples=
             throw std::runtime_error("page mass differs from dense FP64 oracle");
         }
     }
+    if(!equal_rank_average.empty()) {
+        double wrong_weight_error=0;
+        for(size_t i=0;i<expected.size();++i)
+            wrong_weight_error=std::max(wrong_weight_error,std::abs(equal_rank_average[i]-expected[i]));
+        if(wrong_weight_error<1e-4)
+            throw std::runtime_error("unequal-head fixture does not distinguish equal rank weighting");
+    }
     std::cout<<"attention page mass storage="<<int(storage)<<" H="<<heads<<" KVH="<<kvheads<<" pages="<<pages
-        <<" samples="<<samples<<" scale_edges="<<scale_edges<<" max_abs="<<worst<<'\n';
+        <<" samples="<<samples<<" scale_edges="<<scale_edges<<" shards="<<kv_parts.size()
+        <<" max_abs="<<worst<<'\n';
 }
 int main() {
     try {
@@ -153,6 +216,10 @@ int main() {
         qualify(KvCacheStorage::Nvfp4Group16,24,4,4,64);
         qualify(KvCacheStorage::Nvfp4Group16,8,2,3,8,true);
         qualify(KvCacheStorage::Nvfp4Group16,24,4,577,1);
+        for(const auto storage:{KvCacheStorage::BFloat16,KvCacheStorage::Nvfp4Group16}) {
+            qualify(storage,24,4,4,8,false,{3,1});
+            qualify(storage,24,4,4,8,false,{1,3});
+        }
         return 0;
     } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 }

@@ -194,6 +194,7 @@ private:
     // unload and a later load start a new one.
     struct ModelFacts {
         nlohmann::json monitor_devices = nlohmann::json::array();
+        nlohmann::json tensor_shares = nlohmann::json::array();
         const GenerationService* service = nullptr;
         LoadCapacity capacity;
         ninfer::ModelMetadata metadata;

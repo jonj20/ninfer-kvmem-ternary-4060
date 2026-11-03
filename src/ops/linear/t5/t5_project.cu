@@ -179,19 +179,22 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     for (std::size_t i = 0; i < outputs.size(); ++i) {
         if (outputs[i] == nullptr) { throw std::invalid_argument("t5_project: null output"); }
         const Tensor& out = *outputs[i];
-        if (out.dtype != DType::BF16 || out.ne[0] <= 0 || out.ne[0] > w.n - end ||
+        const auto element_bytes = out.dtype == DType::FP32 ? sizeof(float) : sizeof(__nv_bfloat16);
+        if ((out.dtype != DType::BF16 && out.dtype != DType::FP32) || out.ne[0] <= 0 || out.ne[0] > w.n - end ||
             out.ne[1] != tokens || out.ne[2] != 1 || out.ne[3] != 1 ||
-            out.nb[0] != sizeof(__nv_bfloat16) || out.nb[1] < out.ne[0] * sizeof(__nv_bfloat16) || out.data == nullptr) {
+            out.nb[0] != element_bytes || out.nb[1] < out.ne[0] * element_bytes || out.data == nullptr) {
             throw std::invalid_argument("t5_project: outputs must be contiguous BF16 [rows,T]");
         }
         end += out.ne[0];
-        chunked_outputs = chunked_outputs && out.ne[0] % 8 == 0 && out.nb[1] % 16 == 0 && aligned16(out.data);
-        packed.data[i] = static_cast<__nv_bfloat16*>(out.data);
+        chunked_outputs = chunked_outputs && out.dtype == DType::BF16 && out.ne[0] % 8 == 0 && out.nb[1] % 16 == 0 && aligned16(out.data);
+        packed.data[i] = out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
+        packed.fp32[i] = out.dtype == DType::FP32 ? static_cast<float*>(out.data) : nullptr;
         packed.end[i]  = end;
-        packed.stride[i] = static_cast<int>(out.nb[1] / sizeof(__nv_bfloat16));
+        packed.stride[i] = static_cast<int>(out.nb[1] / element_bytes);
     }
     for (std::size_t i = outputs.size(); i < t5_a8::kMaxOutputs; ++i) {
         packed.data[i] = packed.data[outputs.size() - 1];
+        packed.fp32[i] = packed.fp32[outputs.size() - 1];
         packed.end[i]  = end;
         packed.stride[i] = packed.stride[outputs.size() - 1];
     }

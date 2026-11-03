@@ -74,12 +74,12 @@ causal_attention_key_partition(CausalAttentionExecutionEnvelope envelope,
             .page_residue = cache.page_residue};
 }
 
-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
+std::int32_t causal_attention_split_capacity(AttentionHeadGeometry geometry, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size = 1);
 
-CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
+CausalAttentionRoute causal_attention_resolve_route(AttentionHeadGeometry geometry, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope);
 
@@ -101,7 +101,7 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
 // tile width (0 when off) whose tiles run as the batch rows of one split-KV launch and one reduce,
 // after one batched append, instead of the serial fused chunks. Opt-in: NINFER_ATTN_PARALLEL_TILES
 // or the device profile's "attn_parallel_tiles".
-[[nodiscard]] std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads,
+[[nodiscard]] std::int32_t causal_attention_parallel_tile_width(AttentionHeadGeometry geometry,
                                                                 std::int32_t width,
                                                                 std::int32_t batch_size,
                                                                 KvCacheStorage storage);

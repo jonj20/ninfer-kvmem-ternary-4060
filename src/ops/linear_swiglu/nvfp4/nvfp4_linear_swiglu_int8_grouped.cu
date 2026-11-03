@@ -17,16 +17,9 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
-// The registered 27B gate_up profile this route serves.
-constexpr std::int32_t kRows = 34816;
-constexpr std::int32_t kOut  = kRows / 2; // gate rows [0,17408) then up rows [17408,34816)
+// Dense tensor shares retain the complete input and whole 128-row scale tiles
+// in each gate/up half. The existing kernels already take runtime row counts.
 constexpr std::int32_t kCols = 5120;
-
-// Row bytes of the E2M1 code plane and the row offset of the up half's block in the
-// BlockScaleK16M128x4 scale plane: both halves' rows start on a 128-row tile boundary, so the
-// up weight is the same single-source plane seen from row kOut.
-constexpr std::size_t kHalfCodeBytes = std::size_t(kOut) * (kCols / 2);
-constexpr std::size_t kHalfScaleBytes = std::size_t(kOut / 128) * (kCols / 64) * 512;
 
 constexpr std::size_t round256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
@@ -41,11 +34,11 @@ struct WorkspaceParts {
     std::size_t gate_plane;
 };
 
-constexpr WorkspaceParts workspace_parts(std::int32_t addressed_tokens) {
+constexpr WorkspaceParts workspace_parts(std::int32_t addressed_tokens, std::int32_t rows) {
     const std::size_t t = static_cast<std::size_t>(addressed_tokens);
     const std::size_t codes    = round256(t * std::size_t(kCols));
     const std::size_t scales   = round256(t * (kCols / 32) * sizeof(float));
-    const std::size_t gate_f32 = round256(std::size_t(kOut) * t * sizeof(float));
+    const std::size_t gate_f32 = round256(std::size_t(rows / 2) * t * sizeof(float));
     return {codes, scales, gate_f32};
 }
 
@@ -78,8 +71,9 @@ inline std::int32_t gate_plane_tokens(std::int32_t first, std::int32_t last,
     return top;
 }
 
-inline std::size_t gate_plane_bytes(std::int32_t tokens, Nvfp4Int8Mainloop table) {
-    return tokens == 0 ? 0 : workspace_parts(narrow::addressed_tokens(tokens, table)).gate_plane;
+inline std::size_t gate_plane_bytes(std::int32_t tokens, Nvfp4Int8Mainloop table,
+                                   std::int32_t rows) {
+    return tokens == 0 ? 0 : workspace_parts(narrow::addressed_tokens(tokens, table), rows).gate_plane;
 }
 
 } // namespace
@@ -90,16 +84,17 @@ bool nvfp4_linear_swiglu_int8_tokens_supported(std::int32_t tokens) {
 
 bool nvfp4_linear_swiglu_int8_grouped_supported(const Weight& gate_up, std::int32_t tokens) {
     return gate_up.qtype == QType::NVFP4 && gate_up.layout == QuantLayout::BlockScaleK16M128x4 &&
-           gate_up.group == 16 && gate_up.n == kRows && gate_up.k == kCols &&
+           gate_up.group == 16 && gate_up.n > 0 && gate_up.n % 256 == 0 && gate_up.k == kCols &&
            gate_up.qdata != nullptr && gate_up.scales != nullptr &&
            nvfp4_int8_route_admits(tokens);
 }
 
 std::size_t nvfp4_linear_swiglu_int8_workspace_capacity_bytes(std::int32_t min_tokens,
                                                               std::int32_t max_tokens,
-                                                              Nvfp4Int8Mainloop table) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("nvfp4 linear_swiglu int8 workspace: invalid token interval");
+                                                              Nvfp4Int8Mainloop table,
+                                                              std::int32_t gate_up_rows) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || gate_up_rows <= 0 || gate_up_rows % 256 != 0) {
+        throw std::invalid_argument("nvfp4 linear_swiglu int8 workspace: invalid rows or token interval");
     }
     if (min_tokens == max_tokens) {
         // A single-T query reports the route that T will actually run: under `default` only a whole
@@ -108,7 +103,7 @@ std::size_t nvfp4_linear_swiglu_int8_workspace_capacity_bytes(std::int32_t min_t
         // answer as well, because the unified narrow band sizes to the call and MMVQ to the tile.
         if (!nvfp4_int8_route_admits(min_tokens)) { return 0; }
         const WorkspaceParts parts =
-            workspace_parts(narrow::addressed_tokens(min_tokens, table));
+            workspace_parts(narrow::addressed_tokens(min_tokens, table), gate_up_rows);
         // Exact at one width, gate plane included: it is reserved only where the launch allocates
         // it, and sized at the width the launch addresses. Reserving it unconditionally cost the
         // grouped route 13.09x what it uses (75,392 B a token against 5,760 at 34816x5120).
@@ -120,11 +115,11 @@ std::size_t nvfp4_linear_swiglu_int8_workspace_capacity_bytes(std::int32_t min_t
     // monotonically with the width and meet at eight, so the widest point of the interval is also
     // its largest reservation; rounding the interval DOWN here would under-reserve a padded launch.
     if (!nvfp4_int8_route_interval_admits(min_tokens, max_tokens)) { return 0; }
-    const WorkspaceParts parts = workspace_parts(narrow::addressed_tokens(max_tokens, table));
+    const WorkspaceParts parts = workspace_parts(narrow::addressed_tokens(max_tokens, table), gate_up_rows);
     // The gate plane does not follow the interval's top: see gate_plane_tokens. An upper bound over
     // the admitted widths, exact at each of them.
     return parts.codes + parts.scales +
-           gate_plane_bytes(gate_plane_tokens(min_tokens, max_tokens, table), table);
+           gate_plane_bytes(gate_plane_tokens(min_tokens, max_tokens, table), table, gate_up_rows);
 }
 
 namespace {
@@ -135,6 +130,10 @@ namespace {
 void launch_from_planes(const Weight& weight, const void* codes, const void* scales,
                         const void* gate_plane, Tensor& out, bool narrow_route, bool mmq_route,
                         bool mmvq_route, std::int32_t tokens, cudaStream_t stream) {
+    const std::int32_t rows = weight.n;
+    const std::int32_t output_rows = rows / 2;
+    const std::size_t half_code_bytes = std::size_t(output_rows) * (kCols / 2);
+    const std::size_t half_scale_bytes = std::size_t(output_rows / 128) * (kCols / 64) * 512;
     // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
     // where llama.cpp folds it too, like the A16 route's global divisor. Both
     // projections share it -- the gate plane holds the rescaled gate, so silu(gate)*up is the
@@ -147,37 +146,37 @@ void launch_from_planes(const Weight& weight, const void* codes, const void* sca
 
     if (mmvq_route || mmq_route) {
         const LinearF32Output gate_output{reinterpret_cast<float*>(const_cast<void*>(gate_plane)),
-                                          kOut};
+                                          output_rows};
         const LinearBf16GateSiluOutput up_output{
-            static_cast<__nv_bfloat16*>(out.data), kOut,
-            reinterpret_cast<const float*>(gate_plane), kOut};
+            static_cast<__nv_bfloat16*>(out.data), output_rows,
+            reinterpret_cast<const float*>(gate_plane), output_rows};
         if (mmvq_route) {
             if (narrow_route) {
                 narrow::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales,
-                                                alpha, gate_output, kCols, tokens, kOut, stream);
+                                                alpha, gate_output, kCols, tokens, output_rows, stream);
                 narrow::launch<LinearBf16GateSiluOutput>(
-                    weight_codes + kHalfCodeBytes, weight_scales + kHalfScaleBytes, x_codes,
-                    x_scales, alpha, up_output, kCols, tokens, kOut, stream);
+                    weight_codes + half_code_bytes, weight_scales + half_scale_bytes, x_codes,
+                    x_scales, alpha, up_output, kCols, tokens, output_rows, stream);
             } else {
                 mmvq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales, alpha,
-                                              gate_output, kCols, tokens, kOut, stream);
+                                              gate_output, kCols, tokens, output_rows, stream);
                 mmvq::launch<LinearBf16GateSiluOutput>(
-                    weight_codes + kHalfCodeBytes, weight_scales + kHalfScaleBytes, x_codes,
-                    x_scales, alpha, up_output, kCols, tokens, kOut, stream);
+                    weight_codes + half_code_bytes, weight_scales + half_scale_bytes, x_codes,
+                    x_scales, alpha, up_output, kCols, tokens, output_rows, stream);
             }
         } else {
             mmq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, alpha, gate_output,
-                                         kCols, tokens, kOut, stream);
-            mmq::launch<LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
-                                                  weight_scales + kHalfScaleBytes, x_codes, alpha,
-                                                  up_output, kCols, tokens, kOut, stream);
+                                         kCols, tokens, output_rows, stream);
+            mmq::launch<LinearBf16GateSiluOutput>(weight_codes + half_code_bytes,
+                                                  weight_scales + half_scale_bytes, x_codes, alpha,
+                                                  up_output, kCols, tokens, output_rows, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const LinearBf16Output paired_output{static_cast<__nv_bfloat16*>(out.data), kOut};
+    const LinearBf16Output paired_output{static_cast<__nv_bfloat16*>(out.data), output_rows};
     nvfp4_int8_grouped_swiglu_launch<LinearBf16Output>(
-        weight_codes, weight_scales, x_codes, x_scales, alpha, paired_output, kCols, tokens, kRows,
+        weight_codes, weight_scales, x_codes, x_scales, alpha, paired_output, kCols, tokens, rows,
         stream);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -220,7 +219,7 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     // routes below the crossover need the FP32 gate plane.
     const bool two_projection = mmq_route || mmvq_route;
     const DeviceSpan gate_plane =
-        two_projection ? workspace.alloc_bytes(std::size_t(kOut) * padded * sizeof(float))
+        two_projection ? workspace.alloc_bytes(std::size_t(weight.n / 2) * padded * sizeof(float))
                        : DeviceSpan{};
 
     if (mmq_route) {
@@ -267,7 +266,7 @@ void nvfp4_linear_swiglu_int8_fused_norm_launch(const Tensor& residual, const Te
                                                     (kCols / 32) * sizeof(float));
     const bool two_projection = mmq_route || mmvq_route;
     const DeviceSpan gate_plane =
-        two_projection ? workspace.alloc_bytes(std::size_t(kOut) * padded * sizeof(float))
+        two_projection ? workspace.alloc_bytes(std::size_t(weight.n / 2) * padded * sizeof(float))
                        : DeviceSpan{};
 
     launch_rmsnorm_int8_quantize(residual, norm_weight, eps,

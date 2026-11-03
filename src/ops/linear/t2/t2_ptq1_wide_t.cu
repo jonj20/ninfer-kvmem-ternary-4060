@@ -36,7 +36,7 @@ void launch_t2_ptq1_wide_t(const Tensor& x, const Weight& w, Tensor& out,
     if (w.qtype != QType::PTQ1_G128_FP16 || w.qdata == nullptr || w.qhigh == nullptr ||
         w.scales == nullptr || (reinterpret_cast<std::uintptr_t>(w.qhigh) & 7u) != 0u ||
         w.padded_shape[1] != w.k || (w.k % kTernaryWideChunkK) != 0 || x.ne[0] != w.k ||
-        x.dtype != DType::BF16 || out.dtype != DType::BF16 || x.ne[1] < 1 || out.ne[0] < w.n ||
+        x.dtype != DType::BF16 || (out.dtype != DType::BF16 && out.dtype != DType::FP32) || x.ne[1] < 1 || out.ne[0] < w.n ||
         out_row_stride < w.n) {
         throw std::invalid_argument(
             "t2 PTQ1 wide-t mma: unsupported shape or packing (needs a PTQ1_G128_FP16 weight "
@@ -49,10 +49,14 @@ void launch_t2_ptq1_wide_t(const Tensor& x, const Weight& w, Tensor& out,
     // row-block grid.
     const unsigned grid =
         static_cast<unsigned>((w.n + kTernaryWideRowsPerCta - 1) / kTernaryWideRowsPerCta);
-    ternary_wide_t_kernel<true><<<grid, kTernaryWideThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, x.ne[1], out_row_stride);
+    const auto launch = [&]<class Out>() {
+        ternary_wide_t_kernel<true, Out><<<grid, kTernaryWideThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<Out*>(out.data), w.n, w.k, x.ne[1], out_row_stride);
+    };
+    if (out.dtype == DType::FP32) launch.template operator()<float>();
+    else launch.template operator()<__nv_bfloat16>();
     CUDA_CHECK(cudaGetLastError());
 }
 

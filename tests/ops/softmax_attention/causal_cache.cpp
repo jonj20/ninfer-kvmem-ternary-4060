@@ -5303,11 +5303,47 @@ int run_softmax_attention_invariant_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+namespace {
+
+int check_dense_partial_rejected(const Geometry& geometry) {
+    constexpr std::int32_t kTokens = 1;
+    const RowInputs inputs = make_row_inputs(geometry, 63, kTokens, 9100u);
+    const HostCache initial = make_cache(geometry, kPlanBf16, 128, 9101u);
+    int failures = 0;
+    for (const std::int32_t stride : {1, 2}) {
+        DeviceCache cache(initial, MappingPattern::Fragmented);
+        auto view = cache.batch_view();
+        view.page_stride = stride;
+        GuardedDeviceBuffer partial(
+            ops::causal_attention_partial_elements(geometry.q_heads, kTokens) * sizeof(float));
+        try {
+            (void)run_row(geometry, inputs, kTokens, view, {1, 128}, &partial);
+            std::cerr << geometry.name << ": GQA4 accepted an unsupported partial output\n";
+            ++failures;
+        } catch (const std::invalid_argument& error) {
+            if (std::string_view(error.what()).find("GQA4 supports heads TP") == std::string_view::npos) {
+                std::cerr << geometry.name << ": unexpected partial rejection: " << error.what() << '\n';
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+} // namespace
+
 int run_softmax_attention_dense_family_tests() {
     std::cout << std::unitbuf;
     if (cuda_unavailable()) return 77;
     int failures = 0;
-    for (const Geometry geometry : {Geometry{"dense-h8-kv2", 8, 2}, Geometry{"dense-h16-kv4", 16, 4}}) {
+    // Includes uneven 1+3 KV-head shares of H16/KV4, not just the 1+1 split of H8/KV2.
+    // A1/A3 and masked-batch cases use the independent FP64 attention oracle after decoding
+    // represented cache values; they do not compare one kernel's output against another.
+    for (const Geometry geometry : {Geometry{"dense-h4-kv1", 4, 1},
+                                     Geometry{"dense-h8-kv2", 8, 2},
+                                     Geometry{"dense-h12-kv3", 12, 3},
+                                     Geometry{"dense-h16-kv4", 16, 4}}) {
+        failures += check_dense_partial_rejected(geometry);
         failures += run_geometry(geometry);
         for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                 KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::RotatedLloyd4KeyInt4Value,

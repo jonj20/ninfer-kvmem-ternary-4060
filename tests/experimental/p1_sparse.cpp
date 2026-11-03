@@ -78,7 +78,7 @@ int sparse_case(KvCacheStorage storage, const std::vector<int>& prefix, int offs
     const ops::CausalAttentionExecutionEnvelope envelope{
         .min_visible_keys = static_cast<unsigned>(keys),
         .max_visible_keys = static_cast<unsigned>(keys), .fast_prompt_kernel = fast, .small_prefill = true};
-    if (fast && (ops::detail::causal_attention_resolve_route(geometry.q_heads, width, 1, storage, envelope) !=
+    if (fast && (ops::detail::causal_attention_resolve_route(op_geometry(geometry), width, 1, storage, envelope) !=
                      ops::detail::CausalAttentionRoute::Prompt ||
                  !ops::detail::causal_attention_prompt_fast_kernel(storage, true)))
         throw std::runtime_error("Fast sparse fixture did not select the fast prompt route");

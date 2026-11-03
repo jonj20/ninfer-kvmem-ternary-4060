@@ -40,8 +40,9 @@ __global__ void silu_and_mul_fp32_kernel(const float* gate, const float* up, __n
     }
 }
 
+template <class Input>
 __global__ void silu_and_mul_strided_input_kernel(
-    const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int64_t n,
+    const Input* gate, const Input* up, __nv_bfloat16* out, std::int64_t n,
     std::int32_t ne0, std::int32_t ne1, std::int32_t ne2, std::int64_t gnb0, std::int64_t gnb1,
     std::int64_t gnb2, std::int64_t gnb3, std::int64_t unb0, std::int64_t unb1, std::int64_t unb2,
     std::int64_t unb3) {
@@ -64,9 +65,9 @@ __global__ void silu_and_mul_strided_input_kernel(
         const std::int64_t uoff =
             static_cast<std::int64_t>(d0) * unb0 + static_cast<std::int64_t>(d1) * unb1 +
             static_cast<std::int64_t>(d2) * unb2 + static_cast<std::int64_t>(d3) * unb3;
-        const auto gv = *reinterpret_cast<const __nv_bfloat16*>(gate_bytes + goff);
-        const auto uv = *reinterpret_cast<const __nv_bfloat16*>(up_bytes + uoff);
-        out[i]        = __float2bfloat16(silu(__bfloat162float(gv)) * __bfloat162float(uv));
+        const float gv = static_cast<float>(*reinterpret_cast<const Input*>(gate_bytes + goff));
+        const float uv = static_cast<float>(*reinterpret_cast<const Input*>(up_bytes + uoff));
+        out[i]         = __float2bfloat16(silu(gv) * uv);
     }
 }
 

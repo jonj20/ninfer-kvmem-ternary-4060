@@ -5,13 +5,14 @@
 
 #include <cstdint>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace ninfer::test {
-// Run the existing correctness fixtures on physical pipeline ranks without changing their CLI.
+// Run the existing correctness fixtures on pipeline or heads-TP ranks without changing their CLI.
 // CUDA_VISIBLE_DEVICES defines UUID order; these are the resulting local ordinals.
 inline void kvmem_test_devices(EngineOptions& options) {
     const auto parse = [](const char* name) {
@@ -36,6 +37,32 @@ inline void kvmem_test_devices(EngineOptions& options) {
     options.devices = parse("NINFER_TEST_DEVICE_IDS");
     const auto layers = parse("NINFER_TEST_STAGE_LAYERS");
     options.stage_layers.assign(layers.begin(), layers.end());
+    if (const char* raw = std::getenv("NINFER_TEST_TENSOR_PARALLEL")) {
+        const std::string_view flag(raw);
+        if (flag != "0" && flag != "1") throw std::invalid_argument("invalid NINFER_TEST_TENSOR_PARALLEL");
+        options.tensor_parallel = flag == "1";
+    }
+    options.tensor_attention = TensorAttention::Heads;
+    if (const char* raw = std::getenv("NINFER_TEST_TENSOR_SPLIT"); raw && *raw) {
+        std::string_view list(raw);
+        while (!list.empty()) {
+            const auto separator = list.find(',');
+            const auto item = list.substr(0, separator);
+            double value = 0;
+            const auto result = std::from_chars(item.data(), item.data() + item.size(), value);
+            if (result.ec != std::errc{} || result.ptr != item.data() + item.size() ||
+                !std::isfinite(value) || value <= 0)
+                throw std::invalid_argument("invalid NINFER_TEST_TENSOR_SPLIT");
+            options.tensor_split.push_back(value);
+            if (separator == std::string_view::npos) break;
+            list.remove_prefix(separator + 1);
+            if (list.empty()) throw std::invalid_argument("invalid NINFER_TEST_TENSOR_SPLIT");
+        }
+    }
+    if ((!options.tensor_split.empty() && (!options.tensor_parallel ||
+         options.tensor_split.size() != options.devices.size())) ||
+        (options.tensor_parallel && (options.devices.size() < 2 || !options.stage_layers.empty())))
+        throw std::invalid_argument("inconsistent KVMem test tensor-parallel placement");
 }
 
 inline KvCacheStorage kvmem_test_storage(std::string_view name) {

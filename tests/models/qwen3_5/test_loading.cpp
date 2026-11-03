@@ -1,6 +1,8 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
+#include "core/device.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/load/bindings.h"
 
@@ -481,15 +483,188 @@ void invalid_model_data() {
     bad([](Json& root) { root["components"]["text"]["config"]["vocab_size"] = 264; });
 }
 
+void gqa4_positions_rejected_before_binding() {
+    ModelFixture fixture;
+    fixture.file.root["components"]["text"]["config"]["num_attention_heads"] = 4;
+    fixture.file.root["components"]["text"]["config"]["num_key_value_heads"] = 1;
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    LoadOptions options;
+    options.ranks = 2;
+    options.tensor_parallel = true;
+    options.tensor_attention = TensorAttention::Positions;
+    try {
+        (void)qwen::plan_load(reader, options);
+    } catch (const std::invalid_argument& error) {
+        require(std::string(error.what()).find("GQA4 dense models require --tensor-attention heads") !=
+                    std::string::npos,
+                "unsupported GQA4 positions did not fail before weight binding");
+        return;
+    }
+    throw std::runtime_error("unsupported GQA4 positions accepted");
+}
+
+// This opt-in GPU check reaches the real Model -> Parameters boundary. Direct Op tests that
+// pass a policy themselves cannot catch an option that never reaches rank 0's parameters.
+// The two logical ranks may share one GPU; no collective or inference kernel is required.
+void tensor_parallel_precision_parameters() {
+    ModelFixture fixture;
+    auto& config = fixture.file.root["components"]["text"]["config"];
+    config["hidden_size"] = 512;
+    config["num_hidden_layers"] = 2;
+    config["layer_types"] = {"full_attention", "linear_attention"};
+    config["num_attention_heads"] = 16;
+    config["num_key_value_heads"] = 4;
+    config["head_dim"] = 256;
+    config["intermediate_size"] = 1024;
+    config["linear_num_key_heads"] = 4;
+    config["linear_key_head_dim"] = 128;
+    config["linear_num_value_heads"] = 16;
+    config["linear_value_head_dim"] = 128;
+    config["linear_conv_kernel_dim"] = 4;
+    config["rope_parameters"]["mrope_section"] = {22, 21, 21};
+    fixture.file.root["bindings"] = Json::object();
+    fixture.file.root["uses"] = Json::array();
+    const auto add = [&](const std::string& name, std::vector<std::uint64_t> shape,
+                         QType format, const std::string& input = "") {
+        const auto object = "tp-policy/" + name;
+        fixture.tensor(object, std::move(shape), format,
+                       format == QType::NVFP4 ? QuantLayout::BlockScaleK16M128x4
+                                             : QuantLayout::Contiguous);
+        fixture.file.root["bindings"][name] = {{"object", object}};
+        if (!input.empty()) {
+            // The inherited fixture's calibration[0] is positive FP32 2.0. Every NVFP4
+            // Use needs it while the stored permission is AllowA4, even when a later
+            // Parameters option will lower the execution policy to A16.
+            fixture.use(name, input, format == QType::NVFP4 ? std::optional<int>{0}
+                                                           : std::nullopt);
+            if (format != QType::NVFP4)
+                fixture.file.root["uses"].back()["activation_policy"] = "A16Only";
+        }
+    };
+    add("text/token_embedding", {272, 512}, QType::BF16);
+    fixture.file.root["bindings"]["text/output_head"] =
+        fixture.file.root["bindings"]["text/token_embedding"];
+    fixture.use("text/output_head", "text/final_hidden");
+    fixture.file.root["uses"].back()["activation_policy"] = "A16Only";
+    add("text/final_norm", {512}, QType::BF16);
+    for (unsigned layer = 0; layer < 2; ++layer) {
+        const auto p = "text/layers/" + std::to_string(layer) + "/";
+        add(p + "input_norm", {512}, QType::BF16);
+        add(p + "post_attention_norm", {512}, QType::BF16);
+        for (const auto* role : {"gate", "up"})
+            add(p + "mlp/" + role, {1024, 512}, QType::NVFP4, p + "ffn_input");
+        add(p + "mlp/down", {512, 1024}, QType::NVFP4, p + "mlp/product");
+        const auto mixer = layer == 0 ? "attention/" : "gdn/";
+        for (const auto* role : {"query", "key", "value", layer == 0 ? "gate" : "z"}) {
+            const std::string name(role);
+            const unsigned rows = layer == 0 ? (name == "query" || name == "gate" ? 4096 : 1024)
+                                             : (name == "query" || name == "key" ? 512 : 2048);
+            add(p + mixer + role, {rows, 512}, QType::NVFP4, p + "mixer_input");
+        }
+        add(p + mixer + "output", {512, layer == 0 ? 4096u : 2048u}, QType::NVFP4,
+            p + mixer + "gated_output");
+        if (layer == 0) {
+            add(p + "attention/query_norm", {256}, QType::BF16);
+            add(p + "attention/key_norm", {256}, QType::BF16);
+        } else {
+            for (const auto* role : {"a_projection", "b_projection"})
+                add(p + "gdn/" + role, {16, 512}, QType::BF16, p + "mixer_input");
+            for (const auto* role : {"a_log", "dt_bias"})
+                add(p + "gdn/" + role, {16}, QType::FP32);
+            add(p + "gdn/convolution", {4, 3072}, QType::BF16);
+            add(p + "gdn/norm", {128}, QType::BF16);
+        }
+    }
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const std::array ids{0, 0};
+    DeviceContext device(ids);
+    require(device.compute_capability() >= 100,
+            "--tp-policy requires native NVFP4 permission (Blackwell)");
+    const auto check_block = [](const qwen::execution::BlockParameters& block,
+                                ops::LinearPolicy expected) {
+        const auto& dense = std::get<qwen::execution::DenseParameters>(block.ffn);
+        require(dense.gate_up.policy == expected && dense.down.policy == expected &&
+                    dense.verify_gate_up_policy == expected && dense.up &&
+                    dense.up->policy == expected,
+                "TP NVFP4 FFN policy did not honor the selected precision on every rank");
+        std::visit([&](const auto& mixer) {
+            require(mixer.output.policy == expected,
+                    "TP NVFP4 FP32 residual partial retained the wrong policy");
+            std::visit([&](const auto& projection) {
+                require(projection.policy == expected,
+                        "TP NVFP4 input projection retained the wrong policy");
+            }, mixer.projection);
+        }, block.mixer);
+    };
+    unsigned checked = 0;
+    for (const auto split : {std::array{3., 1.}, std::array{1., 3.}}) {
+        for (unsigned mode = 0; mode < 4; ++mode) {
+            LoadOptions options;
+            options.ranks = 2;
+            options.tensor_parallel = true;
+            options.tensor_attention = TensorAttention::Heads;
+            options.tensor_split = {split[0], split[1]};
+            options.nvfp4_w4a16 = (mode & 1) != 0;
+            options.nvfp4_w4a8_int = (mode & 2) != 0;
+            auto model = qwen::materialize_model(
+                qwen::plan_load(reader, options, {}, qwen::rank_tiers(device)), device);
+            const qwen::execution::Parameters parameters(*model);
+            require(parameters.text.rank_count == 2 && parameters.text.rank_layers.size() == 1,
+                    "precision test did not bind both actual tensor ranks");
+            const auto& shares = parameters.text.tensor_shares;
+            const unsigned first_kv = split[0] > split[1] ? 3 : 1;
+            require(shares[0].kv_head_end - shares[0].kv_head_begin == first_kv &&
+                        shares[0].ffn_end - shares[0].ffn_begin == first_kv * 256,
+                    "precision test did not exercise the requested unequal shard geometry");
+            // None of these small BF16-output shapes has an INT8 route; residual/FFN
+            // partials are FP32. INT8 must therefore lower to A16, never leave AllowA4.
+            const auto expected = mode == 0 ? ops::LinearPolicy::AllowA4
+                                            : ops::LinearPolicy::A16Only;
+            for (const auto& block : parameters.text.layers) check_block(block, expected);
+            for (const auto& block : parameters.text.rank_layers[0]) check_block(block, expected);
+            require(parameters.text.output_head.policy == ops::LinearPolicy::A16Only &&
+                        parameters.text.output_head.weight.n == 272 &&
+                        parameters.text.output_head.weight.k == 512,
+                    "TP policy handling changed the unsplit output head");
+            ++checked;
+        }
+    }
+    // The default ordinary path continues to honor the artifact's AllowA4 permission.
+    DeviceContext single_device;
+    auto single = qwen::materialize_model(qwen::plan_load(reader, {}, {},
+                                          qwen::rank_tiers(single_device)), single_device);
+    const qwen::execution::Parameters ordinary(*single);
+    require(!ordinary.text.tensor_parallel(), "ordinary control unexpectedly split weights");
+    for (const auto& block : ordinary.text.layers) check_block(block, ops::LinearPolicy::AllowA4);
+    std::cout << "TP precision Model->Parameters: " << checked
+              << " unequal-split/option cases plus ordinary control passed\n";
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--tp-policy") {
+            int devices = 0;
+            cudaDeviceProp props{};
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
+                cudaGetDeviceProperties(&props, 0) != cudaSuccess || props.major < 10) {
+                std::cout << "TP NVFP4 policy check requires a visible Blackwell GPU\n";
+                return 77;
+            }
+            tensor_parallel_precision_parameters();
+            return 0;
+        }
+        require(argc == 1, "usage: loading_test [--tp-policy]");
         logical_data_and_instances();
         shared_stage_auxiliaries();
         native_uses();
         resident_vision_stage_sizing();
         invalid_model_data();
+        gqa4_positions_rejected_before_binding();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
     } catch (const std::exception& error) {

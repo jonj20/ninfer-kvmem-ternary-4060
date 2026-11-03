@@ -24,9 +24,13 @@ using ninfer::ops::CausalAttentionExecutionEnvelope;
 using ninfer::ops::detail::causal_attention_resolve_route;
 using ninfer::ops::detail::causal_attention_route_name;
 using ninfer::ops::detail::CausalAttentionRoute;
-// Both registered attention geometries: the 27B models (Qwen3.6/3.8-27B, Ternary Bonsai 2) and
-// Qwen3.6-35B-A3B. Their route tables differ, and the 27B one turns on the storage below a cutoff.
-constexpr AttentionHeadGeometry kGeometries[] = {{256, 24, 4}, {256, 16, 2}};
+// Full models and whole-KV-head TP shares. Query-head counts alone are ambiguous:
+// Hq=8,12,16 may each name a GQA4 share or a different model's GQA6/GQA8 share.
+constexpr AttentionHeadGeometry kGeometries[] = {
+    {256, 24, 4}, {256, 18, 3}, {256, 12, 2}, {256, 6, 1},
+    {256, 16, 2}, {256, 8, 1},
+    {256, 16, 4}, {256, 12, 3}, {256, 8, 2}, {256, 4, 1},
+};
 
 // Every KV storage the engine can be configured with. The route table branches on storage, so a
 // planner that is right for one of them is not thereby right for the rest.
@@ -43,7 +47,7 @@ CausalAttentionRoute route_at(AttentionHeadGeometry geometry, std::uint32_t capa
     const std::uint64_t target =
         std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1);
     return causal_attention_resolve_route(
-        geometry.query_heads, static_cast<std::int32_t>(draft_window) + 1, 1, storage,
+        geometry, static_cast<std::int32_t>(draft_window) + 1, 1, storage,
         CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)});
 }
 
@@ -146,7 +150,7 @@ void check(AttentionHeadGeometry geometry, std::uint32_t capacity, std::uint32_t
             const std::uint64_t target = std::min<std::uint64_t>(
                 capacity, static_cast<std::uint64_t>(profile.max) + draft_window + step + 2);
             steps.push_back(causal_attention_resolve_route(
-                geometry.query_heads, 1, 1, storage,
+                geometry, 1, 1, storage,
                 CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)}));
         }
         const auto [it, inserted] = steps_of_class.emplace(profile.topology_class, steps);
@@ -168,7 +172,7 @@ void check_ordinary(AttentionHeadGeometry geometry, std::uint32_t capacity, KvCa
     std::map<std::uint32_t, CausalAttentionRoute> route_of_class;
     for (const auto& profile : profiles) {
         const CausalAttentionRoute route = causal_attention_resolve_route(
-            geometry.query_heads, 1, 1, storage,
+            geometry, 1, 1, storage,
             CausalAttentionExecutionEnvelope{profile.min + 1U, profile.max + 1U});
         const auto [it, inserted] = route_of_class.emplace(profile.topology_class, route);
         if (!inserted && it->second != route) {
@@ -182,9 +186,43 @@ void check_ordinary(AttentionHeadGeometry geometry, std::uint32_t capacity, KvCa
     }
 }
 
+
+// GQA4 has one prompt policy for full models and TP shares, including batched, wide and
+// invariant envelopes. A query-only dispatch would misclassify 8/2, 12/3 and 16/4 here.
+void check_gqa4_prompt_routes() {
+    for (const AttentionHeadGeometry geometry : kGeometries) {
+        if (geometry.query_heads != 4 * geometry.kv_heads) continue;
+        for (const KvCacheStorage storage : kStorages) {
+            for (const std::int32_t batch : {1, 3}) {
+                for (const std::int32_t width : {1, 6, 8, 12, 16, 17, 64}) {
+                    if (batch > 1 && width > 16) continue;
+                    for (const std::uint32_t keys : {256U, 4096U, 32768U}) {
+                        for (const bool invariant : {false, true}) {
+                            CausalAttentionExecutionEnvelope envelope{1U, keys, false, true};
+                            if (invariant) envelope.invariant_segment_keys = 512U;
+                            if (causal_attention_resolve_route(geometry, width, batch, storage,
+                                                               envelope) != CausalAttentionRoute::Prompt ||
+                                ninfer::ops::causal_softmax_attention_route_family(
+                                    geometry, storage, envelope, batch, width) != 2 ||
+                                ninfer::ops::causal_softmax_attention_small_t_launches(
+                                    geometry, storage, envelope, batch, width) != 0) {
+                                std::cerr << "GQA4 heads=" << geometry.query_heads << "/"
+                                          << geometry.kv_heads << " B=" << batch << " W=" << width
+                                          << ": expected prompt-only execution\n";
+                                ++failures;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
+    check_gqa4_prompt_routes();
     // One past the widest window any registered verify path can request today
     // (kMtpDecodeMaximumDrafts and kDFlashDecodeMaximumDrafts are both 15), so the guard that adds
     // the route-flip boundary is itself covered rather than trusted.

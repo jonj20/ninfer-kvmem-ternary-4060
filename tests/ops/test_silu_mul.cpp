@@ -1,9 +1,11 @@
+#include "core/device.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <vector>
 
@@ -134,6 +136,101 @@ int run_strided_gate_up_case() {
     return failures;
 }
 
+// The combined projection stores [gate; up] per token. Both row slices retain
+// the full parent's column pitch; no intermediate BF16 rounding is permitted.
+int run_fp32_strided_gate_up_case(std::int32_t rows, std::int32_t columns) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count), parent(2 * count);
+    GuardedDeviceBuffer device_parent(parent.size() * sizeof(float));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    Tensor projected(device_parent.data(), DType::FP32, {2 * rows, columns});
+    const Tensor gate_tensor = projected.slice(0, 0, rows);
+    const Tensor up_tensor = projected.slice(0, rows, rows);
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns});
+    cudaStream_t stream;
+    cudaGraph_t captured;
+    cudaGraphExec_t executable;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+    int failures = 0;
+    for (int replay = 0; replay < 2; ++replay) {
+        fill_uniform(gate, 401u + replay, -12.0f, 12.0f);
+        fill_uniform(up, 411u + replay, -8.0f, 8.0f);
+        for (std::int32_t column = 0; column < columns; ++column) {
+            const std::size_t source = static_cast<std::size_t>(column) * rows;
+            std::copy_n(gate.data() + source, rows, parent.data() + 2 * source);
+            std::copy_n(up.data() + source, rows, parent.data() + 2 * source + rows);
+        }
+        device_parent.copy_from_host(parent.data(), device_parent.bytes());
+        const auto expected = silu_mul_oracle(gate, up);
+        // Check eager and captured execution independently against represented FP32 inputs.
+        ops::silu_mul(gate_tensor, up_tensor, out_tensor, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        failures += verify_pointwise("silu_mul FP32 row views eager",
+                                      from_device_bf16(device_out.data(), count), expected,
+                                      silu_mul_bf16_criterion());
+        CUDA_CHECK(cudaMemsetAsync(device_out.data(), 0xff, device_out.bytes(), stream));
+        CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        failures += verify_pointwise("silu_mul FP32 row views graph",
+                                      from_device_bf16(device_out.data(), count), expected,
+                                      silu_mul_bf16_criterion());
+        failures += verify_exact("silu_mul FP32 row views unchanged",
+                                  from_device<float>(device_parent.data(), parent.size()), parent);
+        failures += device_parent.verify_guards("silu_mul FP32 row views");
+        failures += device_out.verify_guards("silu_mul FP32 row views out");
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(captured));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return failures;
+}
+
+// Independent pitches in all four dimensions, including a non-unit row stride.
+int run_fp32_general_stride_case() {
+    constexpr int rows = 7, columns = 3, planes = 2, batches = 2;
+    std::vector<float> gate_parent(5 * 17 * 4 * 3), up_parent(19 * 6 * 5 * 4);
+    fill_uniform(gate_parent, 421u, -12.0f, 12.0f);
+    fill_uniform(up_parent, 422u, -8.0f, 8.0f);
+    GuardedDeviceBuffer device_gate(gate_parent.size() * sizeof(float));
+    GuardedDeviceBuffer device_up(up_parent.size() * sizeof(float));
+    GuardedDeviceBuffer device_out(rows * columns * planes * batches * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_parent.data(), device_gate.bytes());
+    device_up.copy_from_host(up_parent.data(), device_up.bytes());
+    const Tensor gate_tensor = Tensor(device_gate.data(), DType::FP32, {5, 17, 4, 3})
+                                   .permute({1, 0, 2, 3})
+                                   .slice(0, 1, rows).slice(1, 1, columns)
+                                   .slice(2, 1, planes).slice(3, 1, batches);
+    const Tensor up_tensor = Tensor(device_up.data(), DType::FP32, {19, 6, 5, 4})
+                                 .slice(0, 3, rows).slice(1, 2, columns)
+                                 .slice(2, 2, planes).slice(3, 1, batches);
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns, planes, batches});
+    std::vector<float> gate, up;
+    for (int b = 0; b < batches; ++b)
+        for (int p = 0; p < planes; ++p)
+            for (int c = 0; c < columns; ++c)
+                for (int r = 0; r < rows; ++r) {
+                    gate.push_back(gate_parent[(c + 1) + 5 * ((r + 1) + 17 * ((p + 1) + 4 * (b + 1)))]);
+                    up.push_back(up_parent[(r + 3) + 19 * ((c + 2) + 6 * ((p + 2) + 5 * (b + 1)))]);
+                }
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+    int failures = verify_pointwise("silu_mul FP32 general strides",
+                                    from_device_bf16(device_out.data(), gate.size()),
+                                    silu_mul_oracle(gate, up), silu_mul_bf16_criterion());
+    failures += verify_exact("silu_mul FP32 strided gate unchanged",
+                              from_device<float>(device_gate.data(), gate_parent.size()), gate_parent);
+    failures += verify_exact("silu_mul FP32 strided up unchanged",
+                              from_device<float>(device_up.data(), up_parent.size()), up_parent);
+    failures += device_gate.verify_guards("silu_mul FP32 strided gate");
+    failures += device_up.verify_guards("silu_mul FP32 strided up");
+    failures += device_out.verify_guards("silu_mul FP32 strided out");
+    return failures;
+}
+
 int run_edge_case() {
     std::vector<float> gate{-30.0f, -8.0f, -1.0f, 0.0f, 1.0f, 8.0f, 30.0f};
     std::vector<float> up{2.0f, -3.0f, 0.5f, -4.0f, 5.0f, -6.0f, 7.0f};
@@ -166,7 +263,7 @@ int run_edge_case() {
 
 } // namespace
 
-int main() {
+int main() try {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -177,7 +274,13 @@ int main() {
     failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
     failures += run_fp32_case(4352, 3, 103u);
     failures += run_strided_gate_up_case();
+    failures += run_fp32_strided_gate_up_case(192, 9);
+    failures += run_fp32_strided_gate_up_case(896, 65);
+    failures += run_fp32_general_stride_case();
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";
     return failures ? 1 : 0;
+} catch (const std::exception& error) {
+    std::cerr << "FAIL silu_mul: " << error.what() << std::endl;
+    return 1;
 }

@@ -55,21 +55,4 @@ decltype(auto) with_causal_geometry(std::int32_t query_heads, std::int32_t kv_he
     return f.template operator()<CausalD256H16Kv2>();
 }
 
-// The same for a call named by its query heads alone. A call holds whole groups of query heads, and
-// the geometries' counts (6, 12, 18 or 24, and 8 or 16) do not overlap.
-template <typename F>
-decltype(auto) with_causal_query_geometry(std::int32_t query_heads, F&& f) {
-    const std::int32_t group = query_heads % CausalD256H24Kv4::GroupSize == 0
-                                   ? CausalD256H24Kv4::GroupSize
-                                   : CausalD256H16Kv2::GroupSize;
-    return with_causal_geometry(query_heads, query_heads / group, static_cast<F&&>(f));
-}
-
-// The query heads of the model whose geometry a call with `query_heads` takes: a tensor-parallel
-// share takes its model's measured routes, chunks and tiles.
-[[nodiscard]] inline std::int32_t causal_attention_model_query_heads(std::int32_t query_heads) {
-    return with_causal_query_geometry(query_heads,
-                                      []<typename Geometry>() { return Geometry::ModelQHeads; });
-}
-
 } // namespace ninfer::ops

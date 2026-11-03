@@ -699,6 +699,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             auto& stats = memory_statistics->ranks[rank];
             auto& candidates = memory_candidate_statistics->ranks[rank];
             stats.first_layer = candidates.first_layer = layout.first_layer;
+            stats.key_offset = candidates.key_offset = layout.key_offset;
+            stats.query_offset = candidates.query_offset = layout.query_offset;
             candidates.block_tokens = 1;
             if(rank==0) stats.attention_tokens=layout.attention_tokens.bind(backings[rank]);
             candidates.attention_tokens=stats.attention_tokens;
@@ -732,6 +734,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         memory_statistics->ranks.front().prefill_origin =
             plan.persistent.memory_statistics.front().prefill_origin.bind(backing);
+        memory_statistics->validate_layout();
+        memory_candidate_statistics->validate_layout();
     }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
@@ -1075,6 +1079,12 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
 
 MemorySummary ProgramImpl::memory_summary() const noexcept {
     MemorySummary out;
+    for (std::size_t rank = 0; rank < parameters.text.tensor_shares.size(); ++rank) {
+        const auto& share = parameters.text.tensor_shares[rank];
+        out.tensor_shares.push_back({static_cast<std::uint32_t>(rank),
+            share.kv_head_begin, share.kv_head_end, share.key_head_begin, share.key_head_end,
+            share.ffn_begin, share.ffn_end});
+    }
     if (kvmem_window_tokens) {
         auto& memory = out.kvmem;
         memory.enabled = true;

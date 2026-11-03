@@ -59,8 +59,17 @@ public:
             const auto byte = std::to_integer<unsigned char>(value);
             model_id += hex[byte >> 4]; model_id += hex[byte & 15];
         }
-        d.identity = {"ninfer", program.backend_kv_pages ? "kvmem-main-mtp-pages-v2" : "kvmem-native-pages-v1",
-            model_id, "qwen3.5-kvmem-state-image-v3"};
+        d.identity = {"ninfer", program.backend_kv_pages ? "kvmem-main-mtp-pages-v3" : "kvmem-native-pages-v2",
+            model_id, "qwen3.5-kvmem-state-image-v4"};
+        // StateImage contains every GDN shard, including ranks without KV heads.
+        // Bind checkpoints to this partition rather than only to its byte size.
+        for (std::size_t i = 0; i < program.state_images->shard_count(); ++i) {
+            const auto& shard = program.state_images->shard(i);
+            d.identity.state_schema += ":" + std::to_string(shard.rank) + "," +
+                std::to_string(shard.first_layer) + "," + std::to_string(shard.layers) + "," +
+                std::to_string(shard.part) + "," + std::to_string(shard.value_heads) + "," +
+                std::to_string(shard.conv_channels);
+        }
         const char* layout_name = nullptr;
         switch (program.kv_storage) {
         case KvCacheStorage::BFloat16: layout_name = "ninfer.bf16.page.v1"; break;
@@ -82,27 +91,45 @@ public:
             break;
         default: throw std::logic_error("Unsupported KVMem native KV storage");
         }
-        d.layout = {layout_name, 1, page_tokens, page_bytes, 256, {}};
+        d.layout = {layout_name, 2, page_tokens, page_bytes, 256, {}};
         const auto& config = program.parameters.model.config().text;
         const std::uint32_t planes = program.kv_storage == KvCacheStorage::BFloat16 ? 2 : 4;
         const kvmem::PayloadPlaneKind kinds[] = {kvmem::PayloadPlaneKind::Key,
             kvmem::PayloadPlaneKind::Value, kvmem::PayloadPlaneKind::KeyScale,
             kvmem::PayloadPlaneKind::ValueScale};
         std::size_t ordinal = 0;
+        const auto& cache = program.decoder->text_kv;
+        if (cache.position_ranks() > 1)
+            throw std::logic_error("KVMem native pages require heads attention");
+        const auto shares = cache.head_shares();
+        const auto ranks = shares.empty() ? 1U : shares.size();
+        std::uint32_t attention_layer = 0;
         for (std::uint32_t layer = 0; layer < config.layer_types.size(); ++layer) {
             if (config.layer_types[layer] != MixerKind::FullAttention) { continue; }
-            for (std::uint32_t kind = 0; kind < planes; ++kind) {
-                const auto& plane = layout.planes.at(ordinal++);
-                d.layout.planes.push_back({layer, kinds[kind], plane.offset,
-                    plane.page_payload_bytes, 1, 0});
+            std::uint32_t head_begin = 0;
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                const auto head_count = static_cast<std::uint32_t>(
+                    shares.empty() ? config.attention->num_key_value_heads : shares[rank]);
+                const auto owner = static_cast<std::uint32_t>(
+                    shares.empty() ? cache.layer_rank(attention_layer) : rank);
+                for (std::uint32_t kind = 0; kind < planes; ++kind) {
+                    const auto& plane = layout.planes.at(ordinal++);
+                    d.layout.planes.push_back({layer, kinds[kind], plane.offset,
+                        plane.page_payload_bytes, 1, 0, owner, head_begin, head_count});
+                }
+                head_begin += head_count;
             }
+            if (head_begin != config.attention->num_key_value_heads)
+                throw std::logic_error("KVMem page inventory does not cover every KV head");
+            ++attention_layer;
         }
         if (ordinal != layout.planes.size()) { throw std::logic_error("KVMem plane inventory mismatch"); }
         if (mtp_layout) {
             for (std::uint32_t kind = 0; kind < planes; ++kind) {
                 const auto& plane = mtp_layout->planes.at(kind);
                 d.layout.planes.push_back({static_cast<std::uint32_t>(config.layer_types.size()),
-                    kinds[kind], layout.page_stride + plane.offset, plane.page_payload_bytes, 1, 0});
+                    kinds[kind], layout.page_stride + plane.offset, plane.page_payload_bytes, 1, 0,
+                    0, 0, static_cast<std::uint32_t>(config.attention->num_key_value_heads)});
             }
         }
         d.capabilities = {page_tokens, program.capacity, true, true, true, false, false, false};

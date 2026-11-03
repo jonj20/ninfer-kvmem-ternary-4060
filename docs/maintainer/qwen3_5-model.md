@@ -157,6 +157,15 @@ KV head serving a consecutive group of query heads. The gate is neither normaliz
 The logical cached values are normalized/rotated K and projected V. Prefill appends a chunk and
 uses causal attention; decode appends one column and attends over the visible prefix.
 
+The local D256 GQA4 dense extension supports one through four KV heads, with four query heads
+per KV head. Heads tensor parallelism keeps whole KV heads and their query groups together,
+including H4/KV1 and H12/KV3 shares of H16/KV4. Every GQA4 width uses prompt attention; it does
+not enter the specialized GQA6/GQA8 small-T kernels. Route and workspace planning carry both
+query-head and KV-head counts because H8, H12 and H16 alone do not identify the GQA ratio.
+GQA4 requires `--tensor-attention heads`: model loading rejects position-split TP, and the Op
+rejects partial-output requests before appending KV or launching a kernel. The upstream
+GQA6/GQA8 position-split paths retain their existing contract.
+
 Paging and KV quantization are storage choices. Their contracts are
 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h),
 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) and

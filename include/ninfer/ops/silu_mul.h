@@ -12,7 +12,8 @@ namespace ninfer::ops {
  *   ideal[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i].
  *
  * `gate`, `up`, and `out` are same-shaped tensors: out BF16 and contiguous; gate and up both BF16
- * with arbitrary valid Tensor strides, or both contiguous FP32 (unrounded projections). out must not overlap either input (the two read-only inputs may
+ * or both FP32 (unrounded projections), with arbitrary valid Tensor strides in either case.
+ * out must not overlap either input (the two read-only inputs may
  * overlap one another). The oracle evaluates `ideal` in FP64 from the represented inputs. The BF16
  * output is promoted and compared directly with that result; output storage rounding belongs to
  * the Op's numerical criterion, not the oracle. Private kernel arithmetic is

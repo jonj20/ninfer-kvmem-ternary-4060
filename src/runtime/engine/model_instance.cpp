@@ -328,6 +328,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("KVMem auxiliary budgets require selected_tokens");
     }
     if (options.kvmem.selected_tokens != 0) {
+        if (options.tensor_attention != TensorAttention::Heads) {
+            throw std::invalid_argument("KVMem tensor parallelism requires tensor-attention heads");
+        }
         if (options.expert_residency != ExpertResidency::Device) {
             throw std::invalid_argument("KVMem does not support host/disk routed expert residency");
         }
@@ -354,10 +357,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-        // Layer stages return target features to the rank-0 drafter. The pinned
-        // tensor-parallel executor does not implement these feature taps.
+        // Layer stages return features; heads TP taps the completed rank-0 residual.
         const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
-            options.max_concurrency <= kMaximumConcurrency && !options.tensor_parallel &&
+            options.max_concurrency <= kMaximumConcurrency &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
             ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
@@ -398,7 +400,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
             throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
-                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
                 "and disabled prefix cache");
         }
     }
@@ -868,9 +870,21 @@ static ConstructedModel construct_model_impl(const EngineOptions& requested, Dev
             .kv_storage = options.kv_cache,
             .state_slots =
                 options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
-            .kv_tokens         = std::uint64_t(options.max_context) * options.max_concurrency,
+            .kv_tokens         = std::uint64_t(options.kvmem.selected_tokens
+                ? options.kvmem.device_tokens() : options.max_context) * options.max_concurrency,
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
-            .kv_headroom_bytes = options.kv_capacity.automatic_headroom_bytes};
+            .kv_headroom_bytes = options.kv_capacity.automatic_headroom_bytes,
+            .memory_statistics = {
+                .capacity = options.max_context,
+                // Normalization already bounds B+R by the uint32 max_context.
+                .window_tokens = options.kvmem.selected_tokens
+                    ? static_cast<std::uint32_t>(options.kvmem.device_tokens()) : 0U,
+                .prefill_chunk = options.prefill_chunk,
+                .verify_window = std::max(options.speculative.draft_tokens,
+                                           options.speculative.ngram_draft_tokens),
+                .max_concurrency = options.max_concurrency,
+                .query_max_tokens = options.kvmem.query_max_tokens,
+                .mean_query = options.kvmem.query_meanq_cosine}};
         options.tensor_split = models::qwen3_5::default_tensor_split(
             reader, models::load_options(options), sizing, free_bytes, rank_copy_bandwidth(device));
     }

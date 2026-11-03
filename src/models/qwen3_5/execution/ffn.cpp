@@ -177,8 +177,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (input_norm != nullptr) {
-        // Only the composition at the bottom of this function folds the norm, so a caller that hands
-        // an un-normed row to any other path must not be answered.
+        // Only the dense combined gate/up composition folds the norm (including
+        // a TP share); other paths must not receive an un-normalized row.
         const auto* dense = std::get_if<DenseParameters>(&parameters);
         const bool fusable =
             dense != nullptr && !mtp && basis == InputBasis::Primal && !rotated_dense(*dense) &&
@@ -187,10 +187,6 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         if (!fusable) { throw std::invalid_argument("FFN: this path cannot fold its input norm"); }
     }
     if (partial != nullptr) {
-        // The share reads the row it is handed, so it cannot take a caller that deferred its norm.
-        if (input_norm != nullptr) {
-            throw std::invalid_argument("FFN: a tensor-parallel share cannot fold its input norm");
-        }
         if (const auto* share = std::get_if<MoeShareParameters>(&parameters); share && !mtp) {
             const auto storage =
                 workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
@@ -208,16 +204,25 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         Tensor activation = workspace.alloc(DType::BF16, {dense->up ? gu.n : gu.n / 2, columns});
         {
             auto call      = workspace.scope();
-            const Tensor x = rotated_input(hidden, dense->gate_up.hadamard_signs, workspace, stream,
-                                           basis);
-            if (dense->up) {
-                ops::linear_swiglu(x, gu, dense->up->weight, activation, dense->gate_up.policy,
-                                   workspace, stream);
+            if (input_norm != nullptr) {
+                // Each rank sees the whole residual and norm, but only its own
+                // gate/up rows. Down writes FP32 until the cross-rank reduction.
+                ops::linear_swiglu_fused_rmsnorm_int8(hidden, *input_norm->weight,
+                    input_norm->eps, gu, activation,
+                    verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
+                    workspace, stream);
             } else {
-                ops::linear_swiglu(x, gu, activation,
-                                   verify && !is_gguf(gu.qtype) ? dense->verify_gate_up_policy
-                                                                : dense->gate_up.policy,
-                                   workspace, stream);
+                const Tensor x = rotated_input(hidden, dense->gate_up.hadamard_signs, workspace,
+                                               stream, basis);
+                if (dense->up) {
+                    ops::linear_swiglu(x, gu, dense->up->weight, activation, dense->gate_up.policy,
+                                       workspace, stream);
+                } else {
+                    ops::linear_swiglu(x, gu, activation,
+                                       verify && !is_gguf(gu.qtype) ? dense->verify_gate_up_policy
+                                                                    : dense->gate_up.policy,
+                                       workspace, stream);
+                }
             }
         }
         const Tensor v = rotated_input(activation, dense->down.hadamard_signs, workspace, stream);

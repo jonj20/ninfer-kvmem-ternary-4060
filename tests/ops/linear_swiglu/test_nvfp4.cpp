@@ -2,6 +2,7 @@
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -14,6 +15,8 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -185,9 +188,86 @@ int check_negative_gate() {
     }
     return failures;
 }
+
+int check_fused_share() {
+    using namespace ninfer;
+    namespace qw = test::quantized_weight;
+    const UnifiedInt8Route unified;
+    constexpr int rows = 512, k = 5120, half = rows / 2;
+    constexpr float eps = 1.0e-6f;
+    auto packed = qw::make_patterned_weight(QType::NVFP4, rows, k, 20261030U,
+        {.weight_scale_divisor = 256.0f, .input_scale_divisor = 3.5f});
+    test::GuardedDeviceBuffer weights(packed.payload.size());
+    weights.copy_from_host(packed.payload.data(), packed.payload.size());
+    const Weight weight = packed.device_weight(weights.data());
+    std::vector<float> norm(k);
+    for (int column = 0; column < k; ++column) norm[column] = float(column % 7 - 3) / 16.0f;
+    auto norm_device = test::to_device_bf16(norm);
+    Tensor norm_tensor(norm_device.p, DType::BF16, {k});
+    int failures = 0;
+    for (const auto tokens : {1, 9, 65}) {
+        std::vector<float> residual(std::size_t(k) * tokens, 0.0f);
+        for (int column = 0; column < k; ++column) residual[column] = float(column % 31 - 15) / 16.0f;
+        for (int token = 1; token < tokens; ++token) {
+            for (int j = 0; j < 4; ++j) {
+                residual[std::size_t(token) * k + (token * 97 + j * 1237) % k] = float(2 * j - 3) / 8.0f;
+            }
+        }
+        auto residual_device = test::to_device_bf16(residual);
+        test::GuardedDeviceBuffer output(std::size_t(half) * tokens * 2);
+        Tensor input(residual_device.p, DType::BF16, {k, tokens});
+        Tensor out(output.data(), DType::BF16, {half, tokens});
+        WorkspaceArena workspace(ops::linear_swiglu_workspace_capacity_bytes(
+            QType::NVFP4, rows, k, ops::LinearPolicy::AllowNvfp4Int8, tokens, tokens));
+        if (!ops::linear_swiglu_fused_rmsnorm_int8_eligible(weight, ops::LinearPolicy::AllowNvfp4Int8, tokens)) {
+            throw std::runtime_error("NVFP4 heads fused norm route not eligible");
+        }
+        ops::linear_swiglu_fused_rmsnorm_int8(input, norm_tensor, eps, weight, out,
+            ops::LinearPolicy::AllowNvfp4Int8, workspace, nullptr);
+        test::cuda_synchronize();
+        const auto actual = test::from_device_bf16(output.data(), std::size_t(half) * tokens);
+        // Independent FP64 Offset RMSNorm, its explicitly specified BF16 boundary,
+        // then exact-decoded weight projections and the complete nonlinear product.
+        std::vector<double> expected(std::size_t(half) * tokens);
+        for (int token = 0; token < tokens; ++token) {
+            double sum = 0;
+            for (int c = 0; c < k; ++c) {
+                const double value = residual[std::size_t(token) * k + c];
+                sum += value * value;
+            }
+            const double inverse = 1.0 / std::sqrt(sum / k + eps);
+            std::vector<std::pair<int, double>> active;
+            for (int c = 0; c < k; ++c) {
+                const float value = static_cast<float>(residual[std::size_t(token) * k + c] * inverse * (1.0 + norm[c]));
+                if (value != 0) active.emplace_back(c, test::bf16_to_f32(test::f32_to_bf16(value)));
+            }
+            for (int row = 0; row < half; ++row) {
+                double gate = 0, up = 0;
+                for (const auto& [c, value] : active) {
+                    gate += qw::logical_weight_fp64(packed, row, c) * value;
+                    up += qw::logical_weight_fp64(packed, half + row, c) * value;
+                }
+                expected[std::size_t(token) * half + row] = gate / (1.0 + std::exp(-gate)) * up;
+            }
+        }
+        failures += test::verify_reduction("NVFP4 heads fused norm", actual, expected, {0.08, 0.01, 0.12});
+        failures += output.verify_guards("NVFP4 heads fused norm");
+        // Also enforce the fused edge's documented equality to the unfused composition.
+        DeviceBuffer normalized(std::size_t(k) * tokens * 2);
+        Tensor normed(normalized.p, DType::BF16, {k, tokens});
+        ops::rmsnorm(input, norm_tensor, eps, true, normed, nullptr);
+        ops::linear_swiglu(normed, weight, out, ops::LinearPolicy::AllowNvfp4Int8, workspace, nullptr);
+        test::cuda_synchronize();
+        if (actual != test::from_device_bf16(output.data(), std::size_t(half) * tokens)) {
+            throw std::runtime_error("NVFP4 heads fused norm differs from its unfused composition");
+        }
+        if (workspace.used() != 0) throw std::runtime_error("NVFP4 heads fused norm workspace leak");
+    }
+    return failures;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
@@ -196,6 +276,32 @@ int main() {
         return 77;
     }
     try {
+        if (argc == 2 && std::string(argv[1]) == "--heads") {
+            const UnifiedInt8Route unified;
+            constexpr std::array<std::int32_t, 7> widths{1, 4, 8, 9, 33, 65, 129};
+            int failures = 0;
+            bool refused = false;
+            try {
+                (void)ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, 384, 5120,
+                    ops::LinearPolicy::AllowNvfp4Int8, 1, 65);
+            } catch (const std::invalid_argument&) { refused = true; }
+            if (!refused) throw std::runtime_error("unaligned NVFP4 int8 share was accepted");
+            for (const auto rows : {512, 1792}) {
+                for (const auto compute : {ActivationCompute::A16, ActivationCompute::A4,
+                                           ActivationCompute::Int8Grouped}) {
+                    failures += run_profile("NVFP4 heads LinearSwiGLU",
+                        {QType::NVFP4, rows, 5120, rows / 2, 20261030U, compute},
+                        widths, std::array<std::int32_t, 2>{9, 65});
+                }
+            }
+            failures += check_fused_share();
+            ops::detail::force_linear_route_table(ops::detail::LinearRouteTable::Legacy);
+            ops::detail::force_nvfp4_int8_mainloop(ops::detail::Nvfp4Int8Mainloop::Mmq);
+            failures += run_profile("NVFP4 heads MMQ LinearSwiGLU",
+                {QType::NVFP4, 1792, 5120, 896, 20261031U, ActivationCompute::Int8Grouped},
+                std::array<std::int32_t, 3>{1, 9, 65}, std::array<std::int32_t, 1>{65});
+            return failures ? 1 : 0;
+        }
         // The A16 ladder stops at the width the fused wide MMA takes over from the SIMT
         // small-T band: 16|17 is the band boundary, and 128/256/512/1024/1025 carry the
         // wide route over whole tiles and the ragged width just past four of them. TODO.md

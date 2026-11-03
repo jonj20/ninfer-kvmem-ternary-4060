@@ -95,6 +95,25 @@ set_property(GLOBAL APPEND PROPERTY NINFER_BUNDLE_ninfer_pipeline_tests_PROGRAMS
 ninfer_finalize_bundle(ninfer_pipeline_tests)
 ninfer_stage_runtime_dlls(ninfer_pipeline_tests)
 
+# Heads TP qualification: reuse the relevant program objects without linking
+# unrelated model families or the entire numerical suite.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_heads_tests_PROGRAMS
+  ninfer_multi_gpu_test ninfer_serve_options_test ninfer_qwen3_5_loading_test
+  ninfer_artifact_selection_test ninfer_qwen3_5_state_image_test
+  ninfer_qwen3_5_state_image_layout_test ninfer_qwen3_5_mtp_graph_profiles_test
+  ninfer_linear_ptq1_test
+  ninfer_linear_swiglu_ptq1_test ninfer_linear_swiglu_nvfp4_test
+  ninfer_linear_swiglu_pair_rowsplit_test ninfer_linear_nvfp4_a4_test
+  ninfer_linear_rowsplit_runtime_shape_test ninfer_silu_mul_test)
+ninfer_finalize_bundle(ninfer_heads_tests)
+ninfer_stage_runtime_dlls(ninfer_heads_tests)
+ninfer_add_test(ninfer_memory_statistics_layout STANDALONE
+  SOURCES models/qwen3_5/test_memory_statistics_layout.cpp LIBRARIES ninfer_core)
+ninfer_stage_runtime_dlls(ninfer_memory_statistics_layout)
+ninfer_add_test(ninfer_memory_statistics_budget_test STANDALONE
+  SOURCES models/qwen3_5/test_memory_statistics_budget.cpp LIBRARIES ninfer_core kvmem)
+ninfer_stage_runtime_dlls(ninfer_memory_statistics_budget_test)
+
 # Every test executable shares one per-config runtime directory; stage the FFmpeg/curl DLL closure
 # there once so they resolve their imports (the Windows loader only searches the executable's own
 # directory, the system directories and PATH).

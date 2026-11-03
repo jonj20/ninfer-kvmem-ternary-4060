@@ -9,11 +9,9 @@ bool ptq1_a8_shape_supported(std::int32_t n, std::int32_t k) {
 }
 
 void validate_ptq1_shape(std::int32_t n, std::int32_t k, std::int32_t tokens, LinearPolicy policy) {
-    const bool shape = k == 5120
-        ? n == 1024 || n == 4096 || n == 6144 || n == 7168 ||
-          n == 12288 || n == 14336 || n == 16384 || n == 34816 ||
-          n == 131072 || n == 248320
-        : (k == 6144 || k == 17408) && n == 5120;
+    // Runtime-sized tensor shares retain complete packed groups and the
+    // small-T kernel's row/slab units. Do not limit them to whole-model shapes.
+    const bool shape = n > 0 && n % 64 == 0 && k > 0 && k % 512 == 0;
     if (!shape || tokens <= 0) {
         throw std::invalid_argument("PTQ1 linear: unsupported shape or token count");
     }

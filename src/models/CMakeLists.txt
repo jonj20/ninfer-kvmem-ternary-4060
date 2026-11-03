@@ -2,6 +2,7 @@
 add_library(ninfer_model_loading STATIC registry.cpp expert_parallel.cpp)
 ninfer_internal_includes(ninfer_model_loading)
 target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops)
+target_link_libraries(ninfer_model_loading PRIVATE kvmem)
 if(WIN32)
   target_link_libraries(ninfer_model_loading PRIVATE onecore) # PrefetchVirtualMemory
 endif()

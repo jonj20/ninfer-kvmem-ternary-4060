@@ -217,6 +217,14 @@ void row_split_layouts() {
               {.rows = {{0, 3}}, .columns = {{0, 128}, {256, 512}}});
     row_split(QType::T2_G128_FP16, 128, 32, 0, {4, 384},
               {.rows = {{2, 4}}, .columns = {{256, 384}}});
+    // Tensor shares gather every PTQ1 plane independently, including its two-byte
+    // high plane. Disjoint rows/columns change both row pitch and plane offsets.
+    row_split(QType::PTQ1_G128_FP16, 128, 24, 2, {384, 5120},
+              {.rows = {{64, 128}, {256, 384}}, .columns = {{512, 1536}, {3584, 4096}}});
+    // T5 stores two 13-byte base-3 units in each 128-column scale group. A
+    // rank's whole 1024-column blocks must retain those bytes in group order.
+    row_split(QType::T5_G128_FP16, 128, 26, 0, {512, 5120},
+              {.rows = {{128, 256}, {384, 512}}, .columns = {{1024, 2048}, {3072, 5120}}});
     // Q4 whole rows; a K that is not a multiple of 128 cuts only at its end.
     row_split(QType::Q4_G64_FP16, 64, 32, 0, {5, 320},
               {.rows = {{1, 3}}, .columns = {{0, 320}}});

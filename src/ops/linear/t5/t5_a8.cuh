@@ -46,6 +46,7 @@ constexpr int kMaxOutputs = 4;
 
 struct Outputs {
     __nv_bfloat16* data[kMaxOutputs];
+    float* fp32[kMaxOutputs];
     int stride[kMaxOutputs];
     int end[kMaxOutputs]; // exclusive parent row bound of each output
 };
@@ -54,23 +55,32 @@ struct Outputs {
 struct OutputRow {
     __nv_bfloat16* data; // element (row, token 0)
     int rows;            // token stride
+    float* fp32;
 };
 
 __device__ __forceinline__ OutputRow output_row(const Outputs& outputs, int row) {
     __nv_bfloat16* data = outputs.data[0];
+    float* fp32 = outputs.fp32[0];
     int begin = 0, stride = outputs.stride[0];
 #pragma unroll
     for (int s = 1; s < kMaxOutputs; ++s) {
         if (row >= outputs.end[s - 1]) {
             data  = outputs.data[s];
+            fp32 = outputs.fp32[s];
             begin = outputs.end[s - 1];
             stride = outputs.stride[s];
         }
     }
-    return {data + (row - begin), stride};
+    return {data ? data + (row - begin) : nullptr, stride,
+            fp32 ? fp32 + (row - begin) : nullptr};
 }
 
 __device__ __forceinline__ void store_row(OutputRow out, int token, float value, bool accumulate) {
+    if (out.fp32) {
+        float* p = out.fp32 + std::int64_t(token) * out.rows;
+        *p = accumulate ? value + *p : value;
+        return;
+    }
     __nv_bfloat16* p = out.data + std::int64_t(token) * out.rows;
     *p = __float2bfloat16_rn(accumulate ? value + __bfloat162float(*p) : value);
 }

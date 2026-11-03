@@ -4,6 +4,7 @@
 #include <vector>
 #include <exception>
 #include <iostream>
+#include <string_view>
 
 namespace {
 
@@ -55,13 +56,24 @@ int run_nvfp4_a4() {
 // 128-row and 256-column units. A share into BF16 and every row of a small matrix cover the BF16
 // output. On an RTX 5090 the widths reach every tile the A4 route picks by waves
 // (common/wave_tiles.h) into either output.
-int run_nvfp4_a4_shares() {
+int run_nvfp4_a4_shares(bool heads_only = false) {
     std::vector<Invocation> invocations;
-    for (int t : {1,  2,   4,   7,   8,   9,   16,  31,  32,   33,   64,
-                  65, 128, 129, 255, 256, 257, 384, 512, 1024, 1025, 2048})
-        invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
-    for (int t : {1, 4, 8, 9, 10, 33, 129, 257, 512})
-        invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    if (heads_only) {
+        // Keep the FP32 row and down-column shares below, including the A16/A4
+        // boundary and graph replay, without running the whole-matrix suite.
+        // run_shape independently decodes the stored weights and evaluates its
+        // FP64 oracle once at T=129; every narrower call checks that prefix.
+        for (int t : {1, 4, 8, 9, 16, 17, 33, 65, 129})
+            invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
+        for (int t : {9, 65})
+            invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    } else {
+        for (int t : {1,  2,   4,   7,   8,   9,   16,  31,  32,   33,   64,
+                      65, 128, 129, 255, 256, 257, 384, 512, 1024, 1025, 2048})
+            invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
+        for (int t : {1, 4, 8, 9, 10, 33, 129, 257, 512})
+            invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    }
 
     struct Share {
         std::int32_t n;
@@ -75,12 +87,14 @@ int run_nvfp4_a4_shares() {
          {Share{8704, 5120, 731U, DType::FP32}, Share{5120, 8704, 733U, DType::FP32},
           Share{13056, 5120, 735U, DType::FP32}, Share{5120, 4352, 737U, DType::FP32},
           Share{4352, 5120, 739U, DType::BF16}}) {
+        if (heads_only && share.out != DType::FP32) continue;
         failures += run_shape("NVFP4_A4 share", ActivationCompute::A4, make_nvfp4_weight,
                               {share.n, share.k, share.seed, Comparison::SampledRows, true,
                                invocations, ActivationSigns::Centered, share.out});
         failures += verify_workspace_envelopes(QType::NVFP4, share.n, share.k);
     }
     for (const DType out : {DType::BF16, DType::FP32}) {
+        if (heads_only && out != DType::FP32) continue;
         failures += run_shape(
             "NVFP4_A4 share", ActivationCompute::A4, make_nvfp4_weight,
             {384, 768, 741U, Comparison::Full, true, invocations, ActivationSigns::Centered, out});
@@ -90,14 +104,21 @@ int run_nvfp4_a4_shares() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool heads_only = argc == 2 && std::string_view(argv[1]) == "--heads";
+    if (argc != 1 && !heads_only) {
+        std::cerr << "Usage: ninfer_linear_nvfp4_a4_test [--heads]\n";
+        return 2;
+    }
     if (!ninfer::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
-        const int failures = run_nvfp4_a4() + run_nvfp4_a4_shares();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";
+        const int failures = heads_only ? run_nvfp4_a4_shares(true)
+                                        : run_nvfp4_a4() + run_nvfp4_a4_shares();
+        std::cout << (failures == 0 ? "OK" : "FAIL")
+                  << (heads_only ? " NVFP4_A4 Linear heads\n" : " NVFP4_A4 Linear\n");
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "NVFP4_A4 Linear: " << error.what() << '\n';

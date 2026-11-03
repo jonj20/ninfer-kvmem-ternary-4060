@@ -1,5 +1,6 @@
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V split-KV small-T launch ownership.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_geometry.cuh"
 
 #include "core/device.h"
 #include "ops/common/math.h"
@@ -136,8 +137,9 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
                                               Tensor& partial_acc, Tensor& partial_m,
                                               Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
-                                                        envelope, invocation.batch_size);
+    const auto splits = causal_attention_split_capacity(
+        {kCausalHeadDim, q.ne[1], cache.num_kv_heads}, invocation.width, cache.storage,
+        envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked>(
@@ -234,7 +236,7 @@ void causal_attention_small_t_k8v4_launch(
         .partition     = causal_attention_key_partition(envelope, cache),
         .partial_out   = partial_out,
     };
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_small_t_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_small_t_k8v4_launch_for<Geometry>(q, input, positions, scale, cache,
                                                            invocation, envelope, partial_acc,
                                                            partial_m, partial_l, out, stream);
@@ -258,7 +260,7 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
         .batch_size    = 1,
         .partition     = causal_attention_key_partition(envelope, batch_cache),
     };
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_small_t_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_small_t_k8v4_launch_for<Geometry>(q, input, positions, scale, batch_cache,
                                                            invocation, envelope, partial_acc,
                                                            partial_m, partial_l, out, stream);

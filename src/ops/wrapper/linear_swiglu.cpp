@@ -8,6 +8,7 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/sm70/sm70_dequantize.h"
@@ -57,6 +58,21 @@ void validate_policy(LinearPolicy policy) {
 
 namespace {
 
+bool combined_share(QType type, std::int32_t rows, std::int32_t columns) {
+    return (type == QType::PTQ1_G128_FP16 || type == QType::T5_G128_FP16 || type == QType::NVFP4) &&
+           (rows != 34816 || columns != 5120);
+}
+
+bool nvfp4_int8_share(QType type, std::int32_t rows, std::int32_t columns, LinearPolicy policy) {
+    return type == QType::NVFP4 && policy == LinearPolicy::AllowNvfp4Int8 &&
+           rows > 0 && rows % 256 == 0 && columns == 5120;
+}
+
+detail::Nvfp4Int8Mainloop share_int8_table(std::int32_t tokens) {
+    return detail::fused_route_table("nvfp4_int8/linear_swiglu", tokens) == detail::LinearRouteTable::Unified
+               ? detail::Nvfp4Int8Mainloop::Grouped : detail::Nvfp4Int8Mainloop::Mmq;
+}
+
 std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_up_rows,
                                                 std::int32_t input_rows, LinearPolicy policy,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
@@ -66,6 +82,28 @@ std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_u
     if (is_gguf(qtype)) {
         const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
         return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
+    }
+    if (combined_share(qtype, gate_up_rows, input_rows)) {
+        if (nvfp4_int8_share(qtype, gate_up_rows, input_rows, policy)) {
+            return detail::capacity_by_table(min_tokens, max_tokens,
+                [](std::int32_t tokens) {
+                    return detail::fused_route_table("nvfp4_int8/linear_swiglu", tokens);
+                },
+                [gate_up_rows](detail::LinearRouteTable table, std::int32_t first, std::int32_t last) {
+                    return detail::unified::nvfp4_linear_swiglu_int8_workspace_capacity_bytes(
+                        first, last, table == detail::LinearRouteTable::Unified
+                            ? detail::Nvfp4Int8Mainloop::Grouped : detail::Nvfp4Int8Mainloop::Mmq,
+                        gate_up_rows);
+                });
+        }
+        if (qtype == QType::NVFP4 && policy == LinearPolicy::AllowNvfp4Int8) {
+            throw std::invalid_argument("linear_swiglu workspace: NVFP4 int8 shares require N%256=0 and K=5120");
+        }
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::FP32, {gate_up_rows, max_tokens});
+        (void)layout.alloc_bytes(linear_workspace_capacity_bytes(
+            qtype, gate_up_rows, input_rows, policy, min_tokens, max_tokens));
+        return layout.peak_bytes(1);
     }
     if (qtype == QType::T5_G128_FP16) {
         if (gate_up_rows <= 0) { throw std::invalid_argument("linear_swiglu workspace: T5 rows must be positive"); }
@@ -179,6 +217,28 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const std::int32_t t   = x.ne[1];
     if (is_gguf(gate_up_weight.qtype)) {
         detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
+        return;
+    }
+    if (combined_share(gate_up_weight.qtype, gate_up_weight.n, gate_up_weight.k)) {
+        if (gate_up_weight.n <= 0 || gate_up_weight.n % 2 != 0 || t <= 0 ||
+            x.ne[0] != gate_up_weight.k || x.ne[2] != 1 || x.ne[3] != 1 ||
+            out.ne[0] != gate_up_weight.n / 2 || out.ne[1] != t || out.ne[2] != 1 || out.ne[3] != 1 ||
+            !x.is_contiguous() || !out.is_contiguous() || !aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
+            throw std::invalid_argument("linear_swiglu: invalid combined tensor share");
+        }
+        if (nvfp4_int8_share(gate_up_weight.qtype, gate_up_weight.n, gate_up_weight.k, policy)) {
+            detail::unified::nvfp4_linear_swiglu_int8_grouped_launch(
+                x, gate_up_weight, out, ws, share_int8_table(t), stream);
+            return;
+        }
+        if (gate_up_weight.qtype == QType::NVFP4 && policy == LinearPolicy::AllowNvfp4Int8) {
+            throw std::invalid_argument("linear_swiglu: NVFP4 int8 shares require N%256=0 and K=5120");
+        }
+        auto scope = ws.scope();
+        Tensor projected = ws.alloc(DType::FP32, {gate_up_weight.n, t});
+        linear(x, gate_up_weight, projected, policy, ws, stream);
+        silu_mul(projected.slice(0, 0, out.ne[0]),
+                 projected.slice(0, out.ne[0], out.ne[0]), out, stream);
         return;
     }
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
@@ -376,7 +436,8 @@ bool linear_swiglu_fused_rmsnorm_int8_eligible(const Weight& gate_up_weight, Lin
     // its standalone rmsnorm here cannot disagree with the route the projection then takes.
     return detail::nvfp4_linear_swiglu_int8_fused_norm_eligible(policy, tokens) &&
            gate_up_weight.qtype == QType::NVFP4 &&
-           gate_up_weight.layout == QuantLayout::BlockScaleK16M128x4 && gate_up_weight.n == 34816 &&
+           gate_up_weight.layout == QuantLayout::BlockScaleK16M128x4 &&
+           gate_up_weight.n > 0 && gate_up_weight.n % 256 == 0 &&
            gate_up_weight.k == 5120;
 }
 

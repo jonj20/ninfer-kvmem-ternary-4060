@@ -1,6 +1,7 @@
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
 // preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_geometry.cuh"
 
 #include "core/paged_kv_storage.h"
 #include "ops/common/device_multiprocessors.h"
@@ -240,11 +241,13 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
 
 } // namespace
 
-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
+std::int32_t causal_attention_split_capacity(AttentionHeadGeometry geometry, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size) {
-    return with_causal_query_geometry(q_heads, [&]<typename Geometry>() -> std::int32_t {
+    const auto q_heads = geometry.query_heads;
+    return with_causal_small_t_geometry(q_heads, geometry.kv_heads,
+                                        [&]<typename Geometry>() -> std::int32_t {
         const std::int32_t kv_heads = q_heads / Geometry::GroupSize;
         if (tokens < 1 || tokens > (Geometry::GroupSize == 6 ? 8 : 6) ||
             envelope.min_visible_keys == 0 ||
@@ -307,8 +310,9 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          const void* gate = nullptr) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits    = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
-                                                           envelope, invocation.batch_size);
+    const auto splits = causal_attention_split_capacity(
+        {kCausalHeadDim, q.ne[1], cache.num_kv_heads}, invocation.width, cache.storage,
+        envelope, invocation.batch_size);
     const bool i8_family = kv_cache_is_int8_family(cache.storage);
     const std::int32_t wave_splits =
         i8_family && invocation.batch_size == 1 && !invocation.partition.segmented()
@@ -462,7 +466,7 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
         .partition     = causal_attention_key_partition(envelope, cache),
         .partial_out   = partial_out,
     };
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_small_t_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
                                                       envelope, partial_acc, partial_m, partial_l,
                                                       out, stream, gate);
@@ -500,7 +504,7 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
         .batch_size    = 1,
         .partition     = causal_attention_key_partition(envelope, batch_cache),
     };
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_small_t_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache, invocation,
                                                       envelope, partial_acc, partial_m, partial_l,
                                                       out, stream);
@@ -524,9 +528,12 @@ __global__ void causal_small_t_tile_metadata_kernel(const std::int32_t* valid_co
 
 } // namespace
 
-std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads, std::int32_t width,
+std::int32_t causal_attention_parallel_tile_width(AttentionHeadGeometry geometry, std::int32_t width,
                                                   std::int32_t batch_size,
                                                   KvCacheStorage storage) {
+    const std::int32_t widest = with_causal_small_t_geometry(
+        geometry.query_heads, geometry.kv_heads,
+        []<typename Geometry>() { return Geometry::GroupSize == 6 ? 8 : 6; });
     if (batch_size != 1 || !kv_cache_is_int8_family(storage)) { return 0; }
     static const int forced = [] {
         const char* value = std::getenv("NINFER_ATTN_PARALLEL_TILES");
@@ -538,7 +545,6 @@ std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads, std::int
     // The widest tile the small-T kernel instantiates for this geometry that divides the width
     // exactly: the tiles are views of one contiguous [D, H, width] block, so a ragged last tile
     // would read past it. A width without such a divisor keeps the serial chunks.
-    const std::int32_t widest = causal_attention_model_query_heads(q_heads) == 24 ? 8 : 6;
     for (std::int32_t tile = widest; tile >= 2; --tile) {
         if (width % tile == 0 && width / tile >= 2) { return tile; }
     }
@@ -554,30 +560,30 @@ void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positi
                                            Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                            cudaStream_t stream, const void* gate,
                                            float* partial_out) {
-    const std::int32_t tiles = q.ne[2] / tile_width;
-    causal_small_t_tile_metadata_kernel<<<1, 32, 0, stream>>>(
-        valid_columns == nullptr ? nullptr
-                                 : static_cast<const std::int32_t*>(valid_columns->data),
-        table_rows == nullptr ? nullptr : static_cast<const std::int32_t*>(table_rows->data),
-        tile_width, tiles,
-        valid_columns == nullptr ? nullptr : static_cast<std::int32_t*>(tile_valid.data),
-        static_cast<std::int32_t*>(tile_rows.data));
-    CUDA_CHECK(cudaGetLastError());
-    // Each tile is one batch row of the multi-batch kernel over the cache the caller already
-    // appended: batch t starts at column t * full_width, the same column t * tile_width of q,
-    // positions and out.
-    const CausalSmallTInvocation invocation{
-        .valid_columns = valid_columns == nullptr ? nullptr : &tile_valid,
-        .table_rows    = &tile_rows,
-        .full_width    = tile_width,
-        .column_begin  = 0,
-        .width         = tile_width,
-        .batch_size    = tiles,
-        .partition     = causal_attention_key_partition(envelope, cache),
-        .partial_out   = partial_out,
-    };
-    const CausalCachedInput input{};
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+    with_causal_small_t_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+        const std::int32_t tiles = q.ne[2] / tile_width;
+        causal_small_t_tile_metadata_kernel<<<1, 32, 0, stream>>>(
+            valid_columns == nullptr ? nullptr
+                                     : static_cast<const std::int32_t*>(valid_columns->data),
+            table_rows == nullptr ? nullptr : static_cast<const std::int32_t*>(table_rows->data),
+            tile_width, tiles,
+            valid_columns == nullptr ? nullptr : static_cast<std::int32_t*>(tile_valid.data),
+            static_cast<std::int32_t*>(tile_rows.data));
+        CUDA_CHECK(cudaGetLastError());
+        // Each tile is one batch row of the multi-batch kernel over the cache the caller already
+        // appended: batch t starts at column t * full_width, the same column t * tile_width of q,
+        // positions and out.
+        const CausalSmallTInvocation invocation{
+            .valid_columns = valid_columns == nullptr ? nullptr : &tile_valid,
+            .table_rows    = &tile_rows,
+            .full_width    = tile_width,
+            .column_begin  = 0,
+            .width         = tile_width,
+            .batch_size    = tiles,
+            .partition     = causal_attention_key_partition(envelope, cache),
+            .partial_out   = partial_out,
+        };
+        const CausalCachedInput input{};
         causal_attention_small_t_launch_for<Geometry>(q, input, positions, scale, cache, invocation,
                                                       envelope, partial_acc, partial_m, partial_l,
                                                       out, stream, gate);

@@ -233,15 +233,17 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool t2 = is_ternary(profile.qtype) && profile.gate_up_rows == 34816 &&
-                    profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool t2 = (is_ternary(profile.qtype) && profile.gate_up_rows == 34816 &&
+                    profile.input_rows == 5120 && profile.output_rows == 17408) ||
+                   (profile.qtype == QType::PTQ1_G128_FP16 && profile.gate_up_rows > 0 &&
+                    profile.gate_up_rows % 64 == 0 && profile.input_rows > 0 && profile.input_rows % 512 == 0);
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
                               profile.output_rows == 6144;
     const bool q8_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 34816 &&
                             profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows > 0 &&
+                       profile.gate_up_rows % 256 == 0 && profile.input_rows == 5120;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
     if ((!q4 && !t2 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
@@ -418,10 +420,12 @@ int run_profile(std::string_view label, const Profile& profile,
                     test::GuardedDeviceBuffer baseline(elements * sizeof(std::uint16_t));
                     Tensor baseline_destination(baseline.data(), DType::BF16,
                                                 {profile.output_rows, tokens});
-                    workspace.reset();
-                    workspace.reset_peak();
+                    WorkspaceArena baseline_workspace(std::max<std::size_t>(256,
+                        ops::linear_swiglu_workspace_capacity_bytes(profile.qtype,
+                            profile.gate_up_rows, profile.input_rows, ops::LinearPolicy::A16Only,
+                            tokens, tokens)));
                     ops::linear_swiglu(x, weight, baseline_destination, ops::LinearPolicy::A16Only,
-                                       workspace, nullptr);
+                                       baseline_workspace, nullptr);
                     test::cuda_check(cudaDeviceSynchronize(),
                                      "synchronize the A16 baseline of the int8 guard");
                     const auto baseline_actual = read_bf16_output(baseline, elements);

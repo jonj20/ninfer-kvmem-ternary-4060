@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/attention_feedback_mass.h"
 #ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
 #include "models/qwen3_5/program/query_test_support.h"
 #endif
@@ -22,30 +23,18 @@ std::uint64_t query_test_fingerprint(const KvmemWindowState& state, bool mean) {
 }
 #endif
 void read_statistics(DeviceContext& device, const execution::MemoryStatistics& statistics,
-                     void* destination, bool include_query,
-                     std::uint32_t query_count=0) {
+                     void* destination, bool include_query, std::uint32_t query_count=0) {
     auto* host = static_cast<std::byte*>(destination);
-    const auto key_stride = std::size_t(statistics.key_width) * statistics.columns * sizeof(float);
-    const auto query_stride = std::size_t(statistics.query_width) * statistics.query_columns * statistics.query_element_bytes();
-    for (std::size_t rank = 0; rank < statistics.ranks.size(); ++rank) {
-        const auto& shard = statistics.ranks[rank];
-        if (shard.key_sums.data == nullptr) { continue; }
-        DeviceBinding binding(device.rank(rank).device);
-        const auto stream = device.stream_for_rank(rank);
-        CUDA_CHECK(cudaMemcpyAsync(host + shard.first_layer * key_stride,
-            shard.key_sums.data, shard.key_sums.bytes(), cudaMemcpyDeviceToHost, stream));
-        if (include_query) {
-            const auto count=statistics.mean_query ? 1U : query_count;
-            if (!count || count > statistics.query_columns)
-                throw std::logic_error("KVMem Query capture exceeds its planned capacity");
-            CUDA_CHECK(cudaMemcpy2DAsync(host+statistics.key_bytes()+shard.first_layer*query_stride,
-                query_stride,shard.query_values.data,query_stride,
-                std::size_t(count)*statistics.query_width*statistics.query_element_bytes(),shard.query_values.ne[2],
-                cudaMemcpyDeviceToHost,stream));
-        }
-    }
+    statistics.for_each_host_copy(include_query, query_count,
+        [&](const execution::MemoryStatisticsCopy& copy) {
+            DeviceBinding binding(device.rank(copy.rank).device);
+            CUDA_CHECK(cudaMemcpy2DAsync(host + copy.destination_offset, copy.destination_pitch,
+                copy.source, copy.width_bytes, copy.width_bytes, copy.rows,
+                cudaMemcpyDeviceToHost, device.stream_for_rank(copy.rank)));
+        });
     device.synchronize();
 }
+
 } // namespace
 
 void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32_t query_begin,
@@ -99,9 +88,13 @@ void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32
             // A Program buffer can have been used by another sequence, an aborted
             // forward, or graph preparation. Seed it from this accepted prefix
             // before every step; the kernel never owns conversation state.
-            CUDA_CHECK(cudaMemcpyAsync(shard.query_values.data,
-                state.query_sums.data()+std::size_t(shard.first_layer)*memory_statistics->query_width,
-                shard.query_values.bytes(),cudaMemcpyHostToDevice,device.stream_for_rank(rank)));
+            for (std::int32_t layer=0; layer<shard.query_values.ne[2]; ++layer) {
+                auto query=shard.query_values.slice(2,layer,1);
+                CUDA_CHECK(cudaMemcpyAsync(query.data,
+                    state.query_sums.data()+std::size_t(shard.first_layer+layer)*memory_statistics->query_width+
+                        shard.query_offset,
+                    query.bytes(),cudaMemcpyHostToDevice,device.stream_for_rank(rank)));
+            }
         }
     }
 }
@@ -329,6 +322,9 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
     for(std::size_t i=0;i<rows.size();++i) observations[i].source_position=begin+rows[i];
     for(std::size_t first=0;first<rows.size();first+=64) {
         const auto count=std::min<std::size_t>(64,rows.size()-first);
+        AttentionPageMassAccumulator page_mass(
+            std::span(observations).subspan(first,count),logical_pages,
+            selected_count,config.attention->num_attention_heads);
         std::vector<std::int32_t> columns(count),positions(count);
         for(std::size_t i=0;i<count;++i) {
             columns[i]=static_cast<std::int32_t>(first_column+rows[first+i]);
@@ -337,14 +333,13 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
         for(std::int32_t slot=0;slot<3;++slot) {
             if(slot && selected[slot]==selected[slot-1]) continue;
             const auto layer=selected[slot];
-            std::size_t rank=0;
-            for(;rank<memory_statistics->ranks.size();++rank) {
-                const auto& shard=memory_statistics->ranks[rank];
-                if(shard.attention_queries.data && layer>=static_cast<std::int32_t>(shard.first_layer) &&
-                    layer<static_cast<std::int32_t>(shard.first_layer+shard.key_sums.ne[2])) break;
-            }
-            if(rank==memory_statistics->ranks.size()) throw std::logic_error("KVMem attention layer has no owning stage");
+            std::uint32_t covered_heads=0;
+            for(std::size_t rank=0;rank<memory_statistics->ranks.size();++rank) {
             auto& shard=memory_statistics->ranks[rank];
+            if(!shard.attention_queries.data || layer<static_cast<std::int32_t>(shard.first_layer) ||
+                layer>=static_cast<std::int32_t>(shard.first_layer+shard.key_sums.ne[2])) continue;
+            const auto local_heads=shard.attention_queries.ne[0]/config.attention->head_dim;
+            covered_heads+=local_heads;
             DeviceBinding binding(device.rank(rank).device);
             const auto stream=device.stream_for_rank(rank);
             auto row_tensor=shard.attention_rows.slice(0,0,static_cast<std::int32_t>(count));
@@ -353,26 +348,23 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
             CUDA_CHECK(cudaMemcpyAsync(position_tensor.data,positions.data(),count*sizeof(positions[0]),cudaMemcpyHostToDevice,stream));
             const auto capacity=shard.attention_queries.ne[1];
             auto query=shard.attention_queries.slice(2,slot,1).view({static_cast<std::int32_t>(config.attention->head_dim),
-                static_cast<std::int32_t>(config.attention->num_attention_heads),capacity});
+                static_cast<std::int32_t>(local_heads),capacity});
             auto scratch=shard.attention_scratch.slice(2,0,static_cast<std::int32_t>(count));
             auto norms=shard.attention_norms.slice(2,0,static_cast<std::int32_t>(count));
             auto mass=shard.attention_output.slice(1,0,static_cast<std::int32_t>(count));
-            auto cache=decoder->text_kv.batch_layer_view(static_cast<std::size_t>(layer));
+            auto cache=decoder->text_kv.batch_layer_view(static_cast<std::size_t>(layer),
+                parameters.text.tensor_parallel() ? rank : 0);
             const auto table_row=text_kv_addresses->bound_row(sequence.kv->text);
             ops::attention_page_mass(query,row_tensor,position_tensor,table_row,cache,scratch,norms,mass,stream);
             std::vector<float> host(std::size_t(mass.ne[0])*count);
             CUDA_CHECK(cudaMemcpyAsync(host.data(),mass.data,host.size()*sizeof(float),cudaMemcpyDeviceToHost,stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            for(std::size_t i=0;i<count;++i) for(std::size_t p=0;p<static_cast<std::size_t>(mass.ne[0]);++p) {
-                const auto value=host[i*mass.ne[0]+p]/selected_count;
-                if(!std::isfinite(value) || value<0) throw std::runtime_error("KVMem sampled invalid attention mass");
-                if(p>=logical_pages.size()) {
-                    if(value>1e-7) throw std::runtime_error("KVMem sampled an unmapped compact page");
-                    continue;
-                }
-                if(value>0) observations[first+i].mass.push_back({std::uint64_t(logical_pages[p])*64,value});
+            page_mass.add(host,static_cast<std::size_t>(mass.ne[0]),local_heads);
             }
+            if(covered_heads!=config.attention->num_attention_heads)
+                throw std::logic_error("KVMem attention feedback does not cover every query head");
         }
+        page_mass.finish();
     }
     if(observations.empty()) {
         state.graph=kvmem::prepare_graph_accept(state.graph,state.graph.accepted_through,end,{},32u<<20);
@@ -380,8 +372,7 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
         return;
     }
     auto next_graph=kvmem::prepare_graph_accept(state.graph,state.graph.accepted_through,end,observations,32u<<20);
-    size_t extra=state.feedback.snapshot().bytes();
-    for(const auto& row:observations) extra+=row.mass.size()*sizeof(std::pair<std::uint64_t,double>)*3;
+    const auto extra=state.feedback.snapshot().bytes()+attention_feedback_workspace_bytes(observations);
     next_graph.reserve_extra(extra);
     auto next_feedback=state.feedback;
     if(output) for(const auto& row:observations) next_feedback.observe_output(row.mass);

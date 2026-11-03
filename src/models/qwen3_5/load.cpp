@@ -1,4 +1,5 @@
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/program/planning/memory_statistics_layout.h"
 
 #include "artifact/reader.h"
 #include "core/dtype.h"
@@ -74,6 +75,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder, options);
     const auto& text = out->config.text;
+    if (options.tensor_parallel && options.tensor_attention == TensorAttention::Positions &&
+        text.attention && text.attention->num_attention_heads ==
+                              4 * text.attention->num_key_value_heads) {
+        throw std::invalid_argument(
+            "GQA4 dense models require --tensor-attention heads; positions is not implemented");
+    }
     if (options.expert_residency == ExpertResidency::Disk && out->artifact_path.empty()) {
         throw std::invalid_argument("disk expert residency requires the artifact entry path");
     }
@@ -405,6 +412,13 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, LoadOpt
             sizing.kv_storage, static_cast<std::int32_t>(text.attention->head_dim));
         divided += sizing.kv_tokens * text.full_attention_layers *
                    text.attention->num_key_value_heads * storage.physical_bytes_per_token_head();
+        const auto statistics = detail::memory_statistics_budget(sizing.memory_statistics,
+            text.full_attention_layers, text.attention->key_width(), text.attention->query_width(),
+            text.attention->num_attention_heads, text.attention->num_key_value_heads,
+            text.attention->head_dim);
+        divided += statistics.divided;
+        every += statistics.every;
+        first += statistics.first;
     }
     // Rank 0 also holds the head stage's parts and MTP's KV, whose heads stay whole there.
     first += head_stage_bytes(reader, bindings, config, weights, options) + kHeadStageFixedBytes +

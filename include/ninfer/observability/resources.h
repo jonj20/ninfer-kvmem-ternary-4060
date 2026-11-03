@@ -122,7 +122,16 @@ struct KvmemMemorySummary {
     std::uint64_t history_spilled_bytes = 0, history_restored_bytes = 0;
 };
 
+struct TensorRankSummary {
+    std::uint32_t rank = 0;
+    std::uint32_t kv_head_begin = 0, kv_head_end = 0;
+    std::uint32_t gdn_key_head_begin = 0, gdn_key_head_end = 0;
+    std::uint32_t ffn_begin = 0, ffn_end = 0;
+};
+
 struct MemorySummary {
+    // Frozen model partition, in CUDA-visible rank order.
+    std::vector<TensorRankSummary> tensor_shares;
     KvmemMemorySummary kvmem;
     int device                                = 0;
     std::uint32_t max_context                 = 0;

@@ -221,6 +221,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--kvmem-capabilities") {
         auto capabilities = nlohmann::json::parse(kvmem::launch_capabilities("ninfer"));
         capabilities["budget_planning_version"] = 1;
+        capabilities["heads_tensor_parallel_revision"] = 1;
         std::cout << capabilities.dump() << '\n';
         return 0;
     }

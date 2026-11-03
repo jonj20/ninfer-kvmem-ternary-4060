@@ -53,7 +53,8 @@ namespace ninfer::ops::detail::unified {
 // mainloop pairs gate and up rows inside the block and allocates nothing).
 [[nodiscard]] std::size_t
 nvfp4_linear_swiglu_int8_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens,
-                                                  Nvfp4Int8Mainloop table);
+                                                  Nvfp4Int8Mainloop table,
+                                                  std::int32_t gate_up_rows = 34816);
 
 // x is contiguous BF16 [k, tokens]; out is contiguous BF16 [n/2, tokens]. Requires the exact
 // workspace capacity above to be reserved in `workspace`.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "models/qwen3_5/program/planning/memory_statistics_options.h"
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/startup.h"
 #include "ops/common/device_tier.h"
@@ -74,6 +75,9 @@ struct StageSizing {
     // every device.
     bool automatic_kv               = false;
     std::uint64_t kv_headroom_bytes = 0;
+    // Exact statistics/capture/Query allocation recipe; the split remains an
+    // estimate and the final per-rank Program plan remains authoritative.
+    detail::MemoryStatisticsPlanning memory_statistics;
 };
 [[nodiscard]] std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
                                                               LoadOptions options,

@@ -2023,6 +2023,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
     }
     if (options.kvmem.selected_tokens) {
+        if (options.tensor_attention != TensorAttention::Heads) {
+            throw std::invalid_argument("KVMem tensor parallelism requires --tensor-attention heads");
+        }
         if (options.speculative.lookup_ngram != 0) {
             throw std::invalid_argument(
                 "KVMem disables legacy --lookup-ngram; use --ngram-draft-tokens and --ngram-min-match");
@@ -2035,10 +2038,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-        // Layer stages return target features to the rank-0 drafter. The pinned
-        // tensor-parallel executor does not implement these feature taps.
+        // Layer stages return features; heads TP taps the completed rank-0 residual.
         const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
-            options.max_concurrency <= kMaximumConcurrency && !options.tensor_parallel &&
+            options.max_concurrency <= kMaximumConcurrency &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
             ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
@@ -2069,7 +2071,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
              options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
-            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU, layer-pipeline or heads-TP BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
                 "and exclusive ownership of history caching");
         }
         if (options.kvmem.recent_blocks() == 0) {

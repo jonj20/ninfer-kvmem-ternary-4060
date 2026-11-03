@@ -2850,6 +2850,23 @@ from accepted output token IDs, including a stop token whose decoded text may be
 
 ### KVMem statistics extension
 
+KVMem's Qwen3.5-core dense path supports explicit heads tensor parallelism:
+`--devices 0,1 --tensor-parallel --tensor-attention heads`. Merely selecting two
+devices retains layer-pipeline placement. Optional `--tensor-split 3,1` weights
+follow device order; omitting them uses the upstream bandwidth/capacity planner,
+including KVMem's resident window and Query statistics. Actual GDN/KV heads and
+FFN columns are rounded to the model's legal stored-block boundaries. `/props`
+reports these ranges in `execution.tensor_shares`, alongside `tensor_split` and
+`tensor_attention`; requested ratios need not equal the realized head counts.
+
+Query capture and scoring retain global head order; attention feedback weights
+each rank by its number of query heads. RAM/SSD payload and recurrent-state
+identities include the actual partition. A cache with a different partition is
+incompatible. KVMem rejects `--tensor-attention positions` before loading;
+the native path without KVMem retains that upstream option. Ordinary generation,
+MTP and DFlash2 share this placement contract. A package's validation report
+identifies which models, weight/KV formats and hardware combinations were tested.
+
 KVMem builds preserve the native `usage`, `timings`, streaming usage selection, and
 `/metrics` names and meanings. Completed Chat Completions and Responses also carry
 `kvmem.speculative`, separately from those native fields. For Chat streams it is
