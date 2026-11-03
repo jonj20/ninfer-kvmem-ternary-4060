@@ -24,6 +24,12 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_dflash2_tests_PROGRAMS
 ninfer_finalize_bundle(ninfer_dflash2_tests)
 ninfer_stage_runtime_dlls(ninfer_dflash2_tests)
 
+# Draft format composition and registered NVFP4 geometry oracles.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_dflash2_format_tests_PROGRAMS
+  ninfer_linear_dynamic_grouped_conv_add_test ninfer_linear_nvfp4_a16_test)
+ninfer_finalize_bundle(ninfer_dflash2_format_tests)
+ninfer_stage_runtime_dlls(ninfer_dflash2_format_tests)
+
 # Reuse only the objects needed to validate the native memory-policy contracts and
 # the C++20 unique-string compatibility fix; do not link the full numerical suite.
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_memory_policy_tests_PROGRAMS

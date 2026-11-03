@@ -957,10 +957,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                              dimension(draft->attention.num_key_value_heads)},
                                             dimension(draft->sliding_window.value_or(0)),
                                             {0, plan.capacity}, width, width, batch));
-                        scratch(layout,
-                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                    dimension(draft->attention.query_width()), width, width, batch,
-                                    batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& w = block.output.weight;
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        w.qtype, w.k, width, width, batch, batch));
+                        }
                     }
                     {
                         auto mlp = layout.scope();
@@ -974,10 +976,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                                     p.weight.qtype, p.weight.n, p.weight.k,
                                                     p.policy, tokens, tokens)));
                         }
-                        scratch(
-                            layout,
-                            ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                dimension(draft->intermediate_size), width, width, batch, batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& w = block.mlp.down.weight;
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        w.qtype, w.k, width, width, batch, batch));
+                        }
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);

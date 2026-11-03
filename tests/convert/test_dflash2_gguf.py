@@ -14,7 +14,7 @@ from tools.convert.recipe import Recipe
 from tools.convert.sources.gguf import TYPE_BF16, write_gguf
 
 
-def fixture(tmp_path: Path, **overrides):
+def fixture(tmp_path: Path, block_projections=None, **overrides):
     kv = {
         'general.architecture':'dflash', 'dflash.attention.causal':False,
         'dflash.block_count':1, 'dflash.embedding_length':256,
@@ -41,10 +41,12 @@ def fixture(tmp_path: Path, **overrides):
     }
     tensors=[]; expected={}
     for index,(name,shape) in enumerate(shapes.items()):
-        if name in ('fc.weight','selector_hidden.weight','blk.0.ffn_gate.weight','blk.0.ffn_up.weight'):
+        if name in ('fc.weight','selector_hidden.weight','blk.0.ffn_gate.weight','blk.0.ffn_up.weight') or name in (block_projections or {}):
             # Q4_K: exactly 144 bytes per block of 256 represented values.
-            data=(np.arange(np.prod(shape)//256*144,dtype=np.uint8)+index).tobytes()
-            tensors.append((name,shape,12,data));expected[name]=data
+            type_id=(block_projections or {}).get(name,12)
+            block_bytes={11:110,12:144}[type_id]
+            data=(np.arange(np.prod(shape)//256*block_bytes,dtype=np.uint8)+index).tobytes()
+            tensors.append((name,shape,type_id,data));expected[name]=data
         else:
             values=(torch.arange(np.prod(shape),dtype=torch.float32).reshape(shape)/257).to(torch.bfloat16)
             tensors.append((name,shape,TYPE_BF16,values.view(torch.int16).numpy().tobytes()))
@@ -98,3 +100,28 @@ def test_recipe_preserves_q4_blocks_and_runtime_fallbacks(tmp_path):
 def test_refuses_incompatible_draft_metadata(tmp_path,overrides):
     path,_=fixture(tmp_path,**overrides)
     with pytest.raises(ValueError):DraftSource(path)
+
+
+@pytest.mark.parametrize('type_id,format', [(11,'gguf_q3_k'),(12,'gguf_q4_k')])
+def test_output_and_down_override_preserves_source_blocks(tmp_path,type_id,format):
+    from tools.convert.recipes.dflash2_gguf_blocks import configure
+    from tools.convert.pipeline import convert
+    from tools.artifact.reader import Artifact
+    tensor_names={'dflash2/layers/0/attention/output':'blk.0.attn_output.weight',
+                  'dflash2/layers/0/mlp/down':'blk.0.ffn_down.weight'}
+    path,expected=fixture(tmp_path,block_projections={name:type_id for name in tensor_names.values()})
+    with DraftSource(path) as source:
+        target={'hidden_size':256,'vocab_size':32,'num_hidden_layers':8}
+        config=draft_config(source.config,target,'dflash2')
+        model=Model({'text':{'config':target},'dflash2':{'config':config,'target':'text'}})
+        _Builder(model).draft(source,config,target,'dflash2')
+        recipe=Recipe(model);_companions(model,recipe,{'dflash2':source})
+        configure(model,recipe,{'dflash2':source})
+        out=tmp_path/'draft.ninfer'
+        convert(model,recipe,out,device='cpu',rows_per_chunk=128)
+        with Artifact(out) as artifact:
+            for logical,tensor in tensor_names.items():
+                binding=artifact.directory.bindings[logical]
+                obj=artifact.object(binding['object'])
+                assert obj.format==format
+                assert artifact.read_object(obj.id)==expected[tensor]
