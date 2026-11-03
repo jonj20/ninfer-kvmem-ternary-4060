@@ -386,8 +386,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  dimension((widest_verify_window(plan) + 1) * plan.max_concurrency), layers},
                  "memory candidate keys");
             stats.candidate_origin = add_tensor(local, DType::I32, {1}, "memory candidate origin");
-            stats.query_sums = add_tensor(local, DType::FP32,
-                {dimension(config.attention->query_width()), dimension(effective_prefill_chunk), layers}, "memory query rows");
+            const auto query_columns = plan.kvmem.query_meanq_cosine ? 1U :
+                std::min<std::uint32_t>(effective_prefill_chunk, plan.kvmem.query_max_tokens);
+            stats.query_values = add_tensor(local, plan.kvmem.query_meanq_cosine ? DType::FP32 : DType::BF16,
+                {dimension(config.attention->query_width()), dimension(query_columns), layers},
+                plan.kvmem.query_meanq_cosine ? "memory query sums" : "memory query rows");
             const auto capture_columns=std::max<std::size_t>(effective_prefill_chunk,
                 (widest_verify_window(plan)+1U)*plan.max_concurrency);
             stats.attention_queries=add_tensor(local,DType::BF16,
@@ -408,9 +411,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.memory_statistics.front().attention_tokens=add_tensor(builder,DType::I32,
             {dimension(std::max<std::size_t>(effective_prefill_chunk,(widest_verify_window(plan)+1U)*plan.max_concurrency))},
             "memory consumed token capture");
-        const auto query_bytes=kvmem::PageSoftmaxCuda::workspace_bytes((plan.capacity+63U)/64U,
-            config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
-        out.memory_query_workspace=add_tensor(builder,DType::U8,{dimension(query_bytes)},"memory page-softmax workspace");
+        if (!plan.kvmem.query_meanq_cosine) {
+            const auto query_bytes=kvmem::PageSoftmaxCuda::workspace_bytes((plan.capacity+63U)/64U,
+                config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+            out.memory_query_workspace=add_tensor(builder,DType::U8,{dimension(query_bytes)},"memory page-softmax workspace");
+        }
     }
     if (plan.causal_scoring) {
         out.score_hidden =

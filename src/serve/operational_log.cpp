@@ -257,8 +257,7 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics     = outcome.metrics;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = metrics.computed_prefill_tokens;
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
     std::ostringstream out;

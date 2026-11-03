@@ -60,6 +60,8 @@ struct GenerationMetrics {
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
     NgramArchiveStats ngram_archive;
+    // Actual logical prefill progress, including partial progress on cancellation.
+    std::uint32_t computed_prefill_tokens     = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;

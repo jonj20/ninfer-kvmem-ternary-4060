@@ -50,6 +50,13 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_query_policy_tests_PROGRAMS
 ninfer_finalize_bundle(ninfer_query_policy_tests)
 ninfer_stage_runtime_dlls(ninfer_query_policy_tests)
 
+# Request accounting and protocol renderers, without unrelated GPU numerical tests.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_request_accounting_tests_PROGRAMS
+  ninfer_request_log_test ninfer_console_stats_test
+  ninfer_openai_schema_test ninfer_text_completion_test)
+ninfer_finalize_bundle(ninfer_request_accounting_tests)
+ninfer_stage_runtime_dlls(ninfer_request_accounting_tests)
+
 # Shape-generalization regressions without linking unrelated model test families.
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_dense_family_tests_PROGRAMS
   ninfer_gdn_gating_proj_test ninfer_linear_gguf_test ninfer_gdn_replay_fold_test

@@ -1221,6 +1221,7 @@ GenerationOutcome sample_outcome() {
     outcome.completion_tokens                   = 7;
     outcome.reasoning_tokens                    = 3;
     outcome.finish_reason                       = ninfer::FinishReason::StopToken;
+    outcome.metrics.computed_prefill_tokens     = 8;
     outcome.metrics.prefix_cache_hit_tokens     = 12;
     outcome.metrics.prompt_wall_seconds         = 0.04;
     outcome.metrics.generation_wall_seconds     = 0.03;
@@ -1289,6 +1290,22 @@ int test_aggregate_response() {
         "aggregate timings use exact cache and N-1 generation intervals");
     failures += check(!response.contains("id_slot") && !response.contains("session_digest"),
                       "an unretained session advertised a slot identity");
+    for (const bool admitted : {false, true}) {
+        GenerationOutcome cancelled;
+        cancelled.prompt_tokens = 6400;
+        cancelled.finish_reason = ninfer::FinishReason::Cancelled;
+        cancelled.metrics.computed_prefill_tokens = admitted ? 1920 : 0;
+        cancelled.metrics.prefix_cache_hit_tokens = admitted ? 4224 : 0;
+        cancelled.metrics.prompt_wall_seconds = 2.0;
+        const Json partial = Json::parse(make_chat_completion_response(identity(), cancelled));
+        failures += check(partial["usage"]["prompt_tokens"] == 6400 &&
+                              partial["timings"]["cache_n"] == (admitted ? 4224 : 0) &&
+                              partial["timings"]["prompt_n"] == (admitted ? 1920 : 0) &&
+                              partial["timings"]["prompt_per_second"] == (admitted ? 960.0 : 0.0) &&
+                              partial["timings"]["predicted_n"] == 0,
+                          "cancelled timings must separate logical input from completed work");
+    }
+
     GenerationOutcome retained = outcome;
     retained.id_slot           = 3;
     retained.session_digest    = "0123456789abcdef";

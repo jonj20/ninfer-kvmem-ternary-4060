@@ -1,16 +1,32 @@
 #include "models/qwen3_5/program/program_impl.h"
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+#include "models/qwen3_5/program/query_test_support.h"
+#endif
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include "ninfer/ops/attention_page_mass.h"
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+std::uint64_t query_test_fingerprint(const KvmemWindowState& state, bool mean) {
+    std::uint64_t hash=14695981039346656037ULL;
+    if (mean) {
+        for (auto value:state.query_sums) query_test_hash(hash,value);
+    } else {
+        for (const auto& layer:state.query_rows)
+            for (auto value:layer) query_test_hash(hash,value);
+    }
+    return hash;
+}
+#endif
 void read_statistics(DeviceContext& device, const execution::MemoryStatistics& statistics,
                      void* destination, bool include_query,
-                     std::uint32_t query_first=0,std::uint32_t query_count=0) {
+                     std::uint32_t query_count=0) {
     auto* host = static_cast<std::byte*>(destination);
     const auto key_stride = std::size_t(statistics.key_width) * statistics.columns * sizeof(float);
-    const auto query_stride = std::size_t(statistics.query_width) * statistics.query_columns * sizeof(float);
+    const auto query_stride = std::size_t(statistics.query_width) * statistics.query_columns * statistics.query_element_bytes();
     for (std::size_t rank = 0; rank < statistics.ranks.size(); ++rank) {
         const auto& shard = statistics.ranks[rank];
         if (shard.key_sums.data == nullptr) { continue; }
@@ -19,11 +35,12 @@ void read_statistics(DeviceContext& device, const execution::MemoryStatistics& s
         CUDA_CHECK(cudaMemcpyAsync(host + shard.first_layer * key_stride,
             shard.key_sums.data, shard.key_sums.bytes(), cudaMemcpyDeviceToHost, stream));
         if (include_query) {
-            const auto count=query_count ? query_count : statistics.query_columns;
-            const auto offset=std::size_t(query_first)*statistics.query_width*sizeof(float);
-            CUDA_CHECK(cudaMemcpy2DAsync(host+statistics.key_bytes()+shard.first_layer*query_stride+offset,
-                query_stride,static_cast<const std::byte*>(shard.query_sums.data)+offset,query_stride,
-                std::size_t(count)*statistics.query_width*sizeof(float),shard.query_sums.ne[2],
+            const auto count=statistics.mean_query ? 1U : query_count;
+            if (!count || count > statistics.query_columns)
+                throw std::logic_error("KVMem Query capture exceeds its planned capacity");
+            CUDA_CHECK(cudaMemcpy2DAsync(host+statistics.key_bytes()+shard.first_layer*query_stride,
+                query_stride,shard.query_values.data,query_stride,
+                std::size_t(count)*statistics.query_width*statistics.query_element_bytes(),shard.query_values.ne[2],
                 cudaMemcpyDeviceToHost,stream));
         }
     }
@@ -63,6 +80,12 @@ void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32
     // Query consumer either: avoid per-token/head D2H, validation and copies.
     // Mean-K and the separate native attention-feedback capture stay enabled.
     state.query_capture=memory_query_probe(sequence,prompt_tokens);
+    if (memory_statistics->mean_query && state.query_capture && !state.query_replayed) {
+        const auto elements=std::size_t(memory_statistics->layers)*memory_statistics->query_width;
+        if (state.query_sums.empty()) state.query_sums.assign(elements,0.0F);
+        if (state.query_sums.size()!=elements)
+            throw std::logic_error("KVMem Mean-Q layer coverage mismatch");
+    }
     memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity),
         state.query_capture ? static_cast<std::int32_t>(query_begin) : 0,
         state.query_capture ? static_cast<std::int32_t>(query_end) : 0};
@@ -72,6 +95,14 @@ void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32
         DeviceBinding binding(device.rank(rank).device);
         CUDA_CHECK(cudaMemcpyAsync(shard.ranges.data, memory_statistics_ranges.data(),
             sizeof(memory_statistics_ranges), cudaMemcpyHostToDevice, device.stream_for_rank(rank)));
+        if (memory_statistics->mean_query && state.query_capture && !state.query_replayed) {
+            // A Program buffer can have been used by another sequence, an aborted
+            // forward, or graph preparation. Seed it from this accepted prefix
+            // before every step; the kernel never owns conversation state.
+            CUDA_CHECK(cudaMemcpyAsync(shard.query_values.data,
+                state.query_sums.data()+std::size_t(shard.first_layer)*memory_statistics->query_width,
+                shard.query_values.bytes(),cudaMemcpyHostToDevice,device.stream_for_rank(rank)));
+        }
     }
 }
 
@@ -88,8 +119,7 @@ void ProgramImpl::commit_memory_statistics(SequenceState& sequence, std::uint32_
     const auto query_first = std::max(begin, state.query_begin);
     const auto query_last = std::min(end, state.query_end);
     const bool read_query=state.query_capture && !state.query_replayed && query_last>query_first;
-    read_statistics(device,buffers,host,read_query,read_query?query_first-begin:0,
-        read_query?query_last-query_first:0);
+    read_statistics(device,buffers,host,read_query,read_query?query_last-query_first:0);
     const auto width = buffers.key_width;
     const auto layer_stride = static_cast<std::size_t>(width) * buffers.columns;
     const auto* keys = reinterpret_cast<const float*>(host);
@@ -106,16 +136,34 @@ void ProgramImpl::commit_memory_statistics(SequenceState& sequence, std::uint32_
         }
     }
     if (read_query) {
-        const auto* query = reinterpret_cast<const float*>(host + buffers.key_bytes());
-        for (std::uint32_t layer=0;layer<buffers.layers;++layer) {
-            const auto* first=query+(std::size_t(layer)*buffers.query_columns+query_first-begin)*buffers.query_width;
-            const auto elements=std::size_t(query_last-query_first)*buffers.query_width;
-            for(std::size_t i=0;i<elements;++i) {
-                if(!std::isfinite(first[i])) throw std::runtime_error("Nonfinite KVMem Query row");
+        if (buffers.mean_query) {
+            const auto* sums=reinterpret_cast<const float*>(host+buffers.key_bytes());
+            const auto elements=std::size_t(buffers.layers)*buffers.query_width;
+            for (std::size_t i=0;i<elements;++i) {
+                if (!std::isfinite(sums[i])) throw std::runtime_error("Nonfinite KVMem Mean-Q sum");
             }
-            state.query_rows[layer].insert(state.query_rows[layer].end(),first,first+elements);
+            state.query_sums.assign(sums,sums+elements);
+        } else {
+            const auto* query=reinterpret_cast<const std::uint16_t*>(host+buffers.key_bytes());
+            for (std::uint32_t layer=0;layer<buffers.layers;++layer) {
+                const auto* first=query+std::size_t(layer)*buffers.query_columns*buffers.query_width;
+                const auto elements=std::size_t(query_last-query_first)*buffers.query_width;
+                auto& rows=state.query_rows[layer];
+                const auto at=rows.size();
+                rows.resize(at+elements);
+                for(std::size_t i=0;i<elements;++i) {
+                    const float value=std::bit_cast<float>(std::uint32_t(first[i])<<16);
+                    if(!std::isfinite(value)) throw std::runtime_error("Nonfinite KVMem Query row");
+                    rows[at+i]=value;
+                }
+            }
         }
         state.query_tokens += query_last - query_first;
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+        std::fprintf(stderr,"KVMEM_QUERY_TEST phase=accepted lane=%u begin=%u end=%u query_begin=%u query_end=%u rows=%u hash=%016llx\n",
+            sequence.lane,begin,end,state.query_begin,state.query_end,state.query_tokens,
+            static_cast<unsigned long long>(query_test_fingerprint(state,buffers.mean_query)));
+#endif
     }
     if (state.selector->total_tokens() != begin) {
         throw std::logic_error("KVMem block catalog lost its statistics frontier");
@@ -139,30 +187,38 @@ void ProgramImpl::score_memory_query(SequenceState& sequence,
     std::vector<const float*> layers(config.full_attention_layers);
     std::vector<std::uint32_t> counts(config.full_attention_layers,state.query_tokens);
     const auto width=config.attention->query_width();
-    if(state.query_rows.size()!=layers.size()) throw std::logic_error("KVMem Query layer coverage mismatch");
-    for(std::size_t layer=0;layer<layers.size();++layer) {
-        if(state.query_rows[layer].size()!=std::size_t(state.query_tokens)*width)
-            throw std::logic_error("KVMem Query token coverage mismatch");
-        layers[layer]=state.query_rows[layer].data();
+    if (kvmem_options.query_meanq_cosine) {
+        if (state.query_sums.size()!=layers.size()*width)
+            throw std::logic_error("KVMem Mean-Q layer coverage mismatch");
+    } else {
+        if(state.query_rows.size()!=layers.size()) throw std::logic_error("KVMem Query layer coverage mismatch");
+        for(std::size_t layer=0;layer<layers.size();++layer) {
+            if(state.query_rows[layer].size()!=std::size_t(state.query_tokens)*width)
+                throw std::logic_error("KVMem Query token coverage mismatch");
+            layers[layer]=state.query_rows[layer].data();
+        }
     }
     const auto& policy=*state.selector;
     const auto& options=policy.config();
     const auto frontier=prefix ? uint32_t(prefix->prefix.size()) : state.statistics_frontier;
     const auto frame=kvmem::query_score_frame(frontier,64,policy.budget_blocks(),
         options.sink_blocks,options.recent_blocks,mandatory);
-    if(!memory_query_scorer)
+    if(!kvmem_options.query_meanq_cosine && !memory_query_scorer)
         throw std::logic_error("KVMem Query scorer lost its startup workspace");
     const auto previous=prefix ? state.statistics->mean_checkpoint(frontier) : std::vector<float>{};
     if(prefix) state.statistics->restore_mean_checkpoint(frontier,prefix->mean_tail);
     std::vector<double> scores;
     try {
-        const kvmem::PageQueryView query{nullptr,counts.data(),
-            config.full_attention_layers,state.query_tokens,config.attention->num_attention_heads,
-            config.attention->num_key_value_heads,config.attention->head_dim,layers.data()};
         const auto aggregation=kvmem_options.score_agg_max ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
         if (kvmem_options.query_meanq_cosine) {
-            scores=kvmem::mean_query_cosine_scores(*state.statistics,query,uint32_t(frame.starts.size()),aggregation);
+            scores=kvmem::mean_key_retrieval_scores(*state.statistics,uint32_t(frame.starts.size()),
+                {state.query_sums.data(),counts.data(),config.full_attention_layers,
+                 config.attention->head_dim,config.attention->num_attention_heads,
+                 config.attention->num_key_value_heads,aggregation});
         } else {
+            const kvmem::PageQueryView query{nullptr,counts.data(),
+                config.full_attention_layers,state.query_tokens,config.attention->num_attention_heads,
+                config.attention->num_key_value_heads,config.attention->head_dim,layers.data()};
             scores=memory_query_scorer->score(*state.statistics,query,frame,aggregation);
         }
         if (kvmem_options.graph_alpha > 0)
@@ -173,6 +229,19 @@ void ProgramImpl::score_memory_query(SequenceState& sequence,
     }
     if(prefix) state.statistics->restore_mean_checkpoint(frontier,previous);
     state.selector->set_retrieval_scores(scores);
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+    std::uint64_t score_hash=14695981039346656037ULL;
+    for (double value:scores) {
+        const auto bits=std::bit_cast<std::uint64_t>(value);
+        for (unsigned shift=0;shift<64;shift+=8) {
+            score_hash^=(bits>>shift)&255U; score_hash*=1099511628211ULL;
+        }
+    }
+    std::fprintf(stderr,"KVMEM_QUERY_TEST phase=scored lane=%u rows=%u hash=%016llx scores=%016llx\n",
+        sequence.lane,state.query_tokens,
+        static_cast<unsigned long long>(query_test_fingerprint(state,kvmem_options.query_meanq_cosine)),
+        static_cast<unsigned long long>(score_hash));
+#endif
     if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_QUERY scorer=%s agg=%s lrfu=%d graph_alpha=%.6g rows=%u blocks=%zu\n",
         kvmem_options.query_meanq_cosine ? "meanq-cosine" : "page-softmax",
         kvmem_options.score_agg_max ? "max" : "mean",int(kvmem_options.lrfu),kvmem_options.graph_alpha,
@@ -214,6 +283,9 @@ void ProgramImpl::commit_memory_candidates(SequenceState& sequence, std::uint32_
     state.selector->register_append(end - begin);
     observe_memory_attention(sequence,begin,end,first_column,row_width,false);
     state.statistics_frontier = end;
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+    std::fprintf(stderr,"KVMEM_QUERY_TEST phase=decode lane=%u begin=%u end=%u\n",sequence.lane,begin,end);
+#endif
 }
 
 void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t begin,std::uint32_t end,

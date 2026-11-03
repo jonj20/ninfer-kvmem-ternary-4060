@@ -333,9 +333,22 @@ if(NOT EXISTS "${NINFER_KVMEM_SOURCE_DIR}/include/kvmem/memory_contract.hpp")
 endif()
 add_subdirectory("${NINFER_KVMEM_SOURCE_DIR}" "kvmem-core" EXCLUDE_FROM_ALL)
 kvmem_enable_cuda_recall(CUDART_TARGET ${NINFER_CUDART_TARGET})
+option(NINFER_KVMEM_QUERY_TEST_HOOKS "Enable deterministic native Query lifecycle test rendezvous and fingerprints" OFF)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
+if(NINFER_KVMEM_QUERY_TEST_HOOKS)
+  if(NOT BUILD_TESTING)
+    message(FATAL_ERROR "NINFER_KVMEM_QUERY_TEST_HOOKS requires BUILD_TESTING")
+  endif()
+  set_property(SOURCE
+    src/models/qwen3_5/program/prefill.cpp
+    src/models/qwen3_5/program/storage/memory_statistics.cpp
+    src/models/qwen3_5/program/storage/kvmem_window.cpp
+    TARGET_DIRECTORY ninfer_model_runtime
+    APPEND PROPERTY COMPILE_DEFINITIONS NINFER_KVMEM_QUERY_TEST_HOOKS=1)
+endif()
+
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
   add_subdirectory(tools)

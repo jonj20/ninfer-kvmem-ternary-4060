@@ -1264,9 +1264,15 @@ last JSON chunk before `[DONE]`: the empty `choices` usage chunk when
 }
 ```
 
-`cache_n` is the exact Engine-proven reused prompt prefix and `prompt_n` is the remaining prompt
-suffix, so `cache_n + prompt_n` equals `usage.prompt_tokens`. Prompt time starts when admission
-commits that exact reuse choice and ends when the first output token is committed. Generation time
+`cache_n` is the exact Engine-proven reused prompt prefix and terminal `prompt_n` is the
+uncached prompt tokens actually accepted at completed prefill boundaries. For a completed
+prefill, `cache_n + prompt_n` equals `usage.prompt_tokens`; cancellation during prefill can
+leave a smaller sum, and cancellation before admission reports zero for both.
+`request_done.result.computed_prefill_tokens` and console prefill rates use the same actual progress,
+excluding internal replay. Logical input usage still reports the full prompt.
+Prompt time starts when admission
+commits that exact reuse choice and ends when the first output token is committed, or at
+termination if prefill is cancelled before output. Generation time
 starts at that first token and ends at the last committed output token. Accordingly, generation
 speed uses `max(predicted_n - 1, 0)` token intervals; the first token belongs to prompt latency and
 is not counted again as a decode interval. Zero-token, one-token, zero-duration, and exact-cache-hit

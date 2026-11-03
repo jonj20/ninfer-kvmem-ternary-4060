@@ -875,6 +875,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing                = result.engine_timing;
+    outcome.metrics.computed_prefill_tokens      = result.computed_prompt_tokens;
     outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
     outcome.id_slot                              = result.slot;
     outcome.session_digest                       = result.session_digest;

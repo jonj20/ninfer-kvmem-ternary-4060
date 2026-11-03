@@ -1422,6 +1422,9 @@ private:
                     .count();
             generation_wall_seconds =
                 std::chrono::duration<double>(*request->last_token - *request->first_token).count();
+        } else if (request->observation.phase_timings && request->admitted_at) {
+            prompt_wall_seconds =
+                std::chrono::duration<double>(Clock::now() - *request->admitted_at).count();
         }
         release_planning_state(request);
         request->prompt      = {};
@@ -1443,9 +1446,10 @@ private:
         result.finish_reason           = reason;
         result.matched_stop_string     = request->output.matched_stop_string();
         result.timings.prepare_seconds = request->prepare_seconds;
-        if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+        result.computed_prompt_tokens = request->computed_prompt_tokens;
+        if (request->admitted_begin) {
+            result.reused_prompt_tokens = request->admitted_begin->reused_prompt_tokens;
+            result.prefix_reuse_path    = request->admitted_begin->prefix_reuse_path;
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;

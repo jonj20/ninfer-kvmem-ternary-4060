@@ -1040,6 +1040,11 @@ bool ProgramImpl::rewind_memory_query(SequenceState& sequence) {
     for(uint32_t id=0;id<pages;++id) {candidates.push_back(id);scores.push_back(window.selector->selection_score(id));}
     window.query_selected=window.selector->pick_scored_blocks(candidates,scores,window.query_required,
         kvmem_options.selected_tokens/page_tokens,true);
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+    std::fprintf(stderr,"KVMEM_QUERY_TEST phase=selected lane=%u rows=%u pages=",sequence.lane,window.query_tokens);
+    for (auto page:window.query_selected) std::fprintf(stderr,"%u,",page);
+    std::fprintf(stderr,"\n");
+#endif
     const auto admission=kvmem::query_replay_plan({window.query_begin,window.query_end},frontier,
         sequence.text_kv_valid,kvmem_options.query_replay_max_tokens,page_tokens,
         window.query_selected.size(),kvmem_window_tokens/page_tokens,
@@ -1372,6 +1377,7 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
     // determines continuation; never retain features from a discarded suffix.
     window.query_tokens = 0;
     for(auto& rows:window.query_rows) rows.clear();
+    window.query_sums.clear();
     // The durable archive already covers the quoted prefix. This is not a
     // native allocation frontier; force-selection creates only B resident rows.
     sequence.text_kv_valid = *frontier;
@@ -1524,6 +1530,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
     window.query_tokens=0;
     window.query_capture=false;
     for(auto& rows:window.query_rows) std::vector<float>().swap(rows);
+    std::vector<float>().swap(window.query_sums);
     if (window.session_key) {
         for (const auto& publication : memory_publications) {
             if (publication.key == window.session_key && publication.order > window.publication_order) return;

@@ -42,7 +42,7 @@ struct MemoryStatisticsLayout {
     TensorLayout candidate_keys;
     TensorLayout candidate_origin;
     TensorLayout prefill_origin;
-    TensorLayout query_sums;
+    TensorLayout query_values;
     TensorLayout attention_queries;
     TensorLayout attention_tokens;
     TensorLayout attention_rows, attention_positions, attention_scratch, attention_norms, attention_output;
@@ -50,7 +50,7 @@ struct MemoryStatisticsLayout {
 };
 
 struct PersistentLayout {
-    TensorLayout memory_query_workspace;
+    std::optional<TensorLayout> memory_query_workspace;
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.

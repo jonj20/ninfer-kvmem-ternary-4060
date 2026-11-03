@@ -614,8 +614,7 @@ std::string format_request_done(const RequestLogContext& context,
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = metrics.computed_prefill_tokens;
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
@@ -978,9 +977,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
-             {"computed_prefill_tokens",
-              std::max(0, outcome.prompt_tokens -
-                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+             {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.requested_budget

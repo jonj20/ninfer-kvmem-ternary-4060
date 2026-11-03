@@ -459,6 +459,7 @@ int main() {
     outcome.metrics.prefill_seconds         = 0.2345678901234;
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
+    outcome.metrics.computed_prefill_tokens = 300;
     outcome.metrics.prefix_cache_hit_tokens = 101;
     outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
     outcome.metrics.engine_timing           = {
@@ -626,6 +627,27 @@ int main() {
             "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
             "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
+
+    // A 6,400-token input cancelled after frontier 6,144, with 4,224 reused.
+    // The unexecuted 256-token tail must not inflate either log's prefill rate.
+    for (const bool admitted : {false, true}) {
+        GenerationOutcome cancelled;
+        cancelled.prompt_tokens = 6400;
+        cancelled.finish_reason = ninfer::FinishReason::Cancelled;
+        cancelled.metrics.computed_prefill_tokens = admitted ? 1920 : 0;
+        cancelled.metrics.prefix_cache_hit_tokens = admitted ? 4224 : 0;
+        cancelled.metrics.prefix_reuse_path = admitted ? ninfer::PrefixReusePath::PrivateTurnClosure
+                                                      : ninfer::PrefixReusePath::Root;
+        cancelled.metrics.prefill_seconds = 2.0;
+        const Json record = Json::parse(format_request_done_json("serve-test", 3001, context, cancelled));
+        failures += check(record["result"]["prompt_tokens"] == 6400 &&
+                              record["result"]["computed_prefill_tokens"] == (admitted ? 1920 : 0) &&
+                              record["result"]["prefix_cache_hit_tokens"] == (admitted ? 4224 : 0),
+                          "cancelled request must report only completed prefill work");
+        failures += check(render_request_done(context, cancelled).message.find(
+                              admitted ? "prefill 960.0 tok/s" : "prefill 0.0 tok/s") != std::string::npos,
+                          "cancelled request operational rate includes unexecuted prompt tokens");
+    }
 
     GenerationOutcome normalized_tool_outcome = outcome;
     normalized_tool_outcome.tool_calls.push_back(

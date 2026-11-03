@@ -657,6 +657,9 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens = 0;
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
+    // Logical uncached prompt tokens accepted at completed prefill boundaries.
+    // Excludes reused prefixes and internal replay; may be partial or zero on cancellation.
+    std::uint32_t computed_prompt_tokens = 0;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     MaterializationDiagnostics materialization;

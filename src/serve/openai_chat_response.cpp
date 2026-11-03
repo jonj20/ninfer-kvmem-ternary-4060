@@ -54,13 +54,13 @@ double tokens_per_second(std::uint32_t tokens, double milliseconds) {
     return milliseconds > 0.0 ? 1000.0 * static_cast<double>(tokens) / milliseconds : 0.0;
 }
 
-CompletionTimings make_completion_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
+CompletionTimings make_completion_timings(std::uint32_t computed_tokens, std::uint32_t cached_tokens,
                                           std::uint32_t generated_tokens, double prompt_ms,
                                           double generation_ms, std::uint64_t draft_tokens = 0,
                                           std::uint64_t accepted_draft_tokens = 0) {
     CompletionTimings timings;
-    timings.cache_n             = std::min(cached_tokens, prompt_tokens);
-    timings.prompt_n            = prompt_tokens - timings.cache_n;
+    timings.cache_n             = cached_tokens;
+    timings.prompt_n            = computed_tokens;
     timings.prompt_ms           = finite_nonnegative(prompt_ms);
     timings.prompt_per_token_ms = milliseconds_per_token(timings.prompt_n, timings.prompt_ms);
     timings.prompt_per_second   = tokens_per_second(timings.prompt_n, timings.prompt_ms);
@@ -94,8 +94,7 @@ Json timings_json(const CompletionTimings& timings) {
 
 CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
     return make_completion_timings(
-        static_cast<std::uint32_t>(std::max(0, outcome.prompt_tokens)),
-        outcome.metrics.prefix_cache_hit_tokens,
+        outcome.metrics.computed_prefill_tokens, outcome.metrics.prefix_cache_hit_tokens,
         static_cast<std::uint32_t>(std::max(0, outcome.completion_tokens)),
         outcome.metrics.prompt_wall_seconds * 1000.0,
         outcome.metrics.generation_wall_seconds * 1000.0, outcome.metrics.speculative_draft_tokens,
@@ -105,8 +104,10 @@ CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
 CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
                                       const ninfer::GenerationTimingObservation& observation) {
     constexpr double kNanosecondsToMilliseconds = 1.0e-6;
+    // Output timing observations start only after the complete prompt has been accepted.
+    cached_tokens = std::min(cached_tokens, prompt_tokens);
     return make_completion_timings(
-        prompt_tokens, cached_tokens, observation.generated_tokens,
+        prompt_tokens - cached_tokens, cached_tokens, observation.generated_tokens,
         static_cast<double>(observation.prompt_elapsed_ns) * kNanosecondsToMilliseconds,
         static_cast<double>(observation.generation_elapsed_ns) * kNanosecondsToMilliseconds);
 }

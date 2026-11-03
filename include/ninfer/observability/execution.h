@@ -32,7 +32,8 @@ struct GenerationTimings {
     std::uint32_t overlay_exclusive_windows = 0;
     double decode_seconds      = 0.0;
     // Request wall phases at committed model-state boundaries. Prompt begins when admission and
-    // its exact reuse choice are published and ends at the first accepted output token. Generation
+    // its exact reuse choice are published and ends at the first accepted output token, or
+    // at termination when prefill is cancelled before output. Generation
     // spans the first through last accepted output token and therefore has N-1 token intervals.
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;

@@ -1,5 +1,8 @@
 #include "runtime/contract/lookup_draft.h"
 #include "models/qwen3_5/program/program_impl.h"
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+#include "models/qwen3_5/program/query_test_support.h"
+#endif
 #include "kvmem/mean_key_retrieval.hpp"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -1241,6 +1244,24 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     return timing.finish();
 }
 
+void RequestControl::snapshot_prefill_timings() noexcept {
+    if (!prefill) { return; }
+    const auto& staged = *prefill;
+    const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
+    timings.vision_seconds  = vision_seconds;
+    timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+    if (staged.vision) {
+        const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
+        timings.overlay_windows           = overlay.windows;
+        timings.overlay_exclusive_windows = overlay.exclusive_windows;
+        timings.overlay_window_seconds    = overlay.window_seconds;
+        timings.overlay_evict_seconds     = overlay.evict_seconds;
+        timings.overlay_restore_seconds   = overlay.restore_seconds;
+        timings.overlay_evicted_bytes     = overlay.evicted_bytes;
+        timings.overlay_staged_bytes      = overlay.staged_bytes;
+    }
+}
+
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing) {
@@ -1683,6 +1704,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
                 if (!finalized) {
+#ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+                    query_test_boundary(sequence.lane, sequence.window.query_tokens,
+                        sequence.window.query_end-sequence.window.query_begin,
+                        sequence.window.query_replayed);
+#endif
                     staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
                     return runtime::PrefillStepResult{.summary=summary,
                         .processed_prompt_tokens=reported_tokens(),.timing=timing.finish()};
@@ -1810,7 +1836,6 @@ runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
     std::uint32_t processed_prompt_tokens, std::span<const TokenId> initial_drafts,
     bool drafts_pending, runtime::ExecutionTimingRecorder& timing) {
     RequestControl::Prefill& staged   = *request.prefill;
-    const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
     const std::uint32_t prompt_tokens = staged.prompt_tokens;
     sequence.window.query_replay_active = false;
 
@@ -1835,18 +1860,7 @@ runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
         throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
     }
     sequence.tail_hidden_valid      = true;
-    request.timings.vision_seconds  = vision_seconds;
-    request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
-    if (staged.vision) {
-        const execution::VisionOverlayWindowStats overlay = staged.vision->overlay_stats();
-        request.timings.overlay_windows           = overlay.windows;
-        request.timings.overlay_exclusive_windows = overlay.exclusive_windows;
-        request.timings.overlay_window_seconds    = overlay.window_seconds;
-        request.timings.overlay_evict_seconds     = overlay.evict_seconds;
-        request.timings.overlay_restore_seconds   = overlay.restore_seconds;
-        request.timings.overlay_evicted_bytes     = overlay.evicted_bytes;
-        request.timings.overlay_staged_bytes      = overlay.staged_bytes;
-    }
+    request.snapshot_prefill_timings();
     staged.prompt.release_all_media_payloads();
     if (staged.vision) { staged.vision->retire_handoff(); }
 

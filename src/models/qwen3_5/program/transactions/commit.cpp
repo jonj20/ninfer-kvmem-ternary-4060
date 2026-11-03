@@ -997,6 +997,7 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     try {
         device.synchronize();
     } catch (...) { return out; }
+    request.snapshot_prefill_timings();
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         out.timings     = request.timings;

@@ -161,6 +161,7 @@ GenerationOutcome outcome() {
     out.completion_tokens               = 3;
     out.finish_reason                   = ninfer::FinishReason::StopString;
     out.matched_stop_string             = "###";
+    out.metrics.computed_prefill_tokens = 3;
     out.metrics.prefix_cache_hit_tokens = 2;
     out.metrics.prompt_wall_seconds     = 0.01;
     out.metrics.generation_wall_seconds = 0.02;

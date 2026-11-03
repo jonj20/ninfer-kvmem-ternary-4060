@@ -628,6 +628,9 @@ struct KvmemWindowState {
     std::unique_ptr<kvmem::RawKvStore> statistics;
     std::unique_ptr<kvmem::KvMemStore> selector;
     std::vector<std::vector<float>> query_rows;
+    // Mean-Q keeps the chronological FP32 sum instead of retaining token rows.
+    // The per-step device accumulator is always reseeded from this accepted state.
+    std::vector<float> query_sums;
     kvmem::GraphSnapshot graph;
     kvmem::AttentionFeedback feedback;
     kvmem::OutputSampleState attention_scope;
@@ -814,6 +817,9 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
+
+    // Snapshot completed prefill work before normal completion or cancellation retires it.
+    void snapshot_prefill_timings() noexcept;
 
     // Returns the request slot to Empty once its lane's resources have been released. Nothing of
     // the request survives into the lane's next one: its grammar, its tool-open ban, and its
