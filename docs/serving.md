@@ -2748,10 +2748,21 @@ reaching `max_tokens`.
 
 ### Default output limit
 
+With KVMem enabled, the automatically derived output limit uses the remaining logical
+`--max-context`, independently of the resident `B+R` KV window. This applies when no fixed
+default or request cap is set, or Chat Completions explicitly sends `max_tokens: -1`. Decode
+Pressure recycles that window as generation continues. The automatic budget is also bounded
+by the history that fits in the configured RAM/SSD payload budget, using whole native pages
+including speculative backend KV. This avoids reserving the entire maximum context for a
+short request when history storage is smaller. If the prompt itself does not fit, admission
+still reports a capacity error. Explicit positive output caps retain their existing admission
+checks; they are not reduced to fit history storage. Concurrent requests still wait for their
+history reservations to become available.
+
 A request that omits its output limit (`max_completion_tokens`/`max_tokens` on Chat Completions,
 `max_output_tokens` on Responses, `max_tokens` on Messages) receives the largest budget that still
-lets every configured lane be admitted at the same time. Once its prompt is prepared, the Engine
-finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
+lets every configured lane be admitted at the same time when KVMem is disabled. Once its prompt
+is prepared, the Engine finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
 plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
 (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
 (`--max-context` minus the prompt). With one lane, or a pool of at least `--max-concurrency` times

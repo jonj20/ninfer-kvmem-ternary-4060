@@ -270,8 +270,24 @@ KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
-    // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
-    // not compete for the pool up front: the remaining context stays the budget.
+    // KVMem recycles its B+R device window, but admission reserves the complete retained
+    // history. Automatic output must fit that RAM/SSD payload budget as well as context;
+    // otherwise even a short request fails when H/D cannot hold the maximum context.
+    if (kvmem_window_tokens) {
+        if (prompt_tokens == 0 || prompt_tokens > capacity) return 0U;
+        const auto remaining = capacity - prompt_tokens + 1U;
+        const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
+        if (!page_bytes) return remaining;
+        const auto pages = std::min<std::uint64_t>(kv_pages_for_tokens(capacity),
+                                                  memory_retained_budget / page_bytes);
+        const auto frontier = std::min<std::uint64_t>(capacity, pages * kPagedKVPageSize);
+        // If the prompt itself cannot fit, preserve admission's capacity error instead
+        // of turning an impossible request into a successful zero-output request.
+        if (prompt_tokens > frontier) return remaining;
+        // The last sampled output is not written to KV (the same boundary as admission).
+        return static_cast<std::uint32_t>(frontier) - prompt_tokens + 1U;
+    }
+    // Growing native leases hold a bounded window, independently of the total output.
     if (context_cache.kv_lease_growth) {
         return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
                                                               : capacity - prompt_tokens + 1U;
