@@ -273,6 +273,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     };
     GenerationService* const service = &lease.service();
     PreparedRequest prepared;
+    monitor_media_input(req_id, "openai_responses", resolved.generation);
     try {
         prepared = service->prepare(
             resolved.generation,

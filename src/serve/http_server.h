@@ -138,6 +138,7 @@ private:
     };
 
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context, PreparedRequest& prepared);
+    void monitor_media_input(std::uint64_t id, const char* endpoint, const GenerationRequest& request);
 
     [[nodiscard]] httplib::Server::HandlerResponse pre_route(const httplib::Request& req,
                                                              httplib::Response& res) const;

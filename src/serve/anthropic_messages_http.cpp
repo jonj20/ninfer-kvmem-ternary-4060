@@ -74,6 +74,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
+    monitor_media_input(req_id, "anthropic_messages", request.generation);
     try {
         prepared            = service->prepare(request.generation,
                                                request.stream ? GenerationConsumerMode::Streaming

@@ -357,6 +357,12 @@ void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failur
     owner_->record_response_failure(context_.id, failure);
 }
 
+void HttpServer::monitor_media_input(std::uint64_t id, const char* endpoint, const GenerationRequest& request) {
+    if (request.media_item_count() == 0) return;
+    const auto key = monitor_->begin(endpoint, std::to_string(id));
+    monitor_->update(key, {{"has_media", true}});
+}
+
 std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestLogContext context, PreparedRequest& prepared) {
     auto lifecycle = std::make_shared<RequestLifecycle>(*this, context);
     const auto id = std::to_string(context.id);

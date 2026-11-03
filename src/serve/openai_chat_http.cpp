@@ -43,6 +43,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
+    monitor_media_input(req_id, "openai_chat_completions", request.generation);
     try {
         const ninfer::GenerationObservationOptions observation{
             .phase_timings   = true,
