@@ -2,6 +2,7 @@
 #include "ops/linear/t5/t5_project.h"
 
 #include "core/device.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/t5/t5_a8.cuh"
 
 #include <cuda_bf16.h>
@@ -160,7 +161,8 @@ void require_input(const Tensor& x, const Weight& w, const char* what) {
 // Validates the weight, policy and outputs, then quantizes the input and multiplies: dp4a GEMV
 // through T = 4, the small-T MMA route through T = 32 (and at any T when N % 64 != 0, in 32-token
 // tiles), the 64 x 64 GEMM through T = 64 (and beyond when N % 128 != 0 or an output is not made
-// of aligned 8-row chunks), the pipelined 128-row GEMM beyond (every Bonsai weight).
+// of aligned 8-row chunks), the pipelined 128-row GEMM beyond where shared memory permits.
+// Turing's 64 KiB cannot hold the tall kernel's 67 KiB; its 64 x 64 GEMM tiles any T.
 template <class Input>
 void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* const> outputs,
              bool accumulate, LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
@@ -213,10 +215,19 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
         case 3: launch_small_t<3>(q, w, tokens, packed, accumulate, stream); break;
         default: launch_small_t<4>(q, w, tokens, packed, accumulate, stream); break;
         }
-    } else if (tokens > t5_a8::kGemmTokens && w.n % t5_a8::kTallRows == 0 && chunked_outputs) {
-        launch_tall_gemm(q, w, tokens, packed, accumulate, stream);
     } else {
-        launch_gemm(q, w, tokens, packed, accumulate, stream);
+        with_shape_set([&]<bool TuringShapes>() {
+            constexpr auto shared_limit = shape_max_shared_bytes_per_block(TuringShapes);
+            static_assert(t5_a8::gemm_shared_bytes() <= shared_limit);
+            if constexpr (t5_a8::gemm_tall_shared_bytes() <= shared_limit) {
+                if (tokens > t5_a8::kGemmTokens && w.n % t5_a8::kTallRows == 0 &&
+                    chunked_outputs) {
+                    launch_tall_gemm(q, w, tokens, packed, accumulate, stream);
+                    return;
+                }
+            }
+            launch_gemm(q, w, tokens, packed, accumulate, stream);
+        });
     }
 }
 

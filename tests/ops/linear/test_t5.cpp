@@ -287,9 +287,21 @@ int embedding_case(const Ternary& w, const std::vector<std::int32_t>& ids) {
 } // namespace
 
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) return 77;
     int failures = 0;
+    // First use of a wide projection occurs inside graph capture. On SM75 every length must
+    // stay within 64 KiB, including a partial last tile, strided destinations and accumulation.
+    // The FP64 oracle and output guards validate the smaller GEMM over multiple token tiles.
+    const Ternary prefill(128, 5120, 20261029);
+    for (int t : {65, 63, 64, 127, 128, 129, 255, 256, 257, 513}) {
+        failures += linear_case(prefill, 0, 128, t, t == 65 || t == 257);
+        failures += linear_add_case(prefill, t);
+    }
+    if (argc == 2 && std::string(argv[1]) == "--prefill-regression") {
+        std::cout << (failures ? "FAIL" : "OK") << " T5 prefill regression\n";
+        return failures ? 1 : 0;
+    }
     const Ternary small(301, 3072, 15);
     for (int t : {1,2,3,4,5,8,9,16,17,24,25,32,33,65})
         failures += linear_case(small,0,301,t,t==3 || t==9);
