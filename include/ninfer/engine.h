@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ninfer/budget_plan.h"
 
 #include <chrono>
 #include <cstddef>
@@ -85,6 +86,9 @@ inline constexpr std::size_t kMaximumGenerationBranches = 1024;
 
 class Engine {
 public:
+    // Loads weights once, quotes the largest fitting KVMem budget with all other
+    // settings fixed, then releases the model. Does not create a serving Engine.
+    [[nodiscard]] static KvmemBudgetPlan plan_kvmem_budget(EngineOptions options);
     explicit Engine(EngineOptions options);
     ~Engine();
 

@@ -1,4 +1,5 @@
 #pragma once
+#include "ninfer/budget_plan.h"
 
 #include "core/device_snapshot.h"
 #include "models/qwen3_5/model.h"
@@ -67,5 +68,6 @@ struct ConstructedModel {
 };
 
 [[nodiscard]] ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device);
+[[nodiscard]] KvmemBudgetPlan plan_model_budget(const EngineOptions& options, DeviceContext& device);
 
 } // namespace ninfer::runtime

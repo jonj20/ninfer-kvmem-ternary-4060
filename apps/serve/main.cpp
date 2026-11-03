@@ -13,6 +13,7 @@
 #include "serve/stop_control.h"
 
 #include <spdlog/logger.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <condition_variable>
@@ -218,13 +219,22 @@ std::string binary_identity() {
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--kvmem-capabilities") {
-        std::cout << kvmem::launch_capabilities("ninfer") << '\n';
+        auto capabilities = nlohmann::json::parse(kvmem::launch_capabilities("ninfer"));
+        capabilities["budget_planning_version"] = 1;
+        std::cout << capabilities.dump() << '\n';
         return 0;
+    }
+    // This process-only action never constructs or binds an HTTP server.
+    bool plan_budget = false;
+    std::vector<char*> launch_args{argv[0]};
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--plan-budget") plan_budget = true;
+        else launch_args.push_back(argv[i]);
     }
     std::set_terminate(log_terminate);
     ninfer::serve::ServeOptions options;
     try {
-        options = ninfer::serve::parse_serve_options(argc, argv);
+        options = ninfer::serve::parse_serve_options(static_cast<int>(launch_args.size()), launch_args.data());
     } catch (const std::invalid_argument& exception) {
         std::cerr << "ninfer-serve: " << exception.what() << '\n';
         std::cerr << ninfer::serve::serve_usage_text(argv[0]);
@@ -235,6 +245,7 @@ int main(int argc, char** argv) {
     }
     if (options.help_requested) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        std::cout << "  --plan-budget                 load once, quote maximum KVMem budget, then exit; no server\n";
         return 0;
     }
     options.build_version = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
@@ -265,6 +276,27 @@ int main(int argc, char** argv) {
                      options.max_concurrency);
     }
     ninfer::product::StartupLogRenderer startup_log(logging);
+    if (plan_budget) {
+        try {
+            if (options.router()) throw std::invalid_argument("Budget planning does not support model router mode");
+            auto engine_options = ninfer::serve::make_engine_options(options);
+            engine_options.startup_observer = startup_log.observer();
+            engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
+            const auto plan = ninfer::Engine::plan_kvmem_budget(std::move(engine_options));
+            const nlohmann::json report = {
+                {"version", 1}, {"available", plan.available}, {"budget", plan.budget},
+                {"minimum_budget", plan.minimum_budget}, {"maximum_budget", plan.maximum_budget},
+                {"reserve", plan.reserve}, {"prefill", plan.prefill}, {"context", plan.context},
+                {"concurrency", plan.concurrency}, {"kv_storage", static_cast<unsigned>(plan.kv_cache)},
+                {"available_bytes", plan.available_bytes}, {"runtime_bytes", plan.runtime_bytes},
+                {"safety_bytes", plan.safety_bytes}, {"planning_us", plan.planning_us}};
+            std::cout << "KVMEM_BUDGET_PLAN " << report.dump() << '\n';
+            return 0;
+        } catch (const std::exception& error) {
+            logger->error("Budget planning failed: {}", error.what());
+            return 1;
+        }
+    }
     ninfer::serve::OperationalLog operational_log(logger);
     // Stop prompts use the transient bottom line beneath the statistics panel; output without one
     // (redirected, or not a terminal) logs them instead.

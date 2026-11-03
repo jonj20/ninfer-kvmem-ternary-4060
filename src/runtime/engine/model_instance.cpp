@@ -23,6 +23,7 @@
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
 #include "runtime/engine/graph_probe.h"
+#include "runtime/engine/memory_recovery.h"
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
@@ -812,7 +813,8 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
     return out;
 }
 
-ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& device) {
+static ConstructedModel construct_model_impl(const EngineOptions& requested, DeviceContext& device,
+                                             KvmemBudgetPlan* budget_plan) {
     validate_options(requested);
     install_device_route_profile_for(requested, device);
     std::shared_ptr<core::ResidentMemorySession> residency;
@@ -943,6 +945,20 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     }
     EngineOptions planning_options =
         artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
+    if (budget_plan) {
+        const auto available = free_bytes_by_rank(device, options.wddm_evictable_budget,
+            instance->model->storage_stats().device_capacity_bytes).front();
+        *budget_plan = maximum_memory_budget(planning_options, available,
+            planning_options.max_context - planning_options.kvmem.reserve_tokens,
+            [&](const EngineOptions& candidate) {
+                const auto planner = models::qwen3_5::make_sequence_planner(
+                    instance->parameters, device, candidate, graft_main_pages);
+                const auto pages = (candidate.kv_capacity.explicit_tokens + 63ULL) / 64 + graft_main_pages;
+                return planner.capacity_curve().reservation_bytes(static_cast<std::uint32_t>(pages));
+            });
+        planning.complete();
+        return {}; // Destroy the loaded model; do not allocate a Program or run a graph probe.
+    }
     // Calibrate dense single-device execution uniformly, including MTP and DFlash2.
     // Expert streaming, grafts and suspend need separate qualification of
     // temporary Program ownership. Do not reopen production disk stores in a probe.
@@ -1004,11 +1020,37 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 ? physical_upper_bound - options.cuda_vram_reserve_bytes : 0;
         }
     }
-    auto resolution = options.cuda_memory_policy == CudaMemoryPolicy::Mixed
+    auto resolve_capacity = [&] { return options.cuda_memory_policy == CudaMemoryPolicy::Mixed
         ? resolve_mixed_kv_capacity(capacity_policy, curve, options.max_context,
                                    options.max_concurrency, free_by_rank.front())
         : resolve_kv_capacity(capacity_policy, curve, free_by_rank.front(),
-                              std::span<const std::size_t>(free_by_rank).subspan(1));
+                              std::span<const std::size_t>(free_by_rank).subspan(1)); };
+    auto resolution = [&] {
+        try { return resolve_capacity(); }
+        catch (const std::invalid_argument& error) {
+            const std::string cause = error.what();
+            if (device.size() != 1 || !options.kvmem.selected_tokens ||
+                options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault ||
+                options.kv_capacity.mode != KvCapacityMode::Explicit ||
+                cause.find("requested Engine runtime reservation requires ") != 0) { throw; }
+            std::string report;
+            try {
+                const auto requested_pages = (options.kv_capacity.explicit_tokens + 63ULL) / 64 + graft_main_pages;
+                report = memory_recovery_plan(planning_options, free_by_rank.front(),
+                    curve.reservation_bytes(static_cast<std::uint32_t>(requested_pages)),
+                    [&](const EngineOptions& candidate) {
+                        const auto candidate_planner = models::qwen3_5::make_sequence_planner(
+                            instance->parameters, device, candidate, graft_main_pages);
+                        const auto& candidate_curve = candidate_planner.capacity_curve();
+                        const auto pages = (candidate.kv_capacity.explicit_tokens + 63ULL) / 64 + graft_main_pages;
+                        return candidate_curve.reservation_bytes(static_cast<std::uint32_t>(pages));
+                    });
+            } catch (const std::exception&) { throw std::invalid_argument(cause); }
+            // Keep the report on the same terminal failure so old probe errors
+            // and previous attempts cannot supply recommendations for this run.
+            throw std::invalid_argument(cause + " | KVMEM_MEMORY_PLAN " + report);
+        }
+    }();
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
         // Price startup with the real allocations before the KV plan is finalized: the delivery
@@ -1234,6 +1276,16 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     }
     return {std::move(instance), std::move(summary), std::move(metadata),
             std::move(context_cost.model), std::move(resolved)};
+}
+
+ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device) {
+    return construct_model_impl(options, device, nullptr);
+}
+
+KvmemBudgetPlan plan_model_budget(const EngineOptions& options, DeviceContext& device) {
+    KvmemBudgetPlan result;
+    (void)construct_model_impl(options, device, &result);
+    return result;
 }
 
 } // namespace ninfer::runtime

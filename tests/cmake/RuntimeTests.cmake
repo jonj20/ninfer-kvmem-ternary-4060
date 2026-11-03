@@ -57,3 +57,7 @@ ninfer_add_test(ninfer_engine_logprobs_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_logprobs_real.cpp"
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_engine_logprobs_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_memory_recovery_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_memory_recovery.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
