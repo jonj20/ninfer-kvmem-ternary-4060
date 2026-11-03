@@ -303,6 +303,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
 | `--gdn-state-fp16` | keep the GDN recurrent state in FP16 | FP32 |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
+| `--nvfp4-w4a16` | use BF16 activations for the registered NVFP4 projections instead of native W4A4 | off |
+| `--nvfp4-w4a8-int` | admit G32 INT8 activations for the registered NVFP4 projections; independent of KV storage; W4A16 wins if both flags are set | off |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM); for Gemma 4 the tower's blocks stay pinned and stream through a two-block device window. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident; DeepSeek-V4.1 keeps it resident or, with `overlay`, streams its blocks from pinned memory through a two-block device window, and refuses `cpu` ([DeepSeek-V4.1](deepseek-v41.md#images)) | `resident` |

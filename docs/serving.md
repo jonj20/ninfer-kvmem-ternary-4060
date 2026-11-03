@@ -2259,6 +2259,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
+| `--nvfp4-w4a16` | use BF16 activations for the registered NVFP4 projections instead of native W4A4 | off |
+| `--nvfp4-w4a8-int` | admit G32 INT8 activations for the registered NVFP4 projections; independent of KV storage; W4A16 wins if both flags are set | off |
 | `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading (Q4 costs +0.69% perplexity, Q6 +0.01%) | off |
 | `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
 | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |

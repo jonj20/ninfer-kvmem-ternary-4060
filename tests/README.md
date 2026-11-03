@@ -1,5 +1,10 @@
 # Tests
 
+The local `ninfer_nvfp4_routing_*` checks cover default W4A8 admission at the MTP
+projection shape and family isolation under four scoped overrides. Each override
+runs in a separate process. `ninfer_nvfp4_mode_binding` additionally checks native
+snapshot isolation for explicit W4A16/W4A8 modes, and skips without a model fixture.
+
 The retained tests protect current `.ninfer`, numerical operator, model, runtime-transaction,
 benchmark-report, and external protocol behavior. Repository verification principles are defined in
 [`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in

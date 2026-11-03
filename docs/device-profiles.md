@@ -127,6 +127,11 @@ survives a second interleaved measurement, and its output matches the compiled r
 turns the prompt key splits off and `N` forces N splits wherever a call may split; `NINFER_LINEAR_ROUTES`
 (`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
+The scoped `int8:legacy|unified` forms affect only NVFP4 W4A8; the `a16:` forms
+affect only NVFP4 A16/A4. Plain NVFP4 W4A8 Linear defaults to Unified at every
+width, including MTP T=1, because Legacy has no implementation for that policy.
+An explicit Legacy override is rejected by both planning and execution.
+
 ## Batch composition
 
 A profile picks each width's fastest schedule, and schedules differ in the order in which they sum.

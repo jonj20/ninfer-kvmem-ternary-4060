@@ -85,6 +85,12 @@ __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2_x2m8(unsigned cod
 
 __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,
                                                                        __half scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
+    return __hmul2(kv_cache_fp8_code2_to_half2(storage), __halves2half2(scale, scale));
+
+#else
     // The integer expansion above carries the code times 2^-8 exactly, so the 2^8 that the vendor
     // conversion applies rides in a second half2 operand instead: scaling by a power of two is
     // exact, and the final multiply rounds once, exactly where the converted code times the scale
@@ -92,6 +98,8 @@ __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint
     const __half2 bias = __float2half2_rn(256.0F);
     return __hmul2(__hmul2(kv_cache_fp8_code2_to_half2_x2m8(storage), bias),
                    __halves2half2(scale, scale));
+
+#endif
 }
 
 // Dequantizes 8 contiguous E4M3 codes (16 bytes) to FP16, for PV MMA operands on hardware with
@@ -115,6 +123,26 @@ __device__ __forceinline__ int4 kv_cache_fp8_dequant_f16x8(const std::uint8_t* c
 // Blackwell-only mma.sync...kind::f8f6f4, so K needs a real (not just reinterpreted) wide copy.
 __device__ __forceinline__ int4 kv_cache_fp8_dequant_bf16x8(const std::uint8_t* codes,
                                                              __half scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
+    const int2 raw         = load_vec<int2>(codes);
+    const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
+    const float scale_f    = __half2float(scale);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        __nv_fp8x2_e4m3 value;
+        value.__x                   = c[i];
+        const float2 decoded        = static_cast<float2>(value);
+        const __nv_bfloat162 value2 =
+            __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
+        packed[i] = *reinterpret_cast<const unsigned*>(&value2);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+
+#else
     // The integer expansion carries the code times 2^-8 exactly, so the scale absorbs the 2^8
     // (exact, a power of two) and the product is the same FP32 value the vendor conversion feeds
     // the bf16 rounding. The K plane of k8v4 reads through here, and that path is issue-bound on
@@ -132,6 +160,8 @@ __device__ __forceinline__ int4 kv_cache_fp8_dequant_bf16x8(const std::uint8_t* 
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+
+#endif
 }
 
 } // namespace ninfer::ops

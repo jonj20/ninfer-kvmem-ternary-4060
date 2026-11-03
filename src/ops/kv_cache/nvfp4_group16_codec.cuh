@@ -88,6 +88,30 @@ __device__ __forceinline__ __half2 kv_cache_e2m1x2_to_half2(unsigned codes) {
 
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
                                                              std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
+    // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
+    // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
+    // therefore the exact FP16 expansion boundary, not an additional approximation.
+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
+    __nv_fp8_e4m3 encoded_scale;
+    encoded_scale.__x    = scale_code;
+    const __half scale   = static_cast<__half>(encoded_scale);
+    const __half2 scale2 = __halves2half2(scale, scale);
+    unsigned half_bits[4];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        __nv_fp4x2_e2m1 encoded;
+        encoded.__x         = bytes[pair];
+        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
+                     static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
+
+#else
     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
     // therefore the exact FP16 expansion boundary, not an additional approximation.
@@ -115,6 +139,8 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
     }
     return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
                      static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
+
+#endif
 }
 
 // BF16 counterpart of kv_cache_nvfp4_dequant_f16x8, for QK MMA operands on hardware with no FP4
@@ -122,6 +148,28 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
 // Q's storage) instead of FP16.
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t* codes,
                                                               std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
+    __nv_fp8_e4m3 encoded_scale;
+    encoded_scale.__x  = scale_code;
+    const float scale_f = static_cast<float>(encoded_scale);
+    unsigned bf16_bits[4];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        __nv_fp4x2_e2m1 encoded;
+        encoded.__x           = bytes[pair];
+        const float2 decoded  = static_cast<float2>(encoded);
+        const __nv_bfloat162 value =
+            __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
+        bf16_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
+                     static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
+
+#else
     // Same two substitutions as the FP16 form above, and the same reasoning: the E2M1 half2 the
     // sm70 path builds carries the exact value, so widening it to FP32 and multiplying by the
     // table-derived scale reproduces the vendor expression bit for bit.
@@ -138,6 +186,8 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t
     }
     return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
                      static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
+
+#endif
 }
 
 struct KVCacheNvfp4DequantizedF16x16 {
@@ -147,6 +197,31 @@ struct KVCacheNvfp4DequantizedF16x16 {
 
 __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
 kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
+    const int2 packed         = load_vec<int2>(codes);
+    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
+    __nv_fp8_e4m3 encoded_scale;
+    encoded_scale.__x    = scale_code;
+    const __half scale   = static_cast<__half>(encoded_scale);
+    const __half2 scale2 = __halves2half2(scale, scale);
+    unsigned half_bits[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        __nv_fp4x2_e2m1 encoded;
+        encoded.__x         = bytes[pair];
+        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return {
+        make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
+                  static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3])),
+        make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
+                  static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
+    };
+
+#else
     const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
     const __half2 scale2 = __float2half2_rn(scale_f);
     const int2 packed         = load_vec<int2>(codes);
@@ -163,6 +238,8 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
         make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
                   static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
     };
+
+#endif
 }
 
 } // namespace ninfer::ops

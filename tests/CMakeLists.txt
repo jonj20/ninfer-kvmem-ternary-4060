@@ -191,6 +191,33 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_kvmem_nvfp4_tests_PROGRAMS
 ninfer_finalize_bundle(ninfer_kvmem_nvfp4_tests)
 ninfer_stage_runtime_dlls(ninfer_kvmem_nvfp4_tests)
 
+# NVFP4 integration checks use separate processes for startup-fixed scoped overrides.
+ninfer_add_op_test(ninfer_nvfp4_scope STANDALONE
+  SOURCES experimental/nvfp4_scope.cpp LIBRARIES ninfer_ops)
+ninfer_stage_runtime_dlls(ninfer_nvfp4_scope)
+foreach(route_scope IN ITEMS default int8:legacy int8:unified a16:legacy a16:unified)
+  string(REPLACE ":" "_" route_name "${route_scope}")
+  set(route_environment "${route_scope}")
+  if(route_scope STREQUAL "default")
+    set(route_environment "")
+  endif()
+  add_test(NAME ninfer_nvfp4_routing_${route_name} COMMAND ninfer_nvfp4_scope)
+  set_tests_properties(ninfer_nvfp4_routing_${route_name} PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "NINFER_LINEAR_ROUTES=${route_environment}")
+endforeach()
+ninfer_add_test(ninfer_nvfp4_mode_binding STANDALONE
+  SOURCES experimental/nvfp4_mode_binding.cpp LIBRARIES ninfer::engine)
+set_tests_properties(ninfer_nvfp4_mode_binding PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_stage_runtime_dlls(ninfer_nvfp4_mode_binding)
+
+# Reuse the five relevant oracle objects without building unrelated test families.
+set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_nvfp4_fork_tests_PROGRAMS
+  ninfer_linear_nvfp4_a16_test ninfer_linear_nvfp4_int8_test
+  ninfer_linear_nvfp4_int8_fused_norm_test ninfer_linear_swiglu_nvfp4_test
+  ninfer_linear_add_nvfp4_test)
+ninfer_finalize_bundle(ninfer_nvfp4_fork_tests)
+ninfer_stage_runtime_dlls(ninfer_nvfp4_fork_tests)
+
 # Focused CPU Vision lifecycle and existing numerical/options/loading qualification.
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_cpu_vision_tests_PROGRAMS
   ninfer_qwen3_5_vision_cpu_test ninfer_cli_options_test ninfer_serve_options_test

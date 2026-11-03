@@ -44,6 +44,7 @@ enum class LinearRouteFamily : std::uint8_t {
     Q8,
     Fp8,
     Nvfp4,
+    Nvfp4Int8,
     Bf16,
 };
 
@@ -55,6 +56,8 @@ inline constexpr std::int32_t kRouteBandsMeasuredTo = 1024;
 // The table for one call: by default the unified table only inside the width bands where it was
 // measured faster on this device's class, `wide` past kRouteBandsMeasuredTo, and the legacy table
 // everywhere else; NINFER_LINEAR_ROUTES=legacy|unified takes one table for every width.
+// Plain Nvfp4Int8 defaults to Unified at every width, its only implemented table.
+// Scoped int8:/a16: overrides affect only the matching NVFP4 family (A16 includes A4).
 [[nodiscard]] LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
                                                   LinearRouteTable wide = LinearRouteTable::Legacy);
 
