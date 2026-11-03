@@ -1367,6 +1367,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 static_cast<unsigned long long>(query.begin+query.count),
                 static_cast<unsigned long long>(memory_query_probe(sequence,staged.prompt_tokens) ? plan.end-plan.begin : 0),
                 kvmem_options.query_replay_max_tokens,sequence.window.query_capture ? 1U : 0U);
+            if (const auto input = request.allow_memory_reuse ? memory_input_reuse_frontier(staged.prompt) : 0U)
+                std::fprintf(stderr, "KVMEM_INPUT_REUSE_PLAN frontier=%u fallback=%u prompt=%u\n",
+                    input, staged.prompt.identity.rewrite_checkpoint->frontier, staged.prompt_tokens);
         }
         auto step_tokens = kvmem_window_tokens
             ? prefill_chunk - staged.cursor % prefill_chunk : prefill_chunk;
@@ -1572,11 +1575,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 const bool query_checkpoint = memory_query_probe(sequence, staged.prompt_tokens);
                 const auto checkpoint_purpose = query_checkpoint ? kvmem::CheckpointPurpose::QueryReplay
                                                                  : kvmem::CheckpointPurpose::PromptTail;
+                const auto memory_input_frontier = request.allow_memory_reuse
+                    ? memory_input_reuse_frontier(staged.prompt) : 0U;
+                const auto memory_rewrite_frontier = kvmem_window_tokens && request.allow_memory_reuse &&
+                    staged.prompt.identity.rewrite_checkpoint
+                    ? staged.prompt.identity.rewrite_checkpoint->frontier : 0U;
+                // A structural input source is independent of the earlier rewrite
+                // source and the still-active exact Query source. Establish an
+                // existing complete representative before adding an execution cut.
+                const bool input_source_ready = memory_input_frontier &&
+                    reuse_memory_input_checkpoint(sequence, memory_input_frontier, memory_rewrite_frontier,
+                        query_checkpoint || sequence.window.query_replay_active);
+                if (memory_input_frontier > staged.cursor && !input_source_ready &&
+                    (!split_frontier || memory_input_frontier < *split_frontier))
+                    split_frontier = memory_input_frontier;
                 // Decide before splitting the chunk or allocating a StateImage.
                 // Only an already captured, complete earlier state can substitute
                 // for the ordinary prompt tail; a real Query rewind remains exact.
-                const auto memory_frontier = request.allow_memory_reuse && !query_checkpoint &&
-                    skip_memory_tail_checkpoint(sequence, staged.prompt_tokens) ? 0U :
+                const auto memory_frontier = !query_checkpoint && (memory_input_frontier ||
+                    (request.allow_memory_reuse && skip_memory_tail_checkpoint(sequence, staged.prompt_tokens))) ? 0U :
                     memory_checkpoint_frontier(sequence, staged.prompt_tokens, request.allow_memory_reuse);
                 if (memory_frontier > staged.cursor &&
                     (!split_frontier || memory_frontier < *split_frontier)) {
@@ -1588,9 +1605,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // Frontend owns the exact generation opener/turn reconstruction
                 // boundary. Keep one bounded fallback when later serialization
                 // does not reproduce the generated endpoint byte for byte.
-                const auto memory_rewrite_frontier = kvmem_window_tokens && request.allow_memory_reuse &&
-                    staged.prompt.identity.rewrite_checkpoint
-                    ? staged.prompt.identity.rewrite_checkpoint->frontier : 0U;
                 if (memory_rewrite_frontier > staged.cursor &&
                     (!split_frontier || memory_rewrite_frontier < *split_frontier)) {
                     split_frontier = memory_rewrite_frontier;
@@ -1662,6 +1676,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     capture_memory_anchor(sequence, result.processed_tokens);
                 if (kvmem_window_tokens && request.allow_memory_reuse && !result.finalized)
                     capture_memory_coverage(sequence, result.processed_tokens);
+                if (memory_input_frontier && !input_source_ready && staged.cursor == memory_input_frontier)
+                    capture_memory_input_reuse(sequence, result.processed_tokens, memory_input_frontier,
+                        memory_rewrite_frontier, query_checkpoint || sequence.window.query_replay_active);
                 if (hybrid_lane != nullptr && !result.finalized) {
                     // A branched read's frontier is a tap position too (its branches follow it).
                     hybrid_after_prefill_chunk(sequence, staged.cursor,

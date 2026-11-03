@@ -9,6 +9,50 @@
 int main() {
     using namespace ninfer::models::qwen3_5::detail;
     constexpr auto keep = no_checkpoint_surrogate;
+    // These are exact Frontend token boundaries, not a prompt-minus-constant
+    // estimate: the long tool input retains its 34-token safe rewrite source.
+    CHECK(structural_input_reuse_frontier(1452, 1450, 34) == 1450);
+    CHECK(structural_input_reuse_frontier(8002, 8000, 34) == 8000);
+    CHECK(structural_input_reuse_frontier(499, 492, 492) == 0);
+    CHECK(structural_input_reuse_frontier(499, 492, 0) == 0);
+    CHECK(structural_input_reuse_frontier(499, 0, 34) == 0);
+    CHECK(structural_input_reuse_frontier(499, 499, 34) == 0);
+    CHECK(structural_input_reuse_frontier(499, 501, 34) == 0);
+    CHECK(structural_input_reuse_frontier(499, 492, 493) == 0);
+    CHECK(input_reuse_source_allowed(1450, 1450, 0, 1440));
+    CHECK(input_reuse_source_allowed(1444, 1450, 16, 1440));
+    CHECK(!input_reuse_source_allowed(1444, 1450, 0, 1440));
+    CHECK(!input_reuse_source_allowed(1444, 1450, 5, 1440));
+    CHECK(!input_reuse_source_allowed(1444, 1450, 16, 1445));
+    CHECK(!input_reuse_source_allowed(1451, 1450, 16, 1440));
+    CHECK(!input_reuse_source_allowed(0, 10, 16, 0));
+    {
+        // The structured input and safe rewrite sources survive independently
+        // of execution-role publication. Query rewind invalidates the deeper
+        // first-pass state; only a fresh second-pass state may replace it.
+        auto fallback = std::make_shared<int>(34);
+        auto query = std::make_shared<int>(1200);
+        auto input = std::make_shared<int>(1450);
+        const auto probe_query = query;
+        std::weak_ptr<int> first_pass = input;
+        std::shared_ptr<int> tail;
+        CheckpointReplayCompletion completion{false, true, false, 0, 1440};
+        CHECK(!retire_query_checkpoint_after_prefill(query, tail, 0, completion));
+        CHECK(query == probe_query && *fallback == 34);
+        input.reset(); // Native restore truncates all roles after query_begin.
+        CHECK(first_pass.expired() && query == probe_query && *fallback == 34);
+        input = std::make_shared<int>(1450);
+        completion = {true, false, true, 1450, 1440};
+        // An InputReuse image is not an ordinary PromptTail publication: the
+        // existing T=0 execution retirement contract is not silently widened.
+        CHECK(!retire_query_checkpoint_after_prefill(query, tail, 0, completion));
+        CHECK(query == probe_query && *input == 1450 && *fallback == 34);
+        auto shared_input = input;
+        std::weak_ptr<int> retained_input = input;
+        input.reset();
+        CHECK(!retained_input.expired()); // Other role/history leases own bytes.
+        CHECK(*shared_input == 1450 && *fallback == 34);
+    }
     {
         // Short -> long: the successfully captured Query replaces the old tail
         // without retaining a second unreferenced native image at T=0.

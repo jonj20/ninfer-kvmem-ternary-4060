@@ -555,12 +555,12 @@ struct KvmemCheckpointRecord {
                 data ? data->state_bytes() + data->metadata_bytes() : 0};
     }
 };
-enum class KvmemCheckpointKind : std::uint16_t { Base, Endpoint, InputFallback, Reconstruction, ReuseAnchor, PromptTail, CoverageBegin = 16 };
+enum class KvmemCheckpointKind : std::uint16_t { Base, Endpoint, InputFallback, Reconstruction, ReuseAnchor, PromptTail, InputReuse, CoverageBegin = 16 };
 // Lookup priority for equal frontiers.
 inline constexpr std::array kKvmemCheckpointKinds{
     KvmemCheckpointKind::Endpoint, KvmemCheckpointKind::Reconstruction,
     KvmemCheckpointKind::InputFallback, KvmemCheckpointKind::Base, KvmemCheckpointKind::ReuseAnchor,
-    KvmemCheckpointKind::PromptTail};
+    KvmemCheckpointKind::PromptTail, KvmemCheckpointKind::InputReuse};
 struct KvmemHistoryMatch {
     std::size_t history;
     KvmemCheckpointKind kind;
@@ -667,7 +667,9 @@ struct KvmemWindowState {
     std::uint32_t query_begin = 0, query_end = 0;
     // QueryReplay owns the exact pre-Query execution state. PromptTail is a
     // separate optional reuse point, or an alias leasing its earlier substitute.
-    kvmem::CheckpointCatalog<KvmemCheckpointRecord> checkpoints{kvmem::CheckpointLimits{6}};
+    // InputReuse independently retains a deeper structural input boundary when
+    // conservative template rewrite recovery requires an earlier InputFallback.
+    kvmem::CheckpointCatalog<KvmemCheckpointRecord> checkpoints{kvmem::CheckpointLimits{7}};
     kvmem::CheckpointArchive<KvmemCheckpointRecord> coverage;
     kvmem::CheckpointCapturePlan capture_plan;
     std::uint32_t reuse_anchor = 0;
@@ -2134,6 +2136,12 @@ private:
         std::uint32_t prompt_tokens, bool allow_reuse) const;
     void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens, bool query_checkpoint);
     bool skip_memory_tail_checkpoint(SequenceState& sequence, std::uint32_t prompt_tokens);
+    std::uint32_t memory_input_reuse_frontier(const PreparedPromptData& prompt) const;
+    bool reuse_memory_input_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                        std::uint32_t fallback, bool query_protected);
+    void capture_memory_input_reuse(SequenceState& sequence, std::uint32_t chunk_tokens,
+                                     std::uint32_t frontier, std::uint32_t fallback,
+                                     bool query_protected) noexcept;
     bool complete_memory_checkpoint(const SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint) const;
     void prune_completed_memory_checkpoints(SequenceState& sequence);
     std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence, bool optional = false);

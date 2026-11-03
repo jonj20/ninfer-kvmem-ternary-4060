@@ -11,6 +11,16 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// The Frontend has already mapped both boundaries exactly through tokenization
+// and media expansion. Add a deeper input source only when conservative rewrite
+// recovery moved earlier; ordinary same-boundary requests keep their old policy.
+inline std::uint32_t structural_input_reuse_frontier(std::uint32_t prompt_tokens,
+                                                     std::uint32_t input_end,
+                                                     std::uint32_t rewrite_frontier) {
+    return rewrite_frontier && rewrite_frontier < input_end && input_end < prompt_tokens
+        ? input_end : 0U;
+}
+
 // Publish only after capture/restore succeeded. The two roles replace the old
 // single Base role across requests, so splitting their names must not retain
 // an obsolete extra image. During a real replay its exact Query source remains
@@ -57,6 +67,14 @@ inline bool checkpoint_recompute_allowed(std::uint64_t earlier, std::uint64_t fr
                                          std::uint64_t limit, std::uint64_t minimum) {
     return limit && earlier && earlier < frontier && earlier >= minimum &&
            frontier - earlier <= limit;
+}
+
+// A same-boundary native image can be shared even with thinning disabled. The
+// caller still has to prove complete native identity, state and KV coverage.
+inline bool input_reuse_source_allowed(std::uint64_t source, std::uint64_t frontier,
+                                       std::uint64_t limit, std::uint64_t query_end) {
+    return source && source >= query_end &&
+        (source == frontier || checkpoint_recompute_allowed(source, frontier, limit, query_end));
 }
 
 struct CheckpointRecomputePoint {

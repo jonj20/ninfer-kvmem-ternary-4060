@@ -2,6 +2,8 @@
 #include "kvmem_test_options.h"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -54,6 +56,68 @@ struct Sink final : ninfer::OutputSink {
     }
     void publish(ninfer::OutputDelta) override {}
 };
+
+struct InputReuseBoundary {
+    std::vector<ninfer::TokenId> tokens;
+    std::uint32_t safe = 0, input_end = 0, opener = 0;
+};
+
+InputReuseBoundary input_reuse_boundary(ninfer::Engine& engine, const ninfer::PromptInput& prompt,
+                                       std::ofstream& output, const char* name) {
+    auto prepared = engine.prepare(prompt);
+    InputReuseBoundary result;
+    result.tokens.assign(prepared.token_ids().begin(), prepared.token_ids().end());
+    // This fixture deliberately qualifies the real Qwen ChatML artifact. Decode the actual
+    // tokens, including special tokens, instead of assuming a model-specific token count.
+    std::string rendered;
+    std::vector<std::size_t> offsets{0};
+    for (auto token : result.tokens) {
+        rendered += engine.token_bytes(token);
+        offsets.push_back(rendered.size());
+    }
+    constexpr std::string_view assistant = "<|im_start|>assistant\n";
+    constexpr std::string_view close = "<|im_end|>";
+    const auto first_assistant = rendered.find(assistant);
+    const auto last_assistant = rendered.rfind(assistant);
+    require(first_assistant != std::string::npos && last_assistant > first_assistant,
+            "input-reuse fixture is not the expected real ChatML history");
+    const auto last_close = rendered.rfind(close, last_assistant);
+    require(last_close != std::string::npos && last_close < last_assistant,
+            "input-reuse history has no completed input message");
+    const auto frontier = [&](std::size_t byte) {
+        const auto found = std::lower_bound(offsets.begin(), offsets.end(), byte);
+        require(found != offsets.end() && *found == byte,
+                "fixture marker is not an exact token boundary");
+        return static_cast<std::uint32_t>(found - offsets.begin());
+    };
+    result.safe = frontier(first_assistant);
+    auto input_byte_end = last_close + close.size();
+    if (input_byte_end < rendered.size() && rendered[input_byte_end] == '\n') ++input_byte_end;
+    result.input_end = frontier(input_byte_end);
+    result.opener = frontier(last_assistant);
+    require(result.safe < result.input_end && result.input_end <= result.opener &&
+            result.opener < result.tokens.size(), "fixture input frontiers are not ordered");
+    output << "INPUT_REUSE_BOUNDARY case=" << name << " safe=" << result.safe
+           << " input_end=" << result.input_end << " opener=" << result.opener
+           << " prompt=" << result.tokens.size() << " tokens=";
+    for (auto token : result.tokens) output << token << ',';
+    output << '\n'; output.flush();
+    std::cout << "INPUT_REUSE_BOUNDARY case=" << name << " safe=" << result.safe
+              << " input_end=" << result.input_end << " opener=" << result.opener
+              << " prompt=" << result.tokens.size() << std::endl;
+    return result;
+}
+
+std::uint32_t input_reuse_limit() {
+    const char* raw = std::getenv("KVMEM_CHECKPOINT_EXTRA_RECOMPUTE_TOKENS");
+    if (!raw || !*raw) return 0;
+    const std::string_view value(raw);
+    std::uint32_t limit = 0;
+    const auto parsed = std::from_chars(value.data(), value.data()+value.size(), limit);
+    require(parsed.ec == std::errc{} && parsed.ptr == value.data()+value.size() &&
+            limit <= 2147483647U, "invalid input-reuse test recompute limit");
+    return limit;
+}
 }
 
 int main(int argc, char** argv) {
@@ -84,7 +148,8 @@ int main(int argc, char** argv) {
         }
         if (mode == "lrfu") { o.kvmem.lrfu = true; o.kvmem.score_agg_max = true; }
         const bool input_fallback = mode == "input-fallback";
-        if ((mode == "endpoint" || input_fallback) && o.speculative.draft_tokens) {
+        const bool input_reuse = mode == "input-reuse";
+        if ((mode == "endpoint" || input_fallback || input_reuse) && o.speculative.draft_tokens) {
             o.speculative.ngram_draft_tokens = 31;
             o.speculative.ngram_min_match = 4;
         }
@@ -98,7 +163,7 @@ int main(int argc, char** argv) {
             } else if (feature == "fast") o.fast_prefill_kernel = true;
             else throw std::invalid_argument("expected wddm, adaptive, fast or adaptive-fast");
         }
-        if (input_fallback) o.gdn_state_fp16 = true;
+        if (input_fallback || input_reuse) o.gdn_state_fp16 = true;
         ninfer::Engine engine(o);
         std::cout << "FEATURE drafts=" << o.speculative.draft_tokens << " adaptive="
                   << (o.speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive)
@@ -272,6 +337,101 @@ int main(int argc, char** argv) {
             check("cancel-output", chat, previous, 8);
             check("after-cancel", chat, previous);
             std::cout << "INPUT_FALLBACK PASS" << std::endl;
+            return 0;
+        }
+        if (input_reuse) {
+            ninfer::PromptInput chat;
+            chat.options.enable_thinking = true;
+            chat.options.preserve_thinking = true;
+            chat.context_cache.session_key = "input-reuse-real-template";
+            add(chat, ninfer::ChatRole::System, "Read the archive and reply with the single word violet.");
+            add(chat, ninfer::ChatRole::User, "What is the observatory's color? Use the tool records.");
+            add(chat, ninfer::ChatRole::Assistant, "I will read the archive.");
+            std::string records;
+            for (int i = 0; i < 100; ++i)
+                records += "Record " + std::to_string(i) + ": the violet observatory studies pulsars.\n";
+            add(chat, ninfer::ChatRole::Tool, records);
+            const auto base = input_reuse_boundary(engine, chat, output, "base");
+            require(base.tokens.size() > o.kvmem.selected_tokens + o.kvmem.reserve_tokens,
+                    "input-reuse fixture did not exercise sparse history");
+            const auto limit = input_reuse_limit();
+            require(base.input_end - base.safe > limit,
+                    "input-reuse threshold hides the deep-versus-safe distinction");
+            const auto lcp = [](const auto& left, const auto& right) {
+                return static_cast<std::uint32_t>(std::mismatch(left.begin(), left.end(),
+                                                              right.begin(), right.end()).first-left.begin());
+            };
+            const auto check = [&](const char* name, const ninfer::PromptInput& prompt,
+                                   std::uint32_t minimum, std::uint32_t maximum, bool cancel) {
+                ninfer::RequestOptions request;
+                request.execution.requested_output_tokens = 96;
+                request.execution.sampling.temperature = 0;
+                request.execution.sampling.seed = 42;
+                request.execution.thinking.budget = 16;
+                Sink sink; sink.cancel_output = cancel ? 8 : 0;
+                std::cout << "INPUT_REUSE_BEGIN case=" << name << " minimum=" << minimum
+                          << " maximum=" << maximum << " limit=" << limit << std::endl;
+                const auto result = engine.submit(engine.prepare(prompt), request,
+                    ninfer::OutputConsumerMode::Streaming,
+                    {.phase_timings = true, .live_timings = true, .prompt_progress = true})
+                    .wait(&sink, ninfer::CancellationView([&] { return sink.cancel.load(); }));
+                require(engine.is_available() && sink.starts == 1,
+                        "input-reuse request admission failed");
+                require(result.reused_prompt_tokens == sink.reused &&
+                        result.reused_prompt_tokens >= minimum && result.reused_prompt_tokens <= maximum,
+                        "input-reuse did not restore within the independently derived legal range");
+                if (cancel) require(result.finish_reason == ninfer::FinishReason::Cancelled,
+                                    "input-reuse cancellation did not terminate");
+                else {
+                    require(sink.processed == sink.total && !result.content.empty(),
+                            "input-reuse prompt or content did not complete");
+                    if (o.speculative.draft_tokens)
+                        require(result.speculative.enabled && result.speculative.rounds > 0 &&
+                                result.speculative.drafted_tokens > 0,
+                                "input-reuse MTP did not verify any drafts");
+                }
+                const auto memory = engine.memory_summary().kvmem;
+                require(memory.host_payload_bytes <= o.kvmem.host_bytes &&
+                        memory.resident_pages == 0 && memory.mtp_resident_pages == 0,
+                        "input-reuse retirement exceeded Host budget or retained device KV");
+                output << "INPUT_REUSE_RESULT case=" << name << " reused=" << result.reused_prompt_tokens
+                       << " minimum=" << minimum << " maximum=" << maximum
+                       << " cancelled=" << cancel << " host_payload_bytes=" << memory.host_payload_bytes
+                       << " generated=" << result.generated_token_ids.size() << '\n';
+                output.flush();
+                std::cout << "INPUT_REUSE_RESULT case=" << name << " reused=" << result.reused_prompt_tokens
+                          << " minimum=" << minimum << " maximum=" << maximum
+                          << " cancelled=" << cancel << " host_payload_bytes=" << memory.host_payload_bytes
+                          << " generated=" << result.generated_token_ids.size() << std::endl;
+            };
+            check("cold", chat, 0, 0, false);
+            check("repeat-input", chat, base.input_end-limit,
+                  static_cast<std::uint32_t>(base.tokens.size()-1), false);
+            // Discard the generated answer exactly as the old fixture does. The following
+            // transport Tool preserves the real template's existing input serialization.
+            add(chat, ninfer::ChatRole::Assistant, "The tool record is saved.");
+            add(chat, ninfer::ChatRole::Tool, "Additional archive fragment.\n" + records.substr(0, 600));
+            const auto tools = input_reuse_boundary(engine, chat, output, "tools");
+            const auto tool_lcp = lcp(base.tokens, tools.tokens);
+            require(tool_lcp >= base.input_end, "tool fixture does not preserve the deep input");
+            check("discard-and-tool", chat, base.input_end-limit, tool_lcp, false);
+            check("repeat-tool", chat, tools.input_end-limit,
+                  static_cast<std::uint32_t>(tools.tokens.size()-1), false);
+            check("cancel-tool", chat, tools.input_end-limit,
+                  static_cast<std::uint32_t>(tools.tokens.size()-1), true);
+            check("after-cancel", chat, tools.input_end-limit,
+                  static_cast<std::uint32_t>(tools.tokens.size()-1), false);
+            add(chat, ninfer::ChatRole::Assistant, "The tool record is saved.");
+            add(chat, ninfer::ChatRole::User, "What does the observatory study? Answer briefly.");
+            const auto next = input_reuse_boundary(engine, chat, output, "new-user");
+            const auto user_lcp = lcp(tools.tokens, next.tokens);
+            require(user_lcp >= base.safe && user_lcp < base.input_end,
+                    "new-user fixture did not rewrite old assistant packaging");
+            // A later input representative cannot stand in for the early rewrite-safe point.
+            const auto safe_minimum = base.safe > limit ? base.safe-limit : 1U;
+            check("new-user", chat, safe_minimum, user_lcp, false);
+            std::cout << "INPUT_REUSE PASS tool_lcp=" << tool_lcp << " user_lcp=" << user_lcp
+                      << " limit=" << limit << std::endl;
             return 0;
         }
         if (mode == "endpoint") {

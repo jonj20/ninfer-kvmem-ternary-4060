@@ -1088,6 +1088,66 @@ bool ProgramImpl::skip_memory_tail_checkpoint(SequenceState& sequence, std::uint
     return true;
 }
 
+std::uint32_t ProgramImpl::memory_input_reuse_frontier(const PreparedPromptData& prompt) const {
+    if (!kvmem_window_tokens || !prompt.identity.rewrite_checkpoint) return 0;
+    const auto frontier = structural_input_reuse_frontier(static_cast<std::uint32_t>(prompt.token_ids.size()),
+        prompt.memory_input_end, prompt.identity.rewrite_checkpoint->frontier);
+    const auto query = memory_query_span(prompt);
+    if (!frontier || (query.count && frontier < query.begin + query.count)) return 0;
+    for (const auto& item : prompt.vision_items) if (!item.token_spans.empty() &&
+        item.token_spans.front().begin < frontier &&
+        frontier < item.token_spans.back().begin + item.token_spans.back().count) return 0;
+    return frontier;
+}
+
+bool ProgramImpl::reuse_memory_input_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                                std::uint32_t fallback, bool query_protected) {
+    auto& window = sequence.window;
+    const auto limit = window.coverage.policy().extra_recompute_tokens;
+    std::shared_ptr<KvmemPrefixCheckpoint> source;
+    for (const auto kind : checkpoint_kinds(window)) {
+        const auto& cp = memory_checkpoint_slot(window, kind);
+        if (!cp || !input_reuse_source_allowed(cp->prefix.size(), frontier, limit, window.query_end) ||
+            (source && cp->prefix.size() <= source->prefix.size()) ||
+            !complete_memory_checkpoint(sequence, *cp)) continue;
+        source = cp;
+    }
+    if (!source) return false;
+    auto& input = window.checkpoints.slot(kvmem::CheckpointPurpose::InputReuse).data;
+    const bool changed = input != source;
+    input = std::move(source);
+    // This role never retires QueryReplay. Its exact source remains necessary
+    // throughout the probe, waiting-for-rewind and active-replay phases.
+    if (changed && kvmem_options.verify_transfers)
+        std::fprintf(stderr, "KVMEM_INPUT_REUSE action=%s frontier=%u earlier=%zu extra_tokens=%zu limit=%llu fallback=%u query_protected=%d\n",
+            input->prefix.size() == frontier ? "share" : "nearby", frontier, input->prefix.size(),
+            frontier - input->prefix.size(), static_cast<unsigned long long>(limit), fallback, int(query_protected));
+    return true;
+}
+
+void ProgramImpl::capture_memory_input_reuse(SequenceState& sequence, std::uint32_t chunk_tokens,
+                                             std::uint32_t frontier, std::uint32_t fallback,
+                                             bool query_protected) noexcept {
+    try {
+        if (!chunk_tokens || sequence.text_kv_valid != frontier) return;
+        // An anchor/coverage image captured at this same completed chunk can
+        // serve both roles. Equal token position alone never proves validity.
+        if (reuse_memory_input_checkpoint(sequence, frontier, fallback, query_protected)) return;
+        copy_tail(sequence, prefill_hidden.slice(1, static_cast<std::int32_t>(chunk_tokens) - 1, 1));
+        auto captured = capture_memory_checkpoint(sequence, true);
+        sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::InputReuse).data = std::move(captured);
+        if (kvmem_options.verify_transfers)
+            std::fprintf(stderr, "KVMEM_INPUT_REUSE action=capture frontier=%u earlier=%u extra_tokens=0 limit=%llu fallback=%u query_protected=%d\n",
+                frontier, frontier, static_cast<unsigned long long>(sequence.window.coverage.policy().extra_recompute_tokens),
+                fallback, int(query_protected));
+    } catch (const std::exception& error) {
+        // Optional input reuse must not consume the prior safe rewrite source,
+        // an in-flight Query source, or the previously retained input image.
+        std::fprintf(stderr, "KVMEM_INPUT_REUSE action=failed frontier=%u fallback=%u reason=%s\n",
+            frontier, fallback, error.what());
+    }
+}
+
 void ProgramImpl::prune_completed_memory_checkpoints(SequenceState& sequence) {
     auto& window = sequence.window;
     const auto limit = window.coverage.policy().extra_recompute_tokens;
@@ -1210,6 +1270,7 @@ std::shared_ptr<KvmemPrefixCheckpoint>& ProgramImpl::memory_checkpoint_slot(Kvme
     case KvmemCheckpointKind::Reconstruction: return window.checkpoints.slot(kvmem::CheckpointPurpose::Reconstruction).data;
     case KvmemCheckpointKind::ReuseAnchor: return window.checkpoints.slot(kvmem::CheckpointPurpose::ReuseAnchor).data;
     case KvmemCheckpointKind::PromptTail: return window.checkpoints.slot(kvmem::CheckpointPurpose::PromptTail).data;
+    case KvmemCheckpointKind::InputReuse: return window.checkpoints.slot(kvmem::CheckpointPurpose::InputReuse).data;
     }
     const auto index = unsigned(kind)-unsigned(KvmemCheckpointKind::CoverageBegin);
     if (auto* entry=window.coverage.at(index)) return entry->record.data;
@@ -1226,6 +1287,7 @@ const KvmemPrefixCheckpoint* ProgramImpl::memory_checkpoint(const KvmemWindowSta
     case KvmemCheckpointKind::Reconstruction: purpose = kvmem::CheckpointPurpose::Reconstruction; break;
     case KvmemCheckpointKind::ReuseAnchor: purpose = kvmem::CheckpointPurpose::ReuseAnchor; break;
     case KvmemCheckpointKind::PromptTail: purpose = kvmem::CheckpointPurpose::PromptTail; break;
+    case KvmemCheckpointKind::InputReuse: purpose = kvmem::CheckpointPurpose::InputReuse; break;
     default: {
         const auto* entry=window.coverage.at(unsigned(kind)-unsigned(KvmemCheckpointKind::CoverageBegin));
         return entry ? entry->record.data.get() : nullptr;
@@ -1927,7 +1989,8 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
         archive_memory_window(sequence);
     }
     window.query_probe_swaps=window.swaps;
-    if (*frontier == memory_checkpoint_frontier(sequence, staged.prompt_tokens, true))
+    if (*frontier == memory_checkpoint_frontier(sequence, staged.prompt_tokens, true) &&
+        (memory_query_probe(sequence, staged.prompt_tokens) || !memory_input_reuse_frontier(staged.prompt)))
         publish_memory_checkpoint_source(window, std::move(checkpoint), memory_query_probe(sequence, staged.prompt_tokens));
     else
         // An exact replay can start at the input capture boundary, so prefill
@@ -2053,7 +2116,8 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
     if(window.coverage.policy().enabled) {
       try {
         std::shared_ptr<KvmemPrefixCheckpoint> input;
-        if (window.coverage.policy().extra_recompute_tokens) {
+        if (window.coverage.policy().extra_recompute_tokens ||
+            memory_checkpoint(window, KvmemCheckpointKind::InputReuse)) {
             for (const auto kind : checkpoint_kinds(window)) {
                 const auto& cp = memory_checkpoint_slot(window, kind);
                 if (!cp || cp->prefix.size() >= window.output_begin ||
