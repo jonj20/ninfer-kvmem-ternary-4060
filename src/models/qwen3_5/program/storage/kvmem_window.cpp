@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
+#include <unordered_map>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -1032,6 +1034,7 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     checkpoint->prefix.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
     checkpoint->prefix_identity = sequence.prefix_identity;
     checkpoint->prefix_identity.truncate(frontier);
+    checkpoint->prefix_digest = sequence.prefix_digests.at(frontier);
     checkpoint->mean_tail = window.statistics->mean_checkpoint(frontier);
     checkpoint->history = history;
     checkpoint->graph=window.graph;
@@ -1388,232 +1391,317 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     sequence.tail_hidden_valid = true;
 }
 
-std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(const PreparedPromptData& prompt) const {
+KvmemHistoryPreparation::~KvmemHistoryPreparation() { ticket.cancel(); }
+
+std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+    const PreparedPromptData& prompt, const PrefixShortlistDigests* digests) const {
     if (!kvmem_window_tokens || !prompt.identity.reusable || (prompt.context_cache.session_key &&
         !prompt.context_cache.update_session_index)) return std::nullopt;
-    std::optional<KvmemHistoryMatch> best;
-    std::size_t best_frontier = 0;
-    unsigned prefix_rejected = 0, identity_rejected = 0, query_rejected = 0, incomplete = 0, branch_rejected = 0;
-    const auto kind_of = [](const KvmemCheckpointRecord& record) {
-        using Purpose = kvmem::CheckpointPurpose;
-        if (kvmem::has_purpose(record.purposes, Purpose::Endpoint)) return KvmemCheckpointKind::Endpoint;
-        if (kvmem::has_purpose(record.purposes, Purpose::Reconstruction)) return KvmemCheckpointKind::Reconstruction;
-        if (kvmem::has_purpose(record.purposes, Purpose::InputFallback)) return KvmemCheckpointKind::InputFallback;
-        if (kvmem::has_purpose(record.purposes, Purpose::QueryReplay)) return KvmemCheckpointKind::Base;
-        return KvmemCheckpointKind::ReuseAnchor;
-    };
+    const auto started = Clock::now();
     const auto limit = kvmem::prefix_restore_limit(prompt.token_ids.size(), prompt.token_ids.size(),
-                                                  prompt.token_ids.size(), true);
-    for (std::size_t index = 0; index < memory_histories.size(); ++index) {
-        const auto& history = memory_histories[index];
-        if (!history || !history->stamp.valid ||
-            history->session_key != prompt.context_cache.session_key) continue;
-        if (history->coverage.policy().enabled && !history->session_key) {
-            // Restoring consumes this owner's archive. A new root/periodic
-            // point must not turn a different anonymous conversation into a
-            // destructive suffix edit. Explicit session keys authorize edits.
-            const KvmemPrefixCheckpoint* latest = nullptr;
-            for (const auto kind : checkpoint_kinds(*history)) {
-                const auto* cp = memory_checkpoint(*history, kind);
-                if (cp && (!latest || cp->prefix.size() > latest->prefix.size())) latest = cp;
+                                                   prompt.token_ids.size(), true);
+    struct Candidate {
+        KvmemHistoryMatch match;
+        const KvmemPrefixCheckpoint* checkpoint;
+        uint64_t cold_bytes;
+        size_t rank;
+    };
+    unsigned prefix_rejected=0, identity_rejected=0, query_rejected=0, incomplete=0, branch_rejected=0;
+    unsigned shortlisted=0, exact_checks=0;
+    uint64_t compared_tokens=0;
+    PrefixShortlistDigests incoming;
+    std::optional<KvmemHistoryMatch> best;
+    bool fork=false;
+    for (unsigned pass=0; pass<2 && !best; ++pass) {
+        // Tool continuation remains append plus resident-only Pressure. Only a
+        // named request with a current user Query may discover another owner.
+        if (pass && (!prompt.context_cache.session_key || !prompt.memory_query ||
+                     !prompt.memory_query->count)) break;
+        std::vector<Candidate> candidates;
+        for (size_t index=0; index<memory_histories.size(); ++index) {
+            const auto& history=memory_histories[index];
+            if (!history || !history->stamp.valid) continue;
+            const bool own=history->session_key==prompt.context_cache.session_key;
+            if (own != (pass==0)) continue;
+            if (pass && (!history->session_key || !history->coverage.policy().enabled)) continue;
+            if (!pass && history->coverage.policy().enabled && !history->session_key) {
+                const KvmemPrefixCheckpoint* latest=nullptr;
+                for (const auto kind:checkpoint_kinds(*history)) {
+                    const auto* cp=memory_checkpoint(*history,kind);
+                    if(cp && (!latest || cp->prefix.size()>latest->prefix.size())) latest=cp;
+                }
+                if(!latest) continue;
+                const auto shared=std::mismatch(latest->prefix.begin(),latest->prefix.end(),
+                    prompt.token_ids.begin(),prompt.token_ids.end()).first-latest->prefix.begin();
+                if(!kvmem::checkpoint_anonymous_continuation(shared,history->output_begin,latest->prefix.size()) ||
+                   !latest->prefix_identity.matches(prompt,std::min<size_t>(shared,history->output_begin))) {
+                    ++branch_rejected; continue;
+                }
             }
-            if (!latest) continue;
-            const auto shared = std::mismatch(latest->prefix.begin(), latest->prefix.end(),
-                prompt.token_ids.begin(), prompt.token_ids.end()).first - latest->prefix.begin();
-            if (!kvmem::checkpoint_anonymous_continuation(shared, history->output_begin, latest->prefix.size()) ||
-                !latest->prefix_identity.matches(prompt, std::min<size_t>(shared, history->output_begin))) {
-                ++branch_rejected;
-                continue;
+            std::unordered_set<const KvmemPrefixCheckpoint*> seen;
+            size_t rank=0;
+            for(const auto kind:checkpoint_kinds(*history)) {
+                const auto* cp=memory_checkpoint(*history,kind);
+                const auto order=rank++;
+                if(!cp || !seen.insert(cp).second || !cp->prefix.size() || cp->prefix.size()>limit) continue;
+                if(pass) {
+                    if(!digests || digests->size()!=prompt.token_ids.size()) {
+                        incoming.assign(prompt); digests=&incoming;
+                    }
+                    if(cp->prefix_digest!=digests->at(cp->prefix.size())) { ++prefix_rejected; continue; }
+                }
+                uint64_t cold=cp->state ? 0 : cp->state_bytes();
+                for(const auto page:cp->resident_pages) {
+                    if(page>=history->archive.size()) { cold=UINT64_MAX; break; }
+                    const auto& record=history->archive[page];
+                    if(!record.resident_bytes()) cold+=record.size();
+                }
+                candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size())},cp,cold,order});
             }
         }
-        const auto valid = [&](const KvmemCheckpointRecord& record) {
-            const auto& checkpoint = *record.data;
-            const auto frontier = static_cast<std::uint32_t>(checkpoint.prefix.size());
-            const auto pages = kv_pages_for_tokens(frontier);
-            bool complete = frontier && checkpoint.state_bytes() &&
-                checkpoint.state_bytes() == state_images->host_layout().image_bytes &&
-                frontier == checkpoint.identity.stamp.frontier && history->statistics && history->selector &&
-                history->statistics_frontier >= frontier && history->archive.size() >= pages &&
-                history->host_versions.size() >= pages;
-            for (std::uint32_t page = 0; complete && page < pages; ++page)
-                complete = history->archive[page] && history->host_versions[page] >= valid_columns(page, frontier);
-            if (!complete) { ++incomplete; return false; }
-            if (frontier >= prompt.token_ids.size() ||
-                !std::equal(checkpoint.prefix.begin(), checkpoint.prefix.end(), prompt.token_ids.begin())) {
-                ++prefix_rejected; return false;
+        std::stable_sort(candidates.begin(),candidates.end(),[&](const auto& a,const auto& b) {
+            if(a.match.frontier!=b.match.frontier) return a.match.frontier>b.match.frontier;
+            if(pass && a.cold_bytes!=b.cold_bytes) return a.cold_bytes<b.cold_bytes;
+            if(a.match.history!=b.match.history)
+                return memory_histories[a.match.history]->publication_order>memory_histories[b.match.history]->publication_order;
+            return a.rank<b.rank;
+        });
+        shortlisted+=static_cast<unsigned>(candidates.size());
+        unsigned foreign_checks=0;
+        for(const auto& candidate:candidates) {
+            if(pass && foreign_checks++==16) break;
+            const auto& checkpoint=*candidate.checkpoint;
+            const auto& history=*memory_histories[candidate.match.history];
+            const auto frontier=candidate.match.frontier;
+            const auto pages=kv_pages_for_tokens(frontier);
+            bool complete=checkpoint.state_bytes()==state_images->host_layout().image_bytes &&
+                frontier==checkpoint.identity.stamp.frontier && history.statistics && history.selector &&
+                checkpoint.identity.stamp.session==history.stamp.session &&
+                history.statistics_frontier>=frontier && history.archive.size()>=pages && history.host_versions.size()>=pages;
+            for(uint32_t page=0;complete && page<pages;++page)
+                complete=history.archive[page] && history.host_versions[page]>=valid_columns(page,frontier);
+            if(!complete) { ++incomplete; continue; }
+            ++exact_checks; compared_tokens+=frontier;
+            if(frontier>=prompt.token_ids.size() ||
+               !std::equal(checkpoint.prefix.begin(),checkpoint.prefix.end(),prompt.token_ids.begin())) {
+                ++prefix_rejected; continue;
             }
-            if (!checkpoint.prefix_identity.matches(prompt, frontier)) { ++identity_rejected; return false; }
+            if(!checkpoint.prefix_identity.matches(prompt,frontier)) { ++identity_rejected; continue; }
             const auto query=memory_query_span(prompt);
+            const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
             const auto admission=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
                 prompt.token_ids.size(),kvmem_options.query_replay_max_tokens,page_tokens,
                 std::min<uint64_t>((query.begin+63)/64,kvmem_options.selected_tokens/page_tokens),
-                kvmem_window_tokens/page_tokens,backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0);
-            const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
+                kvmem_window_tokens/page_tokens,workspace);
             const bool needs_recall=checkpoint.resident_pages.size()<pages ||
                 prompt.token_ids.size()+workspace>kvmem_window_tokens;
-            if (admission.admitted && needs_recall && prompt.memory_query &&
-                frontier > memory_query_span(prompt).begin && !memory_user_already_evaluated(prompt, frontier)) {
-                ++query_rejected; return false;
-            }
-            return true;
-        };
-        const auto prefer = [&](const KvmemCheckpointRecord& a, const KvmemCheckpointRecord& b) {
-            return std::find(kKvmemCheckpointKinds.begin(), kKvmemCheckpointKinds.end(), kind_of(a)) <
-                   std::find(kKvmemCheckpointKinds.begin(), kKvmemCheckpointKinds.end(), kind_of(b));
-        };
-        auto candidate = history->checkpoints.select(limit, valid, prefer);
-        const auto archived = history->coverage.select(limit, valid);
-        if (archived && (!candidate || archived->data->prefix.size()>candidate->data->prefix.size())) candidate=archived;
-        auto selected_kind=candidate ? kind_of(*candidate) : KvmemCheckpointKind::Base;
-        if (candidate == archived && archived) for(size_t i=0;i<history->coverage.slots();++i)
-            if(history->coverage.at(i) && &history->coverage.at(i)->record==archived)
-                selected_kind=KvmemCheckpointKind(unsigned(KvmemCheckpointKind::CoverageBegin)+i);
-        if (candidate) {
-            const auto frontier = candidate->data->prefix.size();
-            if (frontier > best_frontier || (frontier == best_frontier && best &&
-                    history->publication_order > memory_histories[best->history]->publication_order)) {
-                best = KvmemHistoryMatch{index, selected_kind, static_cast<std::uint32_t>(frontier)};
-                best_frontier = frontier;
-            }
+            if(admission.admitted && needs_recall && prompt.memory_query && frontier>query.begin &&
+               !memory_user_already_evaluated(prompt,frontier)) { ++query_rejected; continue; }
+            best=candidate.match; fork=pass!=0; break;
         }
     }
-    if (kvmem_options.verify_transfers)
-        std::fprintf(stderr, "KVMEM_HISTORY_LOOKUP frontier=%zu prefix_rejected=%u identity_rejected=%u query_rejected=%u incomplete=%u branch_rejected=%u\n",
-                     best_frontier, prefix_rejected, identity_rejected, query_rejected, incomplete, branch_rejected);
+    if(kvmem_options.verify_transfers) std::fprintf(stderr,
+        "KVMEM_HISTORY_LOOKUP frontier=%u prefix_rejected=%u identity_rejected=%u query_rejected=%u incomplete=%u branch_rejected=%u fork=%u candidates=%u exact_checks=%u compared_tokens=%llu lookup_us=%.3f\n",
+        best ? best->frontier : 0,prefix_rejected,identity_rejected,query_rejected,incomplete,branch_rejected,
+        unsigned(fork),shortlisted,exact_checks,(unsigned long long)compared_tokens,
+        std::chrono::duration<double,std::micro>(Clock::now()-started).count());
     return best;
 }
 
-bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& transaction) {
-    if (!memory_io || !kvmem_options.disk_bytes) return true;
-    auto& staged = *requests[transaction.destination.value].prefill;
-    if (!staged.memory_restore_frontier || !staged.memory_restore_generation) return true;
-    if (transaction.memory_history && !transaction.memory_history->ticket.ready()) return false;
-    const auto match = memory_restorable_history(staged.prompt);
-    if (!match || match->frontier != staged.memory_restore_frontier ||
-        memory_histories[match->history]->stamp.session.id != staged.memory_restore_generation) {
-        transaction.memory_history.reset();
-        return true; // ordinary quoted-prefix replay remains the fallback
+std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+    const KvmemWindowState& source, uint32_t frontier) {
+    const auto started=Clock::now();
+    const auto pages=kv_pages_for_tokens(frontier);
+    std::unordered_map<const KvmemPrefixCheckpoint*,std::shared_ptr<KvmemPrefixCheckpoint>> copies;
+    size_t metadata=0;
+    for(const auto kind:checkpoint_kinds(source)) {
+        const auto* cp=memory_checkpoint(source,kind);
+        if(cp && cp->prefix.size()<=frontier && copies.emplace(cp,nullptr).second) metadata+=cp->metadata_bytes();
     }
-    auto& history = *memory_histories[match->history];
-    auto& pending = transaction.memory_history;
+    // Optional optimization: never evict the source to make room for its fork.
+    checkpoint_memory_room(const_cast<KvmemWindowState&>(source),metadata,true);
+    auto child=std::make_unique<KvmemWindowState>();
+    child->stamp=source.stamp;
+    child->stamp.session={next_window_session.fetch_add(1),1};
+    child->stamp.frontier=frontier;
+    child->stamp.history_revision=1;
+    child->stamp.execution_history=1;
+    child->statistics=source.statistics->fork_mean_prefix(frontier);
+    child->statistics_frontier=frontier;
+    child->selector=std::make_unique<kvmem::KvMemStore>(*source.selector);
+    child->selector->truncate_to(frontier);
+    child->graph=source.graph;
+    child->feedback=source.feedback;
+    child->request_messages=source.request_messages;
+    child->query_rows.resize(source.query_rows.size());
+    child->coverage=source.coverage;
+    child->coverage.truncate(frontier);
+    child->checkpoints=source.checkpoints;
+    for(auto& [original,copy]:copies) {
+        copy=std::make_shared<KvmemPrefixCheckpoint>(*original);
+        copy->identity.stamp.session=child->stamp.session;
+    }
+    for(const auto kind:kKvmemCheckpointKinds) {
+        auto& cp=memory_checkpoint_slot(*child,kind);
+        if(cp) cp=cp->prefix.size()<=frontier ? copies.at(cp.get()) : nullptr;
+    }
+    for(auto& entry:child->coverage) if(entry.info.identity) {
+        entry.record.data=copies.at(entry.record.data.get());
+        entry.info.identity=entry.record.data.get();
+        entry.info.bytes=entry.record.checkpoint_info().bytes;
+    }
+    child->archive.reserve(pages);
+    child->host_versions.assign(source.host_versions.begin(),source.host_versions.begin()+pages);
+    for(uint32_t page=0;page<pages;++page) child->archive.push_back(source.archive[page].fork());
+    child->payload_bytes=pages ? pages*source.archive.front().size() : 0;
+    if(kvmem_options.verify_transfers) std::fprintf(stderr,
+        "KVMEM_HISTORY_FORK frontier=%u shared_kv_bytes=%llu metadata_bytes=%zu statistics_bytes=%zu fork_us=%.3f\n",
+        frontier,(unsigned long long)child->payload_bytes,metadata,child->statistics->allocated_bytes(),
+        std::chrono::duration<double,std::micro>(Clock::now()-started).count());
+    return child;
+}
+
+bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& transaction) {
+    auto& staged=*requests[transaction.destination.value].prefill;
+    if(!staged.memory_restore_frontier || !staged.memory_restore_generation) return true;
+    auto& pending=transaction.memory_history;
     try {
-        if (pending) {
-            if (pending->history != match->history || pending->generation != history.stamp.session.id)
-                throw std::logic_error("prepared SSD history changed owner");
-            if (pending->native_ready) return true;
-            if (!pending->ticket.ready()) return false;
-            pending->ticket.wait();
-            auto& work = *pending->work;
-            if (pending->checkpoint) {
-                auto& checkpoint = memory_checkpoint_slot(history, *pending->checkpoint);
-                if (!checkpoint || checkpoint->state || checkpoint->state_bytes() != work.state.size())
-                    throw std::logic_error("prepared state image changed before publication");
-                // Preparation precedes continuation binding; admit against the retained owner.
-                checkpoint_memory_room(history,work.state.size());
-                auto state = memory_checkpoint_pool->acquire(work.state.size());
-                std::memcpy(state->data(), work.state.data(), work.state.size());
-                if(kvmem_options.verify_transfers && checkpoint->cold_tag)
-                    std::fprintf(stderr,"KVMEM_COVERAGE_TIER read_bytes=%zu frontier=%zu\n",work.state.size(),checkpoint->prefix.size());
-                checkpoint->state = std::move(state);
-                checkpoint->cold_state = {};
-                pending.reset();
-            } else {
-                for (std::size_t i = 0; i < work.ids.size(); ++i)
-                    if (work.records[i]) history.archive.at(work.ids[i]) = std::move(work.records[i]);
-                pending->native_ready = true;
-                return true; // leases retain prepared RAM until GPU restoration
+        if(!pending) {
+            const auto match=memory_restorable_history(staged.prompt,&materialization_prefix_digests_);
+            if(!match || match->frontier!=staged.memory_restore_frontier ||
+               memory_histories[match->history]->stamp.session.id!=staged.memory_restore_generation) {
+                staged.memory_restore_generation=0; return true;
+            }
+            const auto& source=*memory_histories[match->history];
+            pending=std::make_unique<KvmemHistoryPreparation>();
+            pending->history=match->history;
+            pending->generation=source.stamp.session.id;
+            pending->selected=match->kind;
+            if(source.session_key!=staged.prompt.context_cache.session_key) {
+                uint64_t required=transaction.plan->impl_->memory_payload_reservation;
+                for(const auto& active:requests) required+=active.memory_payload_reservation;
+                const auto* checkpoint=memory_checkpoint(source,match->kind);
+                const auto full_pages=match->frontier/page_tokens;
+                for(size_t page=0;page<source.archive.size();++page) {
+                    const bool selected=std::find(checkpoint->resident_pages.begin(),checkpoint->resident_pages.end(),page)!=checkpoint->resident_pages.end();
+                    const bool shared=page<full_pages && page!=(match->frontier-1)/page_tokens &&
+                        (!selected || source.archive[page].resident_bytes());
+                    if(!shared) required+=source.archive[page].size();
+                }
+                std::unordered_set<const void*> cold;
+                for(const auto kind:checkpoint_kinds(source)) if(const auto* cp=memory_checkpoint(source,kind);
+                    cp && cp->cold_state && cold.insert(cp->cold_state.storage_identity()).second)
+                    required+=cp->cold_state.size();
+                if(required>memory_retained_budget)
+                    throw std::runtime_error("fork cannot retain its source within the payload budget");
+                pending->fork=fork_memory_history(source,match->frontier);
+                pending->fork->session_key=staged.prompt.context_cache.session_key;
             }
         }
-        for (const auto kind : checkpoint_kinds(history)) {
-            if (history.coverage.policy().enabled && kind != match->kind) continue;
-            const auto* checkpoint = memory_checkpoint(history, kind);
-            if (!checkpoint || checkpoint->state || !checkpoint->cold_state.size()) continue;
-            // A cancelled read may still own this bounded CPU buffer. Let it
-            // drain without turning the next cache hit into an allocation error.
-            if (memory_state_staging.charged_bytes()) return false;
-            auto prepared = std::make_unique<KvmemHistoryPreparation>();
-            prepared->history = match->history;
-            prepared->generation = history.stamp.session.id;
-            prepared->checkpoint = kind;
-            prepared->work = std::make_shared<KvmemHistoryPreparation::Work>();
-            prepared->work->state_source = checkpoint->cold_state;
-            prepared->work->state_tag = checkpoint->cold_tag;
-            prepared->work->state_payload_bytes = checkpoint->state_bytes();
-            prepared->ticket = memory_io->submit(checkpoint->state_bytes(),
-                [work = prepared->work, storage = memory_state_staging]() mutable {
-                    work->state = storage.allocate(work->state_payload_bytes);
-                    if(work->state_tag) kvmem::read_checkpoint_image(work->state_source,work->state_tag,{{work->state.writable_data(),work->state.size()}});
-                    else work->state_source.read(0, work->state.writable_data(), work->state.size());
-                });
-            pending = std::move(prepared);
+        if(pending->native_ready) return true;
+        auto* history=pending->fork.get();
+        if(!history) {
+            auto& source=memory_histories[pending->history];
+            if(!source || source->stamp.session.id!=pending->generation) {
+                pending.reset(); staged.memory_restore_generation=0; return true;
+            }
+            history=&*source;
+        }
+        if(!memory_io || !kvmem_options.disk_bytes) return true;
+        if(pending->ticket && !pending->ticket.ready()) return false;
+        if(pending->ticket) {
+            pending->ticket.wait();
+            auto& work=*pending->work;
+            if(pending->checkpoint) {
+                auto& checkpoint=memory_checkpoint_slot(*history,*pending->checkpoint);
+                if(!checkpoint || checkpoint->state || checkpoint->state_bytes()!=work.state.size())
+                    throw std::logic_error("prepared state image changed before publication");
+                checkpoint_memory_room(*history,work.state.size());
+                auto state=memory_checkpoint_pool->acquire(work.state.size());
+                std::memcpy(state->data(),work.state.data(),work.state.size());
+                if(kvmem_options.verify_transfers) std::fprintf(stderr,
+                    "KVMEM_COVERAGE_TIER read_bytes=%zu frontier=%zu fork=%u\n",work.state.size(),checkpoint->prefix.size(),unsigned(bool(pending->fork)));
+                checkpoint->state=std::move(state);
+                checkpoint->cold_state={};
+                pending->checkpoint.reset(); pending->work.reset(); pending->ticket={};
+            } else {
+                for(size_t i=0;i<work.ids.size();++i) if(work.records[i]) {
+                    work.records[i].seal();
+                    history->archive.at(work.ids[i])=std::move(work.records[i]);
+                }
+                pending->native_ready=true;
+                return true;
+            }
+        }
+        for(const auto kind:checkpoint_kinds(*history)) {
+            if((pending->fork || history->coverage.policy().enabled) && kind!=pending->selected) continue;
+            const auto* checkpoint=memory_checkpoint(*history,kind);
+            if(!checkpoint || checkpoint->state || !checkpoint->cold_state.size()) continue;
+            if(memory_state_staging.charged_bytes()) return false;
+            pending->checkpoint=kind;
+            pending->work=std::make_shared<KvmemHistoryPreparation::Work>();
+            auto work=pending->work;
+            work->state_source=checkpoint->cold_state;
+            work->state_tag=checkpoint->cold_tag;
+            work->state_payload_bytes=checkpoint->state_bytes();
+            pending->ticket=memory_io->submit(checkpoint->state_bytes(),[work,storage=memory_state_staging]() mutable {
+                work->state=storage.allocate(work->state_payload_bytes);
+                if(work->state_tag) kvmem::read_checkpoint_image(work->state_source,work->state_tag,{{work->state.writable_data(),work->state.size()}});
+                else work->state_source.read(0,work->state.writable_data(),work->state.size());
+            });
             return false;
         }
-        auto prepared = std::make_unique<KvmemHistoryPreparation>();
-        prepared->history = match->history;
-        prepared->generation = history.stamp.session.id;
-        prepared->work = std::make_shared<KvmemHistoryPreparation::Work>();
-        auto& work = *prepared->work;
-        const auto& checkpoint = *memory_checkpoint(history, match->kind);
-        for (const auto id : checkpoint.resident_pages) {
-            work.ids.push_back(static_cast<std::uint32_t>(id));
-            work.sources.push_back(history.archive.at(id).source());
+        pending->work=std::make_shared<KvmemHistoryPreparation::Work>();
+        auto work=pending->work;
+        const auto& checkpoint=*memory_checkpoint(*history,pending->selected);
+        for(const auto id:checkpoint.resident_pages) {
+            work->ids.push_back(static_cast<uint32_t>(id));
+            work->sources.push_back(history->archive.at(id).source());
         }
-        work.records.resize(work.ids.size());
-        work.leases.resize(work.ids.size());
-        const auto stride = text_host_kv_page_stride + backend_host_kv_page_stride;
-        const auto tail = (match->frontier - 1) / page_tokens;
-        prepared->ticket = memory_io->submit(work.ids.size() * stride,
-            [work = prepared->work, storage = memory_payload_storage, stride, tail]() mutable {
-                for (std::size_t i = 0; i < work->ids.size(); ++i) {
-                    auto source = work->sources[i].lease();
-                    if (source.data() && work->ids[i] != tail) {
-                        work->leases[i] = std::move(source);
-                    } else {
-                        auto& record = work->records[i];
-                        record = storage.allocate(stride);
-                        source.read(0, record.writable_data(), stride);
-                        work->leases[i] = record.lease();
-                    }
+        work->records.resize(work->ids.size()); work->leases.resize(work->ids.size());
+        const auto stride=text_host_kv_page_stride+backend_host_kv_page_stride;
+        const auto tail=(staged.memory_restore_frontier-1)/page_tokens;
+        pending->ticket=memory_io->submit(work->ids.size()*stride,[work,storage=memory_payload_storage,stride,tail]() mutable {
+            for(size_t i=0;i<work->ids.size();++i) {
+                auto source=work->sources[i].lease();
+                if(source.data() && work->ids[i]!=tail) work->leases[i]=std::move(source);
+                else {
+                    auto& record=work->records[i];
+                    record=storage.allocate(stride);
+                    source.read(0,record.writable_data(),stride);
+                    record.seal();
+                    work->leases[i]=record.lease();
                 }
-                work->sources.clear();
-            });
-        pending = std::move(prepared);
+            }
+            work->sources.clear();
+        });
         return false;
-    } catch (const std::exception& error) {
-        // Keep the original history valid. Recompute the already quoted prefix
-        // using its reserved service budget if an optional cache read fails.
-        std::fprintf(stderr, "KVMEM_HISTORY SSD preparation failed; replaying prefix: %s\n", error.what());
-        pending.reset();
-        staged.memory_restore_generation = 0;
+    } catch(const std::exception& error) {
+        std::fprintf(stderr,"KVMEM_HISTORY preparation failed; replaying prefix: %s\n",error.what());
+        pending.reset(); staged.memory_restore_generation=0;
         return true;
     }
 }
 
 bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged) {
     const auto started = Clock::now();
-    const auto match = memory_restorable_history(staged.prompt);
-    if (!match) return false;
-    auto& history = memory_histories[match->history];
-    const auto frontier = std::optional<std::uint32_t>(match->frontier);
-    if (*frontier != staged.memory_restore_frontier ||
-        staged.memory_restore_generation != history->stamp.session.id) return false;
-    // Materialize attachments before consuming the history or mutating native
-    // state. A failed read leaves every cold source valid and retryable.
-    for (const auto kind : checkpoint_kinds(*history)) {
-        if (history->coverage.policy().enabled && kind != match->kind) continue;
-        auto& slot = memory_checkpoint_slot(*history, kind);
-        if (!slot || slot->state || !slot->cold_state.size()) continue;
-        checkpoint_memory_room(sequence.window,slot->state_bytes());
-        auto state = memory_checkpoint_pool->acquire(slot->state_bytes());
-        slot->read_state(state->data(), state->size());
-        slot->state = std::move(state);
-        slot->cold_state = {};
+    auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+    auto* prepared=transaction ? transaction->memory_history.get() : nullptr;
+    if(!staged.memory_restore_generation || !prepared || prepared->generation!=staged.memory_restore_generation) return false;
+    const bool fork=bool(prepared->fork);
+    const auto kind=prepared->selected;
+    const auto frontier=std::optional<uint32_t>(staged.memory_restore_frontier);
+    if(fork) {
+        sequence.window=std::move(*prepared->fork);
+    } else {
+        auto& history=memory_histories[prepared->history];
+        if(!history || history->stamp.session.id!=prepared->generation) return false;
+        sequence.window=std::move(*history);
+        history.reset();
     }
-    sequence.window = std::move(*history);
-    history.reset();
     auto& window = sequence.window;
     const bool same_query = memory_user_already_evaluated(staged.prompt, *frontier);
-    auto checkpoint = memory_checkpoint_slot(window, match->kind);
+    auto checkpoint = memory_checkpoint_slot(window, kind);
     window.coverage.touch(checkpoint.get());
     // The previous Program address-space lease has been released. These IDs
     // must never be treated as resident in the new native address space.
@@ -1698,14 +1786,14 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
         // An exact replay can start at the input capture boundary, so prefill
         // will not cross it again. Keep the restored complete state for repeats
         // and cancellation recovery; restoring does not consume its payload.
-        memory_checkpoint_slot(window, match->kind) = std::move(checkpoint);
+        memory_checkpoint_slot(window, kind) = std::move(checkpoint);
     staged.base = *frontier;
     staged.cursor = *frontier;
     ++memory_history_hits;
     if (kvmem_options.verify_transfers) {
-        std::fprintf(stderr, "KVMEM_HISTORY_RESTORE frontier=%u kind=%u same_query=%u prefix_match=1 state_exact=1 restore_ms=%.3f\n",
-            *frontier, static_cast<unsigned>(match->kind), same_query ? 1U : 0U,
-            std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+        std::fprintf(stderr, "KVMEM_HISTORY_RESTORE frontier=%u kind=%u same_query=%u prefix_match=1 state_exact=1 restore_ms=%.3f fork=%u\n",
+            *frontier, static_cast<unsigned>(kind), same_query ? 1U : 0U,
+            std::chrono::duration<double, std::milli>(Clock::now() - started).count(),unsigned(fork));
     }
     return true;
 }
@@ -1752,18 +1840,26 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
     for (;;) {
         std::uint64_t cached_bytes = memory_idle_transfer ? memory_idle_transfer->work->destination.size() : 0;
         std::optional<std::size_t> victim;
+        std::unordered_set<const void*> payloads,cold;
+        // Active reservations already include the shared physical prefix.
+        for(const auto& lane:continuation_states) if(lane.window.statistics)
+            for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
+        const auto protected_source=request.prefill ? request.prefill->memory_restore_generation : 0;
         for (std::size_t index = 0; index < memory_histories.size(); ++index) {
             const auto& history = memory_histories[index];
             if (!history) continue;
-            cached_bytes += history->payload_bytes;
+            for(const auto& record:history->archive)
+                if(record && payloads.insert(record.storage_identity()).second) cached_bytes+=record.size();
             std::vector<const KvmemPrefixCheckpoint*> seen;
             for (const auto kind : checkpoint_kinds(*history))
                 if (const auto* checkpoint = memory_checkpoint(*history, kind);
                     checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
-                    cached_bytes += checkpoint->cold_state.size();
+                    if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+                        cached_bytes += checkpoint->cold_state.size();
                     seen.push_back(checkpoint);
                 }
-            if (!victim || history->publication_order < memory_histories[*victim]->publication_order) victim = index;
+            if(history->stamp.session.id!=protected_source &&
+               (!victim || history->publication_order < memory_histories[*victim]->publication_order)) victim = index;
         }
         if (cached_bytes <= available) break;
         if (!victim) throw std::logic_error("KVMem retained Host accounting has no victim");
@@ -1884,10 +1980,17 @@ bool ProgramImpl::progress_memory_storage() {
             if (history && history->stamp.session.id == pending.generation && !being_restored(pending.generation)) {
                 auto& checkpoint = memory_checkpoint_slot(*history, pending.kind);
                 if (checkpoint && checkpoint->state == pending.source && !checkpoint->cold_state.size()) {
-                    checkpoint->cold_tag = pending.work->tag;
-                    checkpoint->cold_payload_bytes = pending.source->size();
-                    checkpoint->cold_state = std::move(pending.work->destination);
-                    checkpoint->state.reset();
+                    // Fork metadata has its own lifetime, but an immutable native
+                    // image gets one SSD extent even when several owners retain it.
+                    for(auto& owner:memory_histories) if(owner && !being_restored(owner->stamp.session.id))
+                        for(const auto kind:checkpoint_kinds(*owner)) {
+                            auto& alias=memory_checkpoint_slot(*owner,kind);
+                            if(!alias || alias->state!=pending.source || alias->cold_state) continue;
+                            alias->cold_tag=pending.work->tag;
+                            alias->cold_payload_bytes=pending.source->size();
+                            alias->cold_state=pending.work->destination;
+                            alias->state.reset();
+                        }
                 }
             }
         } catch (const std::exception& error) {
@@ -1902,14 +2005,20 @@ bool ProgramImpl::progress_memory_storage() {
     const auto disk = memory_payload_storage.spill_file();
     std::uint64_t used = 0;
     for (const auto& active : requests) used += active.memory_payload_reservation;
+    std::unordered_set<const void*> payloads,cold;
+    for(const auto& lane:continuation_states) if(lane.window.statistics)
+        for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
     for (const auto& history : memory_histories) {
         if (!history) continue;
-        used += history->payload_bytes;
+        for(const auto& record:history->archive)
+            if(record && payloads.insert(record.storage_identity()).second) used+=record.size();
         std::vector<const KvmemPrefixCheckpoint*> seen;
         for (const auto kind : checkpoint_kinds(*history))
             if (const auto* checkpoint = memory_checkpoint(*history, kind);
                 checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
-                used += checkpoint->cold_state.size(); seen.push_back(checkpoint);
+                if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+                    used += checkpoint->cold_state.size();
+                seen.push_back(checkpoint);
             }
     }
     // One background image at a time. Its original pinned owner is retained,

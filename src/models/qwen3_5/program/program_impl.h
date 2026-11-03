@@ -521,6 +521,7 @@ struct KvmemPrefixCheckpoint {
     kvmem::CheckpointIdentity identity;
     std::vector<TokenId> prefix;
     ResidentPrefixIdentity prefix_identity;
+    std::array<std::uint64_t, 2> prefix_digest{};
     std::vector<std::uint64_t> resident_pages;
     std::vector<float> mean_tail;
     std::shared_ptr<PinnedHostBuffer> state;
@@ -583,6 +584,7 @@ struct KvmemAppendPreparation {
     }
 };
 
+struct KvmemWindowState;
 struct KvmemHistoryPreparation {
     struct Work {
         kvmem::SpillExtent state_source;
@@ -598,10 +600,12 @@ struct KvmemHistoryPreparation {
     std::size_t history = 0;
     std::uint64_t generation = 0;
     std::optional<KvmemCheckpointKind> checkpoint;
+    KvmemCheckpointKind selected = KvmemCheckpointKind::Base;
+    std::unique_ptr<KvmemWindowState> fork;
     bool native_ready = false;
     // Workers own only CPU buffers/leases. Cancellation can release the engine
     // transaction while a started read safely drains its independent sources.
-    ~KvmemHistoryPreparation() { ticket.cancel(); }
+    ~KvmemHistoryPreparation();
 };
 
 struct KvmemIdleTransfer {
@@ -2148,7 +2152,10 @@ private:
     bool prepare_memory_materialization(MaterializationTransaction& transaction);
     bool progress_memory_storage();
     bool memory_maintenance_pending() const noexcept;
-    std::optional<KvmemHistoryMatch> memory_restorable_history(const PreparedPromptData& prompt) const;
+    std::optional<KvmemHistoryMatch> memory_restorable_history(const PreparedPromptData& prompt,
+        const qwen3_5::detail::PrefixShortlistDigests* digests = nullptr) const;
+    std::unique_ptr<KvmemWindowState> fork_memory_history(const KvmemWindowState& source,
+                                                        std::uint32_t frontier);
     std::uint32_t memory_observed_prefix(const PreparedPromptData& prompt) const;
     std::uint32_t memory_reuse_anchor(const PreparedPromptData& prompt, std::uint32_t base,
                                      std::uint32_t observed) const;

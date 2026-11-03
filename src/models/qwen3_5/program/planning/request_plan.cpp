@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -555,9 +556,13 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         }
         previous_rewrite_frontier = frontier;
     }
-    if (base->summary.publish_continuation) {
+    if (base->summary.publish_continuation || base->allow_memory_reuse) {
+        const auto digest_started=Clock::now();
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag = capture_identity_tag();
+        if(base->allow_memory_reuse && kvmem_options.verify_transfers) std::fprintf(stderr,
+            "KVMEM_PREFIX_INDEX tokens=%zu digest_us=%.3f\n",prompt.token_ids.size(),
+            std::chrono::duration<double,std::micro>(Clock::now()-digest_started).count());
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -852,7 +857,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     }
 
     if (plan->reuse == ReusePath::Root && base.allow_memory_reuse) {
-        if (const auto match = memory_restorable_history(prompt)) {
+        if (const auto match = memory_restorable_history(prompt,&base.prefix_digests)) {
             const auto& history = *memory_histories[match->history];
             plan->memory_restore_frontier = match->frontier;
             plan->memory_restore_generation = history.stamp.session.id;
@@ -995,7 +1000,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     plan->summary.prefix_reuse_path      = plan->reuse;
     if (plan->memory_restore_frontier) {
-        if (const auto match = memory_restorable_history(prompt)) {
+        if (const auto match = memory_restorable_history(prompt,&base.prefix_digests)) {
             plan->summary.prefix_reuse_path = match->kind == KvmemCheckpointKind::Endpoint
                 ? PrefixReusePath::PrivateEndpoint : (match->kind == KvmemCheckpointKind::InputFallback ||
                                                        match->kind == KvmemCheckpointKind::Reconstruction)

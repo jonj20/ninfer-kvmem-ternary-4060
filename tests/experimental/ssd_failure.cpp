@@ -166,9 +166,119 @@ ninfer::RequestOptions request(unsigned output) {
     value.stop.include_model_defaults = false;
     return value;
 }
+
+void checkpoint_fork(const char* artifact) {
+    _putenv_s("KVMEM_CHECKPOINT_POLICY", "spread");
+    _putenv_s("KVMEM_CHECKPOINT_HOT", "1");
+    ninfer::EngineOptions options;
+    ninfer::test::kvmem_test_devices(options);
+    options.artifact_path=artifact;
+    options.device_profile="off";
+    options.max_context=8192;
+    options.prefill_chunk=128;
+    options.kv_cache=ninfer::KvCacheStorage::Int8Group64;
+    options.kv_capacity=ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.kvmem={.selected_tokens=3968,.reserve_tokens=128,.host_bytes=256ULL<<20,
+        .retained_sessions=4,.verify_transfers=true};
+    options.kvmem.disk_bytes=2048ULL<<20;
+    options.kvmem.disk_path=std::filesystem::current_path()/"fork-fault-spill";
+    options.context_cache.enabled=false;
+    ninfer::PromptInput document;
+    document.options.enable_thinking=false;
+    document.context_cache.session_key="parent";
+    const auto add=[](ninfer::PromptInput& input,ninfer::ChatRole role,std::string text) {
+        ninfer::ChatMessage message; message.role=role;
+        message.parts.push_back({.kind=ninfer::MessagePartKind::Text,.text=std::move(text)});
+        input.messages.push_back(std::move(message));
+    };
+    add(document,ninfer::ChatRole::System,"Answer briefly using the supplied reference.");
+    std::string text="Reference: The violet observatory studies pulsars. Its access code is MARIGOLD. ";
+    for(int i=0;i<80;++i) text+="The coastal office files invoices, transport schedules and warehouse inventories. ";
+    text+="Acknowledge this reference with only Recorded. The question comes later.";
+    add(document,ninfer::ChatRole::User,text);
+    {
+        ninfer::Engine engine(options);
+        auto ack_options=request(8); ack_options.stop.include_model_defaults=true;
+        const auto ack=engine.submit(engine.prepare(document),ack_options).wait();
+        auto question=document;
+        add(question,ninfer::ChatRole::Assistant,ack.content);
+        add(question,ninfer::ChatRole::User,"What is the violet observatory access code? Reply with just the code.");
+        auto cold=question; cold.context_cache.session_key="reference";
+        auto response_options=request(12); response_options.stop.include_model_defaults=true;
+        auto fresh=response_options; fresh.execution.allow_prefix_reuse=false;
+        const auto reference=engine.submit(engine.prepare(cold),fresh).wait();
+        require(!reference.reused_prompt_tokens,"reference unexpectedly reused a prefix");
+        const auto answer_begin=reference.content.find_first_not_of(" \t\r\n");
+        const auto answer_end=reference.content.find_last_not_of(" \t\r\n");
+        require(answer_begin!=std::string::npos &&
+            reference.content.substr(answer_begin,answer_end-answer_begin+1)=="MARIGOLD",
+            "fresh prefill missed the independent reference answer");
+        const auto run=[&](const char* key,bool expected_hit=true) {
+            auto input=question; input.context_cache.session_key=key;
+            auto result=engine.submit(engine.prepare(input),response_options).wait();
+            require(!expected_hit || result.reused_prompt_tokens>0,"fork or parent missed its checkpoint");
+            std::cout<<"FORK_OUTPUT "<<key<<" reference="<<reference.content<<" restored="<<result.content<<"\nreference_ids:";
+            for(auto id:reference.generated_token_ids) std::cout<<' '<<id;
+            std::cout<<"\nrestored_ids:";for(auto id:result.generated_token_ids) std::cout<<' '<<id;
+            std::cout<<std::endl;
+            require(result.generated_token_ids==reference.generated_token_ids,"fork/fallback output differs from fresh prefill");
+            require(engine.is_available(),"fork disabled Engine");
+            const auto memory=engine.memory_summary().kvmem;
+            require(memory.host_payload_bytes<=options.kvmem.host_bytes &&
+                memory.disk_payload_bytes<=options.kvmem.disk_bytes && !memory.resident_pages,
+                "fork leaked quota or native pages");
+            std::cout<<"FORK_CASE "<<key<<" reused="<<result.reused_prompt_tokens
+                     <<" native_hits="<<memory.history_hits<<" reads="<<memory.disk_read_bytes
+                     <<" errors="<<memory.disk_errors<<" exact=1"<<std::endl;
+            return result;
+        };
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        run("child"); run("parent");
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        FileFailure<true> failure;
+        const auto before=engine.memory_summary().kvmem;
+        failure.arm();
+        run("failed-child",false);
+        const auto failed=engine.memory_summary().kvmem;
+        require(failure.count()==1 && failed.disk_errors==before.disk_errors+1,
+                "fork did not exercise injected cold read failure");
+        require(failed.history_hits==before.history_hits,"failed restore published a native hit");
+        run("parent");
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto cancelled_input=question; cancelled_input.context_cache.session_key="cancelled-child";
+        failure.arm(true);
+        std::atomic<bool> cancel{false};
+        auto pending=engine.submit(engine.prepare(cancelled_input),response_options);
+        auto cancelled=std::async(std::launch::async,[pending=std::move(pending),&cancel]() mutable {
+            return pending.wait(nullptr,ninfer::CancellationView([&]{return cancel.load();}));
+        });
+        const bool entered=failure.wait_entered();
+        cancel=true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        failure.release();
+        const auto result=cancelled.get();
+        require(entered && result.finish_reason==ninfer::FinishReason::Cancelled,
+                "fork cancellation did not settle while reading cold state");
+        run("parent"); run("child");
+        auto edited=question;
+        edited.context_cache.session_key="edited";
+        edited.messages.front().parts.front().text="Different system identity; answer briefly.";
+        const auto changed=engine.submit(engine.prepare(edited),request(4)).wait();
+        require(!changed.reused_prompt_tokens,"different prefix incorrectly reused history");
+        auto no_update=question; no_update.context_cache.session_key="no-update";
+        no_update.context_cache.update_session_index=false;
+        require(!engine.submit(engine.prepare(no_update),request(4)).wait().reused_prompt_tokens,
+                "no-update request consumed named history");
+        run("parent");
+        std::cout<<"CHECKPOINT_FORK cold_read_failure=1 cancel=1 parent_preserved=1 fresh_exact=1 PASS"<<std::endl;
+    }
+    require(std::filesystem::is_empty(options.kvmem.disk_path),"fork leaked spill file");
+    std::filesystem::remove(options.kvmem.disk_path);
+}
 }
 int main(int argc, char** argv) {
     try {
+        if(argc==3 && std::string_view(argv[2])=="--fork") {checkpoint_fork(argv[1]);return 0;}
         require(argc == 2, "artifact");
         cold_rewrite_peer_progress();
         const auto promotion_path = std::filesystem::current_path() / "promotion-spill";

@@ -1134,6 +1134,9 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             ++memory.retained_sessions;
             collect(*history);
         }
+        if(const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+           transaction && transaction->memory_history && transaction->memory_history->fork)
+            collect(*transaction->memory_history->fork);
         if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end())
             memory.checkpoint_bytes+=memory_coverage_transfer->checkpoint->metadata_bytes();
         memory.host_payload_bytes = memory_payload_storage.charged_bytes();

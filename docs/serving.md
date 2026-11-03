@@ -1004,6 +1004,14 @@ for independent conversations. Shared keys share one cache lineage: editing an e
 can discard its later checkpoints, so independently retained branches require distinct owners.
 Every restore still validates the token/media prefix and native KV/state; a matching key alone
 does not make incompatible inputs reusable. Missing, null or empty cache keys remain anonymous.
+With Qwen3.5 KVMem `spread` checkpoints, a named request carrying a current user Query
+first tries its own owner. If no valid point exists, it can fork an exact token/media/position
+prefix from another named owner, including SSD-backed checkpoints. Candidate discovery uses
+RAM metadata; only the selected cold state and required KV pages are read. The new owner
+shares immutable payloads and copies mutable history, preserving the parent until ordinary
+retention limits evict it. Independent OpenCode forks therefore need distinct keys but no
+parent-ID extension. Failed preparation falls back to full prefill; native history-hit logs
+record completed restores, whereas already quoted reuse counters retain the planned frontier.
 Ordinary tool continuation retains its append and resident-only Pressure behavior.
 Unknown top-level fields are ignored.
 
