@@ -25,7 +25,7 @@ namespace {
     std::fprintf(
         code == 0 ? stdout : stderr,
         "usage: %s [--device N] [--out PATH] [--print] [--repeat N] [--margin F]\n"
-        "          [--no-ternary] [--no-groupwise] [--no-attention]\n"
+        "          [--no-ternary] [--no-groupwise] [--no-nvfp4] [--no-attention]\n"
         "          [--no-linear-attention] [--only PREFIX] [--detail] [--quiet]\n"
         "  Times every route a device profile can steer on this GPU and stores the profile\n"
         "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache), stamped with\n"
@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
             options.ternary = false;
         } else if (arg == "--no-groupwise") {
             options.groupwise = false;
+        } else if (arg == "--no-nvfp4") {
+            options.nvfp4 = false;
         } else if (arg == "--no-attention") {
             options.attention = false;
         } else if (arg == "--no-linear-attention") {

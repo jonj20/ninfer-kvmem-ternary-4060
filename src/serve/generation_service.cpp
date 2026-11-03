@@ -324,6 +324,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
+    engine_options.nvfp4_w4a16              = options.nvfp4_w4a16;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;

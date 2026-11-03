@@ -10,6 +10,18 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+namespace {
+
+// The device-profile key this plan consults: the A16 chain's.
+constexpr const char* kRouteKeyA16 = "unified/nvfp4_gdn_input";
+
+// Widest token count this line's own small-T launcher is instantiated for: its table in
+// nvfp4_gdn_input_small_t.cu is make_index_sequence<32 - 2 + 1>, indexed by tokens - 2 with no
+// bounds check. A capability boundary of the kernel, not a measured crossover.
+constexpr std::int32_t kOwnSmallTMaxTokens = 32;
+
+} // namespace
 namespace {
 
 enum class Nvfp4GdnInputRoute : std::uint8_t {
@@ -26,31 +38,6 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                cudaStream_t stream) {
-    constexpr std::int32_t kChunk   = 32;
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
-        auto* qkv_output =
-            static_cast<std::uint8_t*>(qkv.data) +
-            static_cast<std::int64_t>(token_begin) * kQkvRows * sizeof(std::uint16_t);
-        auto* z_output = static_cast<std::uint8_t*>(z.data) +
-                         static_cast<std::int64_t>(token_begin) * kZRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
-        Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
-        if (active == 1) {
-            nvfp4_gdn_input_decode_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
-        } else {
-            nvfp4_gdn_input_small_t_launch(input_chunk, weight, qkv_chunk, z_chunk, stream);
-        }
-    }
-}
-
 } // namespace
 
 static std::size_t nvfp4_gdn_input_workspace_capacity_bytes_own(LinearPolicy policy,
@@ -60,7 +47,8 @@ static std::size_t nvfp4_gdn_input_workspace_capacity_bytes_own(LinearPolicy pol
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
+    const Nvfp4GdnInputRoute widest = resolve_route(policy, max_tokens);
+    return widest == Nvfp4GdnInputRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows)
                : 0;
 }
@@ -69,7 +57,7 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
                                                      std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/nvfp4_gdn_input", width); },
+        [](std::int32_t width) { return fused_route_table(kRouteKeyA16, width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::nvfp4_gdn_input_workspace_capacity_bytes(policy, first, last)
@@ -79,12 +67,23 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (fused_route_table("unified/nvfp4_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table(kRouteKeyA16, x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16(x, weight, qkv, z, stream);
+        // This table keeps its own kernels up to the width they are instantiated for and hands
+        // everything wider to one unified launch, rather than looping its small-T kernel over
+        // 32-token chunks that each re-read the whole weight. See nvfp4_attn_input_plan.cpp for the
+        // measured figures, the one-ulp consequence inside 3..32, and the sm_75 shared-memory note.
+        const std::int32_t tokens = x.ne[1];
+        if (tokens == 1) {
+            nvfp4_gdn_input_decode_launch(x, weight, qkv, z, stream);
+        } else if (tokens <= kOwnSmallTMaxTokens) {
+            nvfp4_gdn_input_small_t_launch(x, weight, qkv, z, stream);
+        } else {
+            unified::nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
+        }
         return;
     }
     if (workspace == nullptr) {

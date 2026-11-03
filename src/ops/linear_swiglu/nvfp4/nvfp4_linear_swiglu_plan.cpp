@@ -14,11 +14,19 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+namespace {
+
+// The device-profile key this plan consults: the A16 chain's.
+constexpr const char* kRouteKeyA16 = "unified/nvfp4_linear_swiglu";
+
+} // namespace
 namespace {
 
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FusedA16Mma,
     FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
@@ -44,16 +52,15 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
-    if (!allows_a4(policy)) { // A16Only, AllowA8 and the integer-A8 policies
+    if (!allows_a4(policy)) { // A16Only and AllowA8
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        // Deliberately verbose. This throw fires during *runtime planning*, before a token
-        // is processed, so on sm_86 it is the entire user-visible symptom of an artifact
-        // that cannot be loaded at all -- and "registered only through T=16" gives an
-        // operator nothing to act on. It took a full-suite run and a bisect of two
-        // deliberate decisions to work out why; the message now carries that.
-        throw std::invalid_argument(
-            "nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_80/86/89 A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this artifact cannot serve a prefill chunk wider than 16 columns on this architecture. Use a groupwise-int artifact here; an sm_120a build runs NVFP4 through AllowA4 at any width.");
+        // Widest reachable band on a card without a native FP4 tensor core. A16 is the only
+        // policy NVFP4 weights have there, so the wide fused A16 MMA owns everything above the
+        // SIMT small-T band instead of refusing it; see nvfp4_linear_swiglu_a16_mma.cu. The
+        // launcher is shared with the unified plan, and the kernel is sized for the 64 KiB of a
+        // Turing block, so the own chain runs it wherever its table is the only one selectable.
+        return Nvfp4LinearSwiGluRoute::FusedA16Mma;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -146,7 +153,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                          std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/nvfp4_linear_swiglu", width); },
+        [](std::int32_t width) { return fused_route_table(kRouteKeyA16, width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::nvfp4_linear_swiglu_workspace_capacity_bytes(
@@ -158,7 +165,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
-    if (fused_route_table("unified/nvfp4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table(kRouteKeyA16, x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                               stream);
         return;
@@ -168,7 +175,20 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
+        // resolve_route puts 2..16 in this case, which is exactly the range this line's own small-T
+        // kernel is instantiated for (nvfp4_linear_swiglu_small_t.cu's make_index_sequence<16-2+1>,
+        // indexed by tokens - 2 with no bounds check), so the band stays on it and only T > 16 goes
+        // to the shared wide-T A16 MMA below. Consequence, deliberate: inside 3..16 the two tables
+        // run different kernels and fold the global weight divisor at different points, so they
+        // agree exactly only on power-of-two divisors and can differ by one BF16 ulp otherwise --
+        // and this band is where a speculative verify pass lands (T = K+1). Upstream's contract
+        // does not freeze bitwise equality (docs/maintainer/op-development.md). T = 1, T = 2 and
+        // everything above 16 share a launch and so stay byte-identical. Decode (T=1) staying on
+        // this line's kernel is also what keeps the Turing build on a path it always ran.
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FusedA16Mma:
+        unified::nvfp4_linear_swiglu_a16_mma_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);

@@ -89,6 +89,25 @@ public:
 #endif
     }
 
+    // --nvfp4-w4a16 asks a native-FP4 card for the dequantising A16 routes instead of A4. On every
+    // other card the permission was already lowered to A16Only while loading, so the flag is a
+    // no-op there: it only ever trades A4 away.
+    void nvfp4_w4a16_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
+        if (!model_.options().nvfp4_w4a16) { return; }
+        if (p.policy == ops::LinearPolicy::AllowA4 && p.weight.qtype == QType::NVFP4 &&
+            p.weight.n == n && p.weight.k == k) {
+            p.policy = ops::LinearPolicy::A16Only;
+        }
+    }
+
+    // The attention and GDN input projections reach their Op as one fused single parent on NVFP4.
+    void nvfp4_w4a16_route_single(ops::ProjectionWeights& projection, std::int32_t n,
+                                  std::int32_t k) const {
+        if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
+            nvfp4_w4a16_route(*single, n, k);
+        }
+    }
+
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
@@ -176,6 +195,8 @@ public:
         integer_route(out.down, QType::Q5_G64_FP16, 5120, 17408);
         integer_route(out.gate_up, QType::T2_G128_FP16, 34816, 5120);
         integer_route(out.down, QType::T2_G128_FP16, 5120, 17408);
+        nvfp4_w4a16_route(out.gate_up, 34816, 5120);
+        nvfp4_w4a16_route(out.down, 5120, 17408);
         // --mlp-a8-decode is a separate verify-phase trade from --prefill-a8: it must admit the
         // decode route by this profile's own format/shape, not by whether prefill promotion
         // already ran, so the two flags stay orthogonal as documented.
@@ -307,9 +328,11 @@ public:
             integer_route(attention_output, QType::Q4_G64_FP16, 5120, 6144);
             integer_route(attention_output, QType::Q5_G64_FP16, 5120, 6144);
             integer_route(attention_output, QType::T2_G128_FP16, 5120, 6144);
+            nvfp4_w4a16_route(attention_output, 5120, 6144);
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
                 model_.rotated_input(a->query), model_.rotated_input(a->key),
                 model_.rotated_input(a->gate), model_.rotated_input(a->value));
+            nvfp4_w4a16_route_single(attention_projection, 14336, 5120);
             integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
                                7168, 5120);
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
@@ -324,9 +347,11 @@ public:
             integer_route(gdn_output, QType::Q4_G64_FP16, 5120, 6144);
             integer_route(gdn_output, QType::Q5_G64_FP16, 5120, 6144);
             integer_route(gdn_output, QType::T2_G128_FP16, 5120, 6144);
+            nvfp4_w4a16_route(gdn_output, 5120, 6144);
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
                 model_.rotated_input(g.query), model_.rotated_input(g.key),
                 model_.rotated_input(g.value), model_.rotated_input(g.z));
+            nvfp4_w4a16_route_single(gdn_projection, 16384, 5120);
             integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
                                5120);
             integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
@@ -419,6 +444,7 @@ public:
         }
         if (packable) {
             out.projection.packed = ops::prepare_linear_weight(inputs);
+            nvfp4_w4a16_route(out.projection.packed, 14336, 5120);
         }
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
@@ -426,6 +452,7 @@ public:
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
+        nvfp4_w4a16_route(out.output, 5120, 6144);
         out.ffn         = ffn(w.layer.ffn);
         out.output_head = head(w.output_head_use);
         return out;

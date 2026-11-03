@@ -169,6 +169,40 @@ std::optional<LinearRouteTable> forced_route_table() {
     return forced;
 }
 
+// `NINFER_LINEAR_ROUTES=<int8|a16>:<legacy|unified>` moves one NVFP4 family and no other: the
+// plain `legacy|unified` forms above still take every shape. The two families own separate keys,
+// so a scoped override lets an A/B hold the other family on its calibrated schedule.
+std::optional<LinearRouteTable> scoped_nvfp4_table() {
+    static const std::optional<LinearRouteTable> scoped = [] {
+        const char* value = std::getenv("NINFER_LINEAR_ROUTES");
+        if (value == nullptr) return std::optional<LinearRouteTable>{};
+        const std::string_view spec(value);
+        const auto colon = spec.find(':');
+        if (colon == std::string_view::npos) return std::optional<LinearRouteTable>{};
+        const auto scope = spec.substr(0, colon);
+        if (scope != "int8" && scope != "a16") return std::optional<LinearRouteTable>{};
+        const auto table = spec.substr(colon + 1);
+        if (table == "legacy") return std::optional<LinearRouteTable>{LinearRouteTable::Legacy};
+        if (table == "unified") {
+            if (!kUnifiedLinearRoutesBuilt) {
+                throw std::invalid_argument("NINFER_LINEAR_ROUTES=" + std::string(spec) +
+                                            ": this build selects the legacy Linear table only");
+            }
+            return std::optional<LinearRouteTable>{LinearRouteTable::Unified};
+        }
+        return std::optional<LinearRouteTable>{};
+    }();
+    return scoped;
+}
+
+// True for every fused key this family owns: the A16 plans pass "unified/nvfp4_<op>". Other families' keys must keep their calibrated schedule, so the
+// optional "unified/" prefix is stripped before the match.
+bool is_nvfp4_fused_key(std::string_view key) {
+    constexpr std::string_view kUnifiedPrefix = "unified/";
+    if (key.rfind(kUnifiedPrefix, 0) == 0) key.remove_prefix(kUnifiedPrefix.size());
+    return key.rfind("nvfp4", 0) == 0;
+}
+
 } // namespace
 
 LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
@@ -176,6 +210,9 @@ LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
     const auto forced = forced_route_table();
     if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
     if (forced) return *forced;
+    if (family == LinearRouteFamily::Nvfp4) {
+        if (const auto scoped = scoped_nvfp4_table()) return *scoped;
+    }
     for (const WidthBand band : family_bands(bands_for(current_device_class()), family)) {
         if (t >= band.first && t <= band.last) return LinearRouteTable::Unified;
     }
@@ -187,6 +224,9 @@ LinearRouteTable fused_route_table(std::string_view key, std::int32_t width,
     const auto forced = forced_route_table();
     if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
     if (forced) return *forced;
+    if (is_nvfp4_fused_key(key)) {
+        if (const auto scoped = scoped_nvfp4_table()) return *scoped;
+    }
     if (width > kRouteBandsMeasuredTo && !device_route_measured(key, width)) return wide;
     return device_route_schedule(key, width) == "unified" ? LinearRouteTable::Unified
                                                           : LinearRouteTable::Legacy;

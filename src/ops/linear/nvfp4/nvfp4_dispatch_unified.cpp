@@ -3,19 +3,27 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail::unified {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
                          &kNvfp4N5120K6144, &kNvfp4N5120K17408};
 
-const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
-    if (!valid_linear_policy(policy))
-        throw std::invalid_argument("nvfp4 linear: unsupported policy");
+const Nvfp4LinearShape* find_shape(std::int32_t n, std::int32_t k) {
     for (const auto* shape : kShapes)
-        if (shape->n == n && shape->k == k) return *shape;
-    throw std::invalid_argument("nvfp4 linear: unsupported shape");
+        if (shape->n == n && shape->k == k) return shape;
+    return nullptr;
 }
+
+// A geometry is served by its own table row: a new geometry costs a table row (and its
+// routes' instantiation) rather than a kernel.
+const Nvfp4LinearShape* resolve_geometry(std::int32_t n, std::int32_t k) {
+    if (const Nvfp4LinearShape* shape = find_shape(n, k)) { return shape; }
+    const std::string geometry = std::to_string(n) + ',' + std::to_string(k);
+    throw std::invalid_argument("nvfp4 linear: no registered shape [" + geometry + "]");
+}
+
 } // namespace
 
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
@@ -23,8 +31,10 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
                                                   std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
-    const auto& shape = resolve_shape(n, k, policy);
-    return allows_a4(policy) && shape.uses_a4(min_tokens, max_tokens)
+    if (!valid_linear_policy(policy))
+        throw std::invalid_argument("nvfp4 linear workspace: unsupported policy");
+    const Nvfp4LinearShape* shape = resolve_geometry(n, k);
+    return allows_a4(policy) && shape->uses_a4(min_tokens, max_tokens)
                ? nvfp4_a4_workspace_capacity_bytes(max_tokens, k)
                : 0;
 }
@@ -33,13 +43,13 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
                     WorkspaceArena* workspace, cudaStream_t stream) {
     validate_nvfp4_weight(weight, "nvfp4 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
-    const auto& shape = resolve_shape(weight.n, weight.k, policy);
-    if (!allows_a4(policy) || !shape.uses_a4(x.ne[1], x.ne[1]))
-        return shape.a16(x, weight, out, stream);
+    const Nvfp4LinearShape* shape = resolve_geometry(weight.n, weight.k);
+    if (!allows_a4(policy) || !shape->uses_a4(x.ne[1], x.ne[1]))
+        return shape->a16(x, weight, out, stream);
     if (workspace == nullptr)
         throw std::invalid_argument("nvfp4 A4 linear requires caller workspace");
     auto scope         = workspace->scope();
     const auto scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
-    shape.a4(x, weight, out, scratch, stream);
+    shape->a4(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail::unified

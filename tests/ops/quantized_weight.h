@@ -347,6 +347,11 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
+    // NVFP4 only. The default fixture walks eight small scale bytes (0x00..0x1d), which is a
+    // convenient deterministic set but not the domain a production artifact uses: the real planes
+    // reach 0x7E. A gate that only ever saw the small bytes could not arbitrate anything that
+    // depends on the scale's exponent, so this option walks the whole reachable domain instead.
+    bool wide_scale_range                = false;
 };
 
 // Canonical PTQ1 bytes generated independently from the CUDA decode/repack implementation.
@@ -521,6 +526,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         };
         const std::int32_t groups_per_row = k / 16;
         const std::int32_t k_tiles        = k / 64;
+        // The wide domain walks every reachable scale byte, 0x00 through 0x7F, which covers the
+        // subnormals, the normals and the 0x7F guard the vendor decode maps to zero. The default
+        // set is the eight small bytes the fixture has always used.
+        const std::int32_t scale_table_size = options.wide_scale_range ? 128 : 8;
         for (std::int32_t row = 0; row < n; ++row) {
             const std::int32_t row_tile  = row / 128;
             const std::int32_t row_inner = row % 128;
@@ -534,9 +543,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                     static_cast<std::size_t>(row_inner / 32) * 4U +
                     static_cast<std::size_t>(scale_lane);
                 const std::size_t pattern = (static_cast<std::uint32_t>(row) * 5U +
-                                             static_cast<std::uint32_t>(group) * 3U + seed) &
-                                            7U;
-                packed.payload[stored_offset] = kScaleWords[pattern];
+                                             static_cast<std::uint32_t>(group) * 3U + seed) %
+                                            static_cast<std::uint32_t>(scale_table_size);
+                packed.payload[stored_offset] = options.wide_scale_range
+                                                    ? static_cast<std::uint8_t>(pattern)
+                                                    : kScaleWords[pattern];
             }
         }
         detail::store_u32_le(packed.payload, packed.weight_divisor_offset,

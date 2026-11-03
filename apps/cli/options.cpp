@@ -259,6 +259,9 @@ std::string usage_text(const char* argv0) {
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
+           "  --nvfp4-w4a16                 on a native-FP4 card, run NVFP4 weights on the\n"
+           "                                dequantising A16 routes instead of W4A4 (no-op\n"
+           "                                elsewhere)\n"
            "  --prefill-cublas              hand wide prefill GEMMs to cuBLAS: a large\n"
            "                                prefill speedup for a small perplexity cost;\n"
            "                                wants a larger --prefill-chunk\n"
@@ -519,6 +522,8 @@ Options parse_options(int argc, char** argv) {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+        } else if (arg == "--nvfp4-w4a16") {
+            options.nvfp4_w4a16 = true;
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--mtp-attention-window") {

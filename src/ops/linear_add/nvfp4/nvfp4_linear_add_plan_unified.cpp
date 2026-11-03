@@ -41,17 +41,22 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
-    return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::A4
-               ? nvfp4_a4_workspace_capacity_bytes(max_tokens, input_rows)
-               : 0;
+    const Nvfp4LinearAddRoute widest = resolve_route(output_rows, input_rows, policy, max_tokens);
+    if (widest == Nvfp4LinearAddRoute::A4) {
+        return nvfp4_a4_workspace_capacity_bytes(max_tokens, input_rows);
+    }
+    return 0;
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
+    switch (resolve_route(weight.n, weight.k, policy, x.ne[1])) {
+    case Nvfp4LinearAddRoute::A16:
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;
+    case Nvfp4LinearAddRoute::A4:
+        break;
     }
     auto scope                     = workspace.scope();
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k);

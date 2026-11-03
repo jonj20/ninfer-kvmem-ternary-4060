@@ -83,6 +83,12 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                   "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
                 add(key, {"unified"});
             }
+            // QUASAR NVFP4 fused projections: the A16 chain choice at every width a fused launch
+            // serves (the own chain's per-width kernels against the unified templates).
+            for (const char* key : {"unified/nvfp4_attn_input", "unified/nvfp4_gdn_input",
+                                    "unified/nvfp4_linear_add", "unified/nvfp4_linear_swiglu"}) {
+                add(key, {"unified"});
+            }
         }
         // The cuBLAS prefill route's width gate per Op (--prefill-cublas), over the widths the
         // integer A8 mainloop cannot take and, under `/a8`, the multiples of its tile it can.

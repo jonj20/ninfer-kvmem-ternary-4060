@@ -93,6 +93,17 @@ quantized_weight::PackedWeight make_t2_g128_fp16_weight(std::int32_t n, std::int
                                                         std::uint32_t seed);
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed);
+// Same as above but with a caller-chosen global scale divisor. The default 0.125 is a power of
+// two, which makes every partial sum exactly representable and therefore hides any difference in
+// reduction order; a non-power-of-two divisor is what makes such a difference observable.
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor);
+// Same as above with the scale plane walking the whole reachable E4M3 domain (0x00..0x7F) instead
+// of the eight small bytes the fixture uses by default. A production artifact's scales reach 0x7E,
+// so the narrow fixture is a blind spot for anything that depends on the scale's exponent.
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor,
+                                                 bool wide_scale_range);
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,

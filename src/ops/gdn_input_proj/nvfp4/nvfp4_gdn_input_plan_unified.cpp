@@ -33,16 +33,21 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::A4
-               ? nvfp4_a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows)
-               : 0;
+    const Nvfp4GdnInputRoute widest = resolve_route(policy, max_tokens);
+    if (widest == Nvfp4GdnInputRoute::A4) {
+        return nvfp4_a4_workspace_capacity_bytes(max_tokens, Nvfp4N16384K5120::kInputRows);
+    }
+    return 0;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
+    switch (resolve_route(policy, x.ne[1])) {
+    case Nvfp4GdnInputRoute::A16:
         nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
         return;
+    case Nvfp4GdnInputRoute::A4:
+        break;
     }
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 A4 gdn_input_proj requires caller workspace");

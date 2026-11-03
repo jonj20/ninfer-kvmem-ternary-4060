@@ -216,6 +216,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                GDN input projections off that route\n"
            "  --no-prefill-a8               prefill every projection on the A16 routes\n"
            "                                instead of the integer-activation ones\n"
+           "  --nvfp4-w4a16                 native-FP4 cards: NVFP4 weights on the A16\n"
+           "                                routes instead of W4A4\n"
            "  --mlp-a8-decode               integer-activation MLP gate_up at decode and\n"
            "                                verify widths\n"
            "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"
@@ -1580,6 +1582,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+            continue;
+        }
+        if (arg == "--nvfp4-w4a16") {
+            options.nvfp4_w4a16 = true;
             continue;
         }
         if (arg == "--lookup-ngram") {

@@ -30,6 +30,9 @@ struct LoadOptions {
     bool mlp_a8_decode = false;
     // Clearing this returns full prefill tiles to their A16 routes; see EngineOptions::prefill_a8.
     bool prefill_a8 = true;
+    // Prefer the dequantising NVFP4 A16 routes over a native-FP4 card's A4 permission; see
+    // EngineOptions::nvfp4_w4a16.
+    bool nvfp4_w4a16 = false;
     // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
     // trade on top of prefill_a8 and therefore off unless asked for.
     bool prefill_cublas = false;
@@ -140,6 +143,7 @@ struct LoadOptions {
             .expert_residency = options.expert_residency,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
+            .nvfp4_w4a16    = options.nvfp4_w4a16,
             .prefill_cublas = options.prefill_cublas,
             .prefill_cublas_projections = options.prefill_cublas_projections,
             .gdn_state_fp16 = options.gdn_state_fp16,

@@ -619,6 +619,12 @@ struct EngineOptions {
     // already costs, the GDN half carrying nearly all of both. Separable because that is a
     // different trade from the MLP one and an owner may want only the cheaper half.
     bool prefill_cublas_projections        = true;
+    // A native-FP4 card stores the A4 permission for an NVFP4 weight and runs W4A4 by default;
+    // this asks for the dequantising W4A16 routes instead, the higher-precision of the two at the
+    // cost of the FP4 tensor cores. On every other card the loader has already lowered the
+    // permission to A16Only, so the flag is a no-op there: it only ever trades A4 away and never
+    // introduces a compute domain the card lacks.
+    bool nvfp4_w4a16                       = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

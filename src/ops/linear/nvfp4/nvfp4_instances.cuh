@@ -6,10 +6,6 @@ namespace ninfer::ops::detail::unified {
 template <int Tokens, int Warps, int Stages>
 using Nvfp4SlicedInstance = Nvfp4A16SlicedKMmaSchedule<
     Warps, Tokens,
-    (Nvfp4A16SlicedKMmaSchedule<Warps, Tokens, 1, Cache::ca, Cache::cg,
-                                Nvfp4ActivationStage::PaddedZero, Stages>::kSharedBytes <=
-             kMaxSharedBytesPerBlockSm8x / 2
-         ? 2
-         : 1),
+    4,
     Cache::ca, Cache::cg, Nvfp4ActivationStage::PaddedZero, Stages>;
 } // namespace ninfer::ops::detail::unified

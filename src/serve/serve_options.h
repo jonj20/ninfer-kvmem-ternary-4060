@@ -132,6 +132,7 @@ struct ServeOptions {
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
+    bool nvfp4_w4a16        = false;
     bool prefill_cublas     = false;
     bool prefill_cublas_projections = true;
     // Explicit total CUDA Graph driver-state allowance in MiB; 0 keeps the computed allowance.

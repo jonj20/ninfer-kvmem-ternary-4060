@@ -16,6 +16,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FusedA16Mma,
     FusedA4,
     TmaFusedA4,
 };
@@ -28,7 +29,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        // Above the SIMT band the A16-only card needs the fused wide MMA; see
+        // nvfp4_linear_swiglu_a16_mma.cu. There is no NVFP4 tensor-core route here to prefer.
+        return Nvfp4LinearSwiGluRoute::FusedA16Mma;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -59,7 +62,9 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4) {
+    // The `max_tokens <= 4` short-circuit is the same narrow-width A16 preference resolve_route
+    // carries, restated in bytes: at those widths the A16 routes need no transient storage.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 || max_tokens <= 4) {
         return 0;
     }
 
@@ -75,6 +80,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FusedA16Mma:
+        nvfp4_linear_swiglu_a16_mma_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);
