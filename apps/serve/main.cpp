@@ -222,6 +222,7 @@ int main(int argc, char** argv) {
         auto capabilities = nlohmann::json::parse(kvmem::launch_capabilities("ninfer"));
         capabilities["budget_planning_version"] = 1;
         capabilities["heads_tensor_parallel_revision"] = 1;
+        capabilities["checkpoint_recompute_revision"] = 1;
         std::cout << capabilities.dump() << '\n';
         return 0;
     }

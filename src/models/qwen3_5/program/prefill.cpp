@@ -1569,8 +1569,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 const bool drafter     = drafter_at(staged.cursor);
                 schedule_state.drafter = drafter;
-                const auto memory_frontier = memory_checkpoint_frontier(
-                    sequence, staged.prompt_tokens, request.allow_memory_reuse);
+                const bool query_checkpoint = memory_query_probe(sequence, staged.prompt_tokens);
+                const auto checkpoint_purpose = query_checkpoint ? kvmem::CheckpointPurpose::QueryReplay
+                                                                 : kvmem::CheckpointPurpose::PromptTail;
+                // Decide before splitting the chunk or allocating a StateImage.
+                // Only an already captured, complete earlier state can substitute
+                // for the ordinary prompt tail; a real Query rewind remains exact.
+                const auto memory_frontier = request.allow_memory_reuse && !query_checkpoint &&
+                    skip_memory_tail_checkpoint(sequence, staged.prompt_tokens) ? 0U :
+                    memory_checkpoint_frontier(sequence, staged.prompt_tokens, request.allow_memory_reuse);
                 if (memory_frontier > staged.cursor &&
                     (!split_frontier || memory_frontier < *split_frontier)) {
                     split_frontier = memory_frontier;
@@ -1636,15 +1643,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
                 if (memory_frontier && staged.cursor == memory_frontier &&
-                    (!sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data ||
-                     sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data->prefix.size() != memory_frontier)) {
-                    capture_memory_prefix(sequence, result.processed_tokens);
+                    (!sequence.window.checkpoints.slot(checkpoint_purpose).data ||
+                     sequence.window.checkpoints.slot(checkpoint_purpose).data->prefix.size() != memory_frontier)) {
+                    capture_memory_prefix(sequence, result.processed_tokens, query_checkpoint);
                 }
                 if (memory_rewrite_frontier && staged.cursor == memory_rewrite_frontier &&
                     (!sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::InputFallback).data ||
                      sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::InputFallback).data->prefix.size() != memory_rewrite_frontier) &&
                     (!sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data ||
-                     sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data->prefix.size() != memory_rewrite_frontier)) {
+                     sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data->prefix.size() != memory_rewrite_frontier) &&
+                    (!sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::PromptTail).data ||
+                     sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::PromptTail).data->prefix.size() != memory_rewrite_frontier)) {
                     copy_tail(sequence, prefill_hidden.slice(1,
                         static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                     capture_memory_rewrite(sequence, KvmemCheckpointKind::InputFallback);

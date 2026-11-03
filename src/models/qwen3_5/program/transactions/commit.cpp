@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
@@ -606,6 +607,23 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
 
             if (pending_kinds[row] != PendingKind::Begin || decisions[row].cancelled) { continue; }
             RequestControl& request = requests[lanes[row]];
+            if (kvmem_window_tokens) {
+                auto& state = active_sequence(lanes[row]);
+                const auto* tail = memory_checkpoint(state.window, KvmemCheckpointKind::PromptTail);
+                if (memory_checkpoint(state.window, KvmemCheckpointKind::Base) && tail &&
+                    !state.window.coverage.policy().extra_recompute_tokens) {
+                    // resolve_pending_raw has accepted the complete prefill. Drop
+                    // its consumed Query execution role now, so a later decode
+                    // cancellation does not park an obsolete extra StateImage.
+                    const CheckpointReplayCompletion completion{
+                        true, state.window.query_replay_active,
+                        complete_memory_checkpoint(state, *tail), tail->prefix.size(), state.window.query_end};
+                    retire_query_checkpoint_after_prefill(
+                        memory_checkpoint_slot(state.window, KvmemCheckpointKind::Base),
+                        memory_checkpoint_slot(state.window, KvmemCheckpointKind::PromptTail),
+                        state.window.coverage.policy().extra_recompute_tokens, completion);
+                }
+            }
             if (decisions[row].terminal) {
                 request.prefill.reset();
                 continue;
@@ -680,7 +698,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     }
     if (!request.publish_continuation) {
         capture_memory_endpoint(state, request);
-        retain_memory_history(state, request);
+        retain_memory_history(state, request, true);
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
         out.timings     = request.timings;

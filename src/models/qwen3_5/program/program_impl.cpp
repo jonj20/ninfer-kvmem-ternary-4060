@@ -515,6 +515,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (kvmem_window_tokens) {
         const auto policy=kvmem::CheckpointPolicy::environment();
+        if (policy.extra_recompute_tokens && policy.min_gap)
+            throw std::invalid_argument("NInfer checkpoint extra recompute tokens require KVMEM_CHECKPOINT_MIN_GAP=0");
         if(policy.enabled) {
             const auto budget=policy.host_bytes*max_concurrency;
             const auto staging=kvmem_options.disk_bytes ? state_images->host_layout().image_bytes : 0;
