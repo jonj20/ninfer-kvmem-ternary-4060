@@ -67,10 +67,18 @@ void run(ninfer::Engine& engine, const ninfer::EngineOptions& options,
     require(memory.host_payload_bytes <= options.kvmem.host_bytes, "RAM quota exceeded");
     require(memory.disk_payload_bytes <= options.kvmem.disk_bytes, "SSD quota exceeded");
     require(memory.disk_errors == 0, "unexpected SSD I/O error");
+    const char* checkpoint_policy = std::getenv("KVMEM_CHECKPOINT_POLICY");
+    if (checkpoint_policy && std::string(checkpoint_policy) == "spread") {
+        const char* checkpoint_mib = std::getenv("KVMEM_CHECKPOINT_HOST_MIB");
+        const auto checkpoint_budget = (checkpoint_mib ? std::stoull(checkpoint_mib) : 1024ULL) << 20;
+        require(memory.checkpoint_bytes <= checkpoint_budget * options.max_concurrency,
+                "checkpoint Host quota exceeded");
+    }
     require(memory.resident_pages == 0 && memory.mtp_resident_pages == 0 &&
             memory.active_payload_reservation_bytes == 0, "terminal request leaked active resources");
     std::cout << "MEMORY_DISK case=" << label << " reused=" << result.reused_prompt_tokens
               << " H=" << memory.host_payload_bytes << " D=" << memory.disk_payload_bytes
+              << " checkpoint_host=" << memory.checkpoint_bytes
               << " reads=" << memory.disk_read_bytes << " writes=" << memory.disk_written_bytes
               << " errors=" << memory.disk_errors << std::endl;
 }

@@ -1546,6 +1546,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             apply_direct_graft(*graft, result, message_boundaries, cache_boundaries);
         }
     }
+    if (!message_roles.empty() && message_roles.front() == ChatRole::System && message_boundaries.size() > 1)
+        result.memory_root_end = message_boundaries[1].value_or(0);
     // A direct graft is restored whole from its pinned slot and is the root every capture of the
     // request builds on, so it publishes no prefix of its own; a prefill graft is replayed, and its
     // end is published as a shared prefix.

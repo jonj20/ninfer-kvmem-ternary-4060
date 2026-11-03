@@ -9,6 +9,8 @@
 #include "core/vmm.h"
 #include "kvmem/memory_contract.hpp"
 #include "kvmem/prefix_checkpoint.hpp"
+#include "kvmem/checkpoint_policy.hpp"
+#include "kvmem/checkpoint_image.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/kvmem_store.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
@@ -522,10 +524,26 @@ struct KvmemPrefixCheckpoint {
     std::vector<std::uint64_t> resident_pages;
     std::vector<float> mean_tail;
     std::shared_ptr<PinnedHostBuffer> state;
-    // Idle-only attachment in the same disk account as native KV. Active
-    // checkpoints use the existing pinned representation and GPU copy path.
+    // Native images share the KV disk account. Spread also demotes inactive
+    // records within the active history; execution leases stay pinned.
     kvmem::SpillExtent cold_state;
-    std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_state.size(); }
+    std::uint64_t cold_tag = 0, cold_payload_bytes = 0;
+    static std::uint64_t identity_bytes(const kvmem::CheckpointIdentity& value) noexcept {
+        return value.backend.backend.capacity() + value.backend.revision.capacity() +
+            value.backend.model.capacity() + value.backend.state_schema.capacity() +
+            value.layout.format.capacity() + 5 + value.layout.planes.capacity()*sizeof(kvmem::PayloadPlane);
+    }
+    std::uint64_t metadata_bytes() const noexcept {
+        return sizeof(*this) + identity_bytes(identity) + prefix_identity.allocated_bytes() +
+            prefix.capacity()*sizeof(TokenId) + resident_pages.capacity()*sizeof(uint64_t) +
+            mean_tail.capacity()*sizeof(float) + history.scores->capacity()*sizeof(double) + graph.bytes() + feedback.bytes();
+    }
+    std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_tag ? cold_payload_bytes : cold_state.size(); }
+    void read_state(void* destination, size_t bytes) const {
+        if (bytes != state_bytes()) throw std::logic_error("checkpoint state size mismatch");
+        if (cold_tag) kvmem::read_checkpoint_image(cold_state, cold_tag, {{destination, bytes}});
+        else cold_state.read(0, destination, bytes);
+    }
 };
 
 struct KvmemCheckpointRecord {
@@ -533,10 +551,10 @@ struct KvmemCheckpointRecord {
     std::shared_ptr<KvmemPrefixCheckpoint> data;
     kvmem::CheckpointInfo checkpoint_info() const {
         return {data ? data->prefix.size() : 0, purposes, data.get(),
-                data ? data->state_bytes() + data->mean_tail.size() * sizeof(float) + data->graph.bytes() + data->feedback.bytes() : 0};
+                data ? data->state_bytes() + data->metadata_bytes() : 0};
     }
 };
-enum class KvmemCheckpointKind : std::uint8_t { Base, Endpoint, InputFallback, Reconstruction, ReuseAnchor };
+enum class KvmemCheckpointKind : std::uint16_t { Base, Endpoint, InputFallback, Reconstruction, ReuseAnchor, CoverageBegin = 16 };
 // Lookup priority for equal frontiers.
 inline constexpr std::array kKvmemCheckpointKinds{
     KvmemCheckpointKind::Endpoint, KvmemCheckpointKind::Reconstruction,
@@ -568,6 +586,7 @@ struct KvmemAppendPreparation {
 struct KvmemHistoryPreparation {
     struct Work {
         kvmem::SpillExtent state_source;
+        uint64_t state_tag = 0, state_payload_bytes = 0;
         KvmemHostRecord state;
         std::vector<std::uint32_t> ids;
         std::vector<kvmem::HostKvSource> sources;
@@ -590,6 +609,7 @@ struct KvmemIdleTransfer {
         kvmem::SpillExtent destination;
         const void* data = nullptr;
         std::size_t bytes = 0;
+        std::uint64_t tag = 0;
     };
     // Only the engine owns this CUDA host allocation. A worker borrows its
     // immutable bytes; this owner survives history eviction until completion.
@@ -643,6 +663,8 @@ struct KvmemWindowState {
     // Long prompts retain the pre-query boundary for selection/replay; short prompts
     // retain the input prefix before its final token for request-to-request reuse.
     kvmem::CheckpointCatalog<KvmemCheckpointRecord> checkpoints{kvmem::CheckpointLimits{5}};
+    kvmem::CheckpointArchive<KvmemCheckpointRecord> coverage;
+    kvmem::CheckpointCapturePlan capture_plan;
     std::uint32_t reuse_anchor = 0;
     std::uint32_t reconstruction_frontier = 0;
     bool query_replayed = false;
@@ -657,6 +679,19 @@ struct KvmemWindowState {
     kvmem::StorageTicket pending_window_io;
     // Last member: abort/drain the transaction before its source archive dies.
     std::unique_ptr<kvmem::MemorySession> pending_window;
+};
+inline std::vector<KvmemCheckpointKind> checkpoint_kinds(const KvmemWindowState& window) {
+    std::vector<KvmemCheckpointKind> result(kKvmemCheckpointKinds.begin(), kKvmemCheckpointKinds.end());
+    for (size_t i=0; i<window.coverage.slots(); ++i) if (window.coverage.at(i) && window.coverage.at(i)->record.data)
+        result.push_back(KvmemCheckpointKind(unsigned(KvmemCheckpointKind::CoverageBegin)+i));
+    return result;
+}
+struct KvmemCoverageTransfer {
+    std::shared_ptr<KvmemPrefixCheckpoint> checkpoint;
+    std::shared_ptr<PinnedHostBuffer> source;
+    kvmem::SpillExtent destination;
+    kvmem::StorageTicket ticket;
+    ~KvmemCoverageTransfer() { ticket.cancel(); try { ticket.wait(); } catch (...) {} }
 };
 
 struct SequenceState {
@@ -2093,7 +2128,12 @@ private:
     [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
         std::uint32_t prompt_tokens, bool allow_reuse) const;
     void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens);
-    std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence);
+    std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence, bool optional = false);
+    void capture_memory_coverage(SequenceState& sequence, uint32_t chunk_tokens) noexcept;
+    bool skip_memory_coverage(const SequenceState& sequence) const;
+    void progress_checkpoint_coverage(KvmemWindowState& window, bool force = false);
+    void checkpoint_memory_room(KvmemWindowState& window, size_t bytes, bool optional = false);
+    std::unique_ptr<KvmemCoverageTransfer> memory_coverage_transfer;
     void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
     void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
     void capture_memory_reconstruction_if_ready(SequenceState& sequence);

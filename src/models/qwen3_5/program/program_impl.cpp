@@ -513,6 +513,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
     }
+    if (kvmem_window_tokens) {
+        const auto policy=kvmem::CheckpointPolicy::environment();
+        if(policy.enabled) {
+            const auto budget=policy.host_bytes*max_concurrency;
+            const auto staging=kvmem_options.disk_bytes ? state_images->host_layout().image_bytes : 0;
+            memory_checkpoint_pool->configure(budget>staging ? budget-staging : 0,1);
+        }
+    }
     if (kvmem_options.disk_bytes) {
         const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
         const auto pages = std::uint64_t(kvmem_window_tokens / 64) * max_concurrency;
@@ -1083,7 +1091,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         memory.statistics_staging_bytes =
             (memory_statistics_host ? memory_statistics_host->size() : 0) +
             (memory_candidate_host ? memory_candidate_host->size() : 0);
-        memory.checkpoint_bytes += memory_checkpoint_pool->idle_bytes();
+        memory.checkpoint_bytes += memory_checkpoint_pool->allocated_bytes();
         memory.resident_pages = text_kv_pages->physical_pool().allocated_pages();
         memory.mtp_resident_pages = backend_kv_pages
             ? backend_kv_pages->physical_pool().allocated_pages() : 0;
@@ -1100,6 +1108,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         memory.disk_payload_budget_bytes = kvmem_options.disk_bytes;
         memory.retained_payload_budget_bytes = memory_retained_budget;
         for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
+        std::vector<const KvmemPrefixCheckpoint*> seen;
         const auto collect = [&](const KvmemWindowState& window) {
             // Moves into the history directory leave scalar fields behind until lane
             // retirement. Ownership of statistics identifies the live history.
@@ -1109,12 +1118,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             memory.history_swaps += window.swaps;
             memory.history_spilled_bytes += window.spilled_bytes;
             memory.history_restored_bytes += window.restored_bytes;
-            std::vector<const KvmemPrefixCheckpoint*> seen;
-            for (const auto kind : kKvmemCheckpointKinds) {
+            for (const auto kind : checkpoint_kinds(window)) {
                 if (const auto* checkpoint = memory_checkpoint(window, kind);
                     checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
                     seen.push_back(checkpoint);
-                    if (checkpoint->state) memory.checkpoint_bytes += checkpoint->state->size();
+                    memory.checkpoint_bytes += checkpoint->metadata_bytes();
                     memory.checkpoint_tokens = std::max(memory.checkpoint_tokens,
                         static_cast<std::uint32_t>(checkpoint->prefix.size()));
                 }
@@ -1126,6 +1134,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             ++memory.retained_sessions;
             collect(*history);
         }
+        if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end())
+            memory.checkpoint_bytes+=memory_coverage_transfer->checkpoint->metadata_bytes();
         memory.host_payload_bytes = memory_payload_storage.charged_bytes();
     }
     out.device          = device.device;

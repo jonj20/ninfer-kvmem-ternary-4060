@@ -793,6 +793,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             if(staged.prompt.memory_input_end)
                 graph_messages.push_back({staged.prompt.memory_input_end,capacity,false});
             sequence.window.graph.set_messages(graph_messages);
+            const auto tail=staged.prompt.memory_messages.empty() ? 0 : staged.prompt.memory_messages.back().begin;
+            sequence.window.capture_plan=kvmem::CheckpointCapturePlan(staged.cursor,sequence.window.coverage.policy().interval,staged.prompt.memory_root_end,tail);
             sequence.window.request_messages=sequence.window.graph.messages;
             sequence.window.think_open=staged.prompt.memory_think_open;
             sequence.window.think_close=staged.prompt.memory_think_close;
@@ -977,9 +979,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 const auto columns = target - pending.base_E;
                 const auto selectors = state_selectors(sequence);
                 const auto bytes = state_images->host_layout().image_bytes;
-                std::unique_ptr<PinnedHostBuffer> original_state;
+                std::shared_ptr<PinnedHostBuffer> original_state;
                 try {
-                    original_state = std::make_unique<PinnedHostBuffer>(bytes);
+                    checkpoint_memory_room(sequence.window, bytes);
+                    original_state = memory_checkpoint_pool->acquire(bytes);
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "KVMEM_REWRITE capture skipped: %s\n", error.what());
                     sequence.window.reconstruction_frontier = 0;
@@ -1585,6 +1588,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     (!split_frontier || memory_rewrite_frontier < *split_frontier)) {
                     split_frontier = memory_rewrite_frontier;
                 }
+                if(kvmem_window_tokens && request.allow_memory_reuse && sequence.window.coverage.policy().enabled && !staged.vision) {
+                    const auto end=split_frontier.value_or(staged.prompt_tokens);
+                    const auto cut=sequence.window.capture_plan.cut(staged.cursor,end);
+                    if(cut<end) split_frontier=uint32_t(cut);
+                }
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -1643,6 +1651,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 if (reuse_anchor && staged.cursor == reuse_anchor)
                     capture_memory_anchor(sequence, result.processed_tokens);
+                if (kvmem_window_tokens && request.allow_memory_reuse && !result.finalized)
+                    capture_memory_coverage(sequence, result.processed_tokens);
                 if (hybrid_lane != nullptr && !result.finalized) {
                     // A branched read's frontier is a tap position too (its branches follow it).
                     hybrid_after_prefill_chunk(sequence, staged.cursor,
@@ -1764,7 +1774,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if(committed) {
                 // Prefixes containing the entire accepted user input may carry its
                 // logical history even if their native capture preceded prefill completion.
-                for(const auto kind:kKvmemCheckpointKinds) {
+                for(const auto kind:checkpoint_kinds(window)) {
                     auto& checkpoint=memory_checkpoint_slot(window,kind);
                     if(checkpoint && checkpoint->prefix.size()>=input_end) checkpoint->history=history;
                 }

@@ -44,11 +44,13 @@ set_tests_properties(ninfer_hybrid_prefix_admission_test PROPERTIES
 
 # Focused Query/Pressure frontend and replay-budget option contracts.
 ninfer_add_test(ninfer_kvmem_checkpoint_pool_test
-  SOURCES models/qwen3_5/test_checkpoint_buffer_pool.cpp LIBRARIES ninfer_core)
+  SOURCES models/qwen3_5/test_checkpoint_buffer_pool.cpp LIBRARIES ninfer_core ninfer_model_runtime)
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_query_policy_tests_PROGRAMS
   ninfer_serve_options_test ninfer_qwen3_5_frontend_test ninfer_kvmem_checkpoint_pool_test)
 ninfer_finalize_bundle(ninfer_query_policy_tests)
 ninfer_stage_runtime_dlls(ninfer_query_policy_tests)
+add_test(NAME ninfer_kvmem_checkpoint_metadata_test
+  COMMAND ninfer_query_policy_tests ninfer_kvmem_checkpoint_pool_test --metadata-only)
 
 # Request accounting and protocol renderers, without unrelated GPU numerical tests.
 set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_request_accounting_tests_PROGRAMS

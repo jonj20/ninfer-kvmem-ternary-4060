@@ -171,6 +171,7 @@ struct PreparedPromptData {
     std::optional<TokenSpan> memory_query;
     // Proven message boundary before a transient generation header; zero uses all input.
     std::uint32_t memory_input_end = 0;
+    std::uint32_t memory_root_end = 0;
 
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
