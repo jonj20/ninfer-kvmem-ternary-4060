@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -270,7 +272,7 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
     const bool ternary = is_ternary(qtype);
     const bool t2_planes = !ternary ||
-        (weight.qtype == QType::T2_G128_FP16 ? no_high
+        (weight.qtype != QType::PTQ1_G128_FP16 ? no_high
          : (weight.qhigh != nullptr && weight.high_plane_bytes != 0));
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
@@ -883,6 +885,15 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
+    if (qk_weight.qtype == QType::T5_G128_FP16) {
+        Tensor qk = qkv.slice(0, 0, kQkRows);
+        Tensor value = qkv.slice(0, kQkRows, kValueRows);
+        Tensor* first[]{&qk};
+        Tensor* second[]{&value, &z};
+        detail::t5_project(x, qk_weight, first, false, policy, &workspace, stream);
+        detail::t5_project(x, value_z_weight, second, false, policy, &workspace, stream);
+        return;
+    }
     if (sm70_takes(x, qk_weight, &value_z_weight)) {
         sm70_project_gdn(x, qk_weight, &value_z_weight, qkv, z, policy, workspace, stream);
         return;
@@ -918,6 +929,9 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
 std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_t max_columns,
                                            LinearPolicy policy = LinearPolicy::A16Only,
                                            QType qtype = QType::T2_G128_FP16) {
+    if (qtype == QType::T5_G128_FP16) {
+        return detail::t5_workspace_capacity_bytes(policy, 5120, max_columns);
+    }
     // sm_70 projects both parents through its own routes at every width.
     if (detail::sm70::enabled() && qtype == QType::T2_G128_FP16) {
         return sm70_projection_bytes(QType::T2_G128_FP16, QType::T2_G128_FP16, 12288, 5120,

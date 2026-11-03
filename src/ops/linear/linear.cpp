@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
@@ -129,6 +131,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::Q8_G32_FP16:
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::T5_G128_FP16: {
+        Tensor* outputs[]{&out};
+        detail::t5_project(x, w, outputs, false, policy, workspace, stream);
+        return;
+    }
     case QType::PTQ1_G128_FP16:
         if (workspace != nullptr && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
@@ -181,6 +188,9 @@ std::size_t linear_route_workspace_bytes(QType qtype, std::int32_t output_rows,
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
+    case QType::T5_G128_FP16:
+        if (output_rows <= 0) { throw std::invalid_argument("linear workspace: T5 rows must be positive"); }
+        return detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
     case QType::PTQ1_G128_FP16:
         detail::validate_ptq1_shape(output_rows, input_rows, min_tokens, policy);
         detail::validate_ptq1_shape(output_rows, input_rows, max_tokens, policy);

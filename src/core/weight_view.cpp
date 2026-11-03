@@ -109,7 +109,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if (geometry.group == 0) {
             throw std::invalid_argument("RowSplit requires a grouped integer format");
         }
-        if (format == QType::PTQ1_G128_FP16 && (k % 128 || layout != QuantLayout::RowSplit)) {
+        if ((format == QType::PTQ1_G128_FP16 || format == QType::T5_G128_FP16) && (k % 128 || layout != QuantLayout::RowSplit)) {
             throw std::invalid_argument("PTQ1 requires RowSplit and whole 128-column groups");
         }
         out.group_size          = geometry.group;

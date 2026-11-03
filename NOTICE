@@ -10,3 +10,10 @@ Changes made here: integrated the current v3 artifact format and current Op inte
 preserved existing format IDs, T2 routes and architecture bounds; made activation layouts and
 workspace planning format-aware; fused inverse-rotated PTQ1 embedding with a single BF16 output
 rounding; added an artifact-owned codec, conversion recipe and independent numerical tests.
+
+T5 CUDA kernels
+===============
+Adapted from JGamboa/ninfer-4090-windows, commit e905787f067de89ef6ef28c52d65a2ce91d425ca
+https://github.com/JGamboa/ninfer-4090-windows (Apache License 2.0).
+Changes: RowSplit artifact integration, explicit existing Hadamard producer boundary,
+strided split-parent destinations, SM120 qualification, and independent codec/oracle tests.

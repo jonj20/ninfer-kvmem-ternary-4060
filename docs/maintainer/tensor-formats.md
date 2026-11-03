@@ -470,6 +470,9 @@ the row-split layout.
 
 ### 5.2.1 Native PTQ1
 
+The optional T5 packing described below represents the same ternary integers and FP16 scales;
+the two formats have different byte layouts and must never alias one another.
+
 `ptq1_g128_fp16` represents the same ternary values as T2 while preserving Prism PTQ1_0
 packing: every 128-column group has 24 base bytes, two tail bytes and one FP16 multiplier.
 It is supported only in `row_split_k128_v1`, with K a multiple of 128. It is a distinct codec;
@@ -791,3 +794,56 @@ input/output formats, output tolerance, and real target shapes. The
 3.4; a producer that copies an upstream quantized tensor is protected by exact source-word
 comparison, while any source-to-FP8 encoder is protected under its own named profile. Private
 activation quantization, staging, and accumulation remain implementation choices.
+
+
+## Optional native T5 packing
+
+`t5_g128_fp16` / `QType::T5_G128_FP16` uses `row_split_k128_v1`, group 128,
+FP16 scales, no high plane, and 26 code bytes per group. The scale plane follows
+ordinary RowSplit alignment. Matrices require whole 128-column groups; this
+implementation's compute routes require positive K divisible by 1024.
+
+Each 64-column unit occupies 13 bytes. For byte i < 12, g = floor(i/4), j = i%4,
+the five trits are the codes of columns `20*g + 4*m + j`, m=0..4. Byte 12 stores
+columns 60..63 and a zero fifth trit. Codes are 0/1/2 for logical -1/0/+1. Encode
+`v = sum(trit[m] * 3**(4-m))` as `ceil(256*v/243)`. Decode by repeatedly multiplying
+by 3, emitting the high byte and retaining the low byte. Noncanonical bytes and
+nonzero padding trits are rejected by the Python codec. A stored scalar is
+`(code-1) * FP16_scale`, with no zero point. Including scales, storage is 1.75 bits
+per weight, equal to PTQ1; conversion from PTQ1 is a lossless reordering, not a new
+weight quantization.
+
+Execution is opt-in through a separate artifact and `AllowA8` (or `AllowA4`, which
+also admits A8). T5 has no A16 compute fallback; A16-only calls fail explicitly.
+Existing PTQ1/T2 artifacts retain their own paths and policies. The public tensors
+are BF16. Per 128 activation columns, the private quantizer uses symmetric s8
+codes and an FP32 scale, introducing activation rounding within the A8 numerical
+allowance. dp4a serves 1..4 tokens, integer MMA serves 5..32, and larger calls use
+prefill tiles; row tails use the small-token tiled route. Routing is static and
+CUDA Graph capture does not perform host synchronization or persistent allocation.
+
+The same public operations accept T5: linear, residual linear_add, linear_swiglu,
+the Bonsai two-parent attention and GDN projections, ordinary/rotated embedding,
+and the registered full/reduced vocabulary linear_topk heads. Split parents must
+both use T5. Output rows are contiguous; the internal splitter also respects token
+strides for GDN's shared qkv allocation. Every transient allocation is charged to
+the operation's workspace query. Top-k uses A8 projection into BF16 logits before
+the existing reduction; it does not promise identical ranking to A16 near ties.
+
+Hadamard signs remain owned by artifact Uses and model producers. This port
+consumes the represented BF16 rows from existing fused RMSNorm/rotation and
+SwiGLU/rotation producers; it does not repeat rotation or adopt the donor's fully
+fused FP32-producer-to-A8 rounding boundary. The donor's 4090-specific wave-cost
+heuristic is replaced by complete 128-token tiles and a 64-token tail. Other
+shape thresholds and prefetch defaults are inherited starting points, not claims
+of optimal tuning on every GPU.
+
+Source: JGamboa/ninfer-4090-windows at
+e905787f067de89ef6ef28c52d65a2ce91d425ca (Apache-2.0; attribution in NOTICE).
+The integration is a removable patch; format name, QType value and tests belong
+to that patch, not to an unpinned assumption about future upstream compatibility.
+Use `python -m tools.convert.repack_t5 INPUT.ninfer OUTPUT.ninfer` to repack a
+native PTQ1 artifact while retaining other objects byte-for-byte. The converter
+verifies persisted codes/scales and copied-object hashes, saves a verification
+report, and does not overwrite the source. `bonsai2_27b_t5` is also available as a
+conversion recipe. Reverting to PTQ1 uses the original artifact.

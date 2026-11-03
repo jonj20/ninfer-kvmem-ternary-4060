@@ -1,6 +1,8 @@
 // ninfer::ops - hadamard_transform launcher: one warp per (column, 1024-block), four warps per CTA.
 #include "ops/launcher/hadamard_transform.h"
 
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/device.h"
 #include "ops/kernel/hadamard_producers.cuh"
 #include "ops/kernel/hadamard_transform.cuh"
@@ -113,6 +115,10 @@ void embedding_rotated_ternary_launch(const Tensor& ids, const Weight& table, co
     const std::int64_t ctas = (items + kWarpsPerCta - 1) / kWarpsPerCta;
     if (ctas > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("embedding_rotated: grid exceeds the CUDA launch limit");
+    }
+    if (table.qtype == QType::T5_G128_FP16) {
+        t5_embedding(ids, table, signs, out, stream);
+        return;
     }
     if (table.qtype == QType::PTQ1_G128_FP16) {
         embed_gather_t2_hadamard_kernel<kWarpsPerCta, true>

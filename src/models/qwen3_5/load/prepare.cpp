@@ -40,6 +40,9 @@ bool stored_as(const artifact::Binder& binder, const artifact::ParameterReferenc
 
 bool keeps_permission(const artifact::Binder& binder, const artifact::ParameterReference& reference,
                       ops::LinearPolicy policy) {
+    if (ops::allows_a8(policy) && stored_as(binder, reference, QType::T5_G128_FP16)) {
+        return true; // Integer tensor cores; independent of FP8/FP4 architecture support.
+    }
     switch (policy) {
     case ops::LinearPolicy::AllowA4:
         return kNvfp4A4Built && stored_as(binder, reference, QType::NVFP4);
@@ -66,6 +69,12 @@ void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> ra
                                    std::to_string(weight.rank));
         }
         if (rank_tiers[weight.rank] == ops::DeviceTier::Blackwell) { continue; }
+        const auto& parts = weight.reference.binding.parts;
+        bool t5 = !parts.empty();
+        for (const auto& part : parts) {
+            t5 = t5 && bindings.binder.reader().geometry(part.object).format == QType::T5_G128_FP16;
+        }
+        if (t5) { continue; }
         for (WeightUse& use : weight.uses) {
             if (use.policy == ops::LinearPolicy::AllowA8 ||
                 use.policy == ops::LinearPolicy::AllowA4) {

@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/attn_input_proj.h"
@@ -53,7 +55,7 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
     const bool ternary = is_ternary(qtype);
     const bool t2_planes = !ternary ||
-        (weight.qtype == QType::T2_G128_FP16 ? no_high
+        (weight.qtype != QType::PTQ1_G128_FP16 ? no_high
          : (weight.qhigh != nullptr && weight.high_plane_bytes != 0));
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
@@ -357,6 +359,13 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
+    if (query_key_weight.qtype == QType::T5_G128_FP16) {
+        Tensor* first[]{&q, &k};
+        Tensor* second[]{&gate, &v};
+        detail::t5_project(x, query_key_weight, first, false, policy, workspace, stream);
+        detail::t5_project(x, gate_value_weight, second, false, policy, workspace, stream);
+        return true;
+    }
     if (workspace != nullptr && detail::sm70::covers(query_key_weight, cols) &&
         detail::sm70::covers(gate_value_weight, cols)) {
         sm70_split(x, query_key_weight, {&q, &k}, &gate_value_weight, {&gate, &v}, policy,

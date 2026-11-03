@@ -54,6 +54,8 @@ enum class QType : std::uint16_t {
     UINT16 = 32,
     // Native Prism PTQ1_0: 24 base-3 bytes + 2 tail bytes + FP16 scale per 128 weights.
     PTQ1_G128_FP16 = 33,
+    // Exact ternary reordering: two 13-byte T5 units plus FP16 scale per 128.
+    T5_G128_FP16 = 34,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
@@ -61,7 +63,8 @@ enum class QType : std::uint16_t {
 }
 
 [[nodiscard]] constexpr bool is_ternary(QType format) {
-    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16;
+    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16 ||
+           format == QType::T5_G128_FP16;
 }
 
 struct RowSplitFormat {
@@ -80,6 +83,7 @@ struct RowSplitFormat {
     case QType::Q8_G32_FP16: return {32, 32, 0, 2};
     case QType::T2_G128_FP16: return {128, 32, 0, 2};
     case QType::PTQ1_G128_FP16: return {128, 24, 2, 2};
+    case QType::T5_G128_FP16: return {128, 26, 0, 2};
     default: return {};
     }
 }

@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
@@ -153,7 +155,7 @@ void require_t2(const Weight& head, std::int32_t rows) {
         head.ndim == 2 && head.n == rows && head.k == detail::kLinearTopKHidden &&
         head.shape[0] == head.n && head.shape[1] == head.k && head.padded_shape[0] == head.n &&
         head.padded_shape[1] == head.k &&
-        (head.qtype == QType::T2_G128_FP16
+        (head.qtype != QType::PTQ1_G128_FP16
              ? head.qhigh == nullptr && head.high_plane_bytes == 0
              : head.qhigh != nullptr && head.high_plane_bytes != 0) &&
         aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
@@ -248,6 +250,11 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         else if (profile == HeadProfile::Fp8Full)
             detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
                                            stream);
+        else if (head.qtype == QType::T5_G128_FP16) {
+            Tensor* outputs[]{&logits};
+            detail::t5_project(x, head, outputs, false, LinearPolicy::AllowA8, &workspace, stream);
+            detail::linear_topk_logits_launch(logits, id_map != nullptr ? head.n : detail::kLinearTopKFullValidRows, id_map, scratch, stream);
+        }
         else if (profile == HeadProfile::T2)
             detail::linear_topk_t2_launch(
                 x, head, id_map != nullptr ? head.n : detail::kLinearTopKFullValidRows, id_map,
@@ -285,6 +292,9 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         (void)layout.alloc(DType::BF16, {head_rows, columns}, 256);
         (void)detail::allocate_linear_topk_workspace(layout, head_rows, columns, plan.rows,
                                                      plan.tile, plan.block_k);
+        if (qtype == QType::T5_G128_FP16) {
+            (void)layout.alloc_bytes(detail::t5_workspace_capacity_bytes(LinearPolicy::AllowA8, input_rows, columns));
+        }
         if (profile == HeadProfile::Gguf) {
             const detail::GgufShape shape{qtype, head_rows, input_rows};
             (void)layout.alloc_bytes(detail::gguf_project_workspace_bytes(

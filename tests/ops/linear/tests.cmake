@@ -101,3 +101,7 @@ target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
 ninfer_add_op_test(ninfer_linear_stq_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_linear_t5_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t5.cpp" LIBRARIES ninfer_ops)
+ninfer_stage_runtime_dlls(ninfer_linear_t5_test)

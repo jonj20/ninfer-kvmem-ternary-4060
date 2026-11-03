@@ -26,6 +26,7 @@ from .sources.logical import EncodedRows, LogicalSource, array_source
 
 T2 = "t2_g128_fp16"
 PTQ1 = "ptq1_g128_fp16"
+T5 = "t5_g128_fp16"
 
 # The DFlash2 adapter projections a ternary artifact encodes as Q4. The fused query/key/value
 # projection, which the context key/value Uses share, stays Q8 for its Q8-only three-output op.
@@ -426,7 +427,8 @@ def bonsai2_27b_ternary(model, recipe, sources, *, format=T2):
             recipe.assign(name, format=Q4, method=grouped_absmax)
     encoded, direct = text_sources(gguf, format=format)
     for name, source in encoded.items():
-        recipe.assign(name, format=format, method=import_encoded, source=source)
+        recipe.assign(name, format=format, method=import_encoded, source=source,
+                      activation_policy="AllowA8" if format == T5 else "A16Only")
     for name, source in direct.items():
         recipe.assign(
             name,
@@ -488,7 +490,13 @@ def bonsai2_27b_ptq1(model, recipe, sources):
     bonsai2_27b_ternary(model, recipe, sources, format=PTQ1)
 
 
-RECIPES = {"bonsai2_27b_ptq1": bonsai2_27b_ptq1,
+def bonsai2_27b_t5(model, recipe, sources):
+    """Exact Bonsai ternary weights in the JGamboa T5 layout with A8 execution."""
+    bonsai2_27b_ternary(model, recipe, sources, format=T5)
+
+
+RECIPES = {"bonsai2_27b_t5": bonsai2_27b_t5,
+           "bonsai2_27b_ptq1": bonsai2_27b_ptq1,
            "bonsai2_27b_ternary": bonsai2_27b_ternary,
            "bonsai2_27b_ternary_gguf_mtp": bonsai2_27b_ternary_gguf_mtp}
 

@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/layout.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
@@ -148,6 +150,10 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
         const detail::GgufShape shape{qtype, output_rows, input_rows};
         return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
     }
+    if (qtype == QType::T5_G128_FP16) {
+        if (output_rows <= 0) { throw std::invalid_argument("linear_add workspace: T5 rows must be positive"); }
+        return detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
+    }
     if (is_ternary(qtype)) {
         (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16Only,
                                               min_tokens, max_tokens);
@@ -249,6 +255,11 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
+    if (w.qtype == QType::T5_G128_FP16) {
+        Tensor* outputs[]{&residual_out};
+        detail::t5_project(x, w, outputs, true, policy, &ws, stream);
+        return;
+    }
     if (is_ternary(w.qtype)) {
         if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, t)) {
             detail::t2_a8_linear_add(x, w, residual_out, ws, stream);

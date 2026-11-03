@@ -87,6 +87,9 @@ def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
 def _pack_codes(
     codes: torch.Tensor, spec: QuantFormat
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.name == "t5_g128_fp16":
+        from .t5 import pack
+        return pack(codes), torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device)
     if spec.name == "ptq1_g128_fp16":
         from .ptq1 import pack
         return pack(codes)
@@ -136,7 +139,7 @@ def encode_row_split(
         raise ValueError("codes and scales must be on the same device")
     if spec.code_bias and bool(((codes < spec.qmin) | (codes > spec.qmax)).any()):
         raise ValueError("Q2 codes must be in [-1, 2]")
-    if (spec.code_bias or spec.name == "ptq1_g128_fp16") and not bool(torch.isfinite(scales).all()):
+    if (spec.code_bias or spec.name in ("ptq1_g128_fp16", "t5_g128_fp16")) and not bool(torch.isfinite(scales).all()):
         raise ValueError("grouped scales must be finite binary16 words")
     grouped = codes.reshape(-1, spec.group_size)
     base, high = _pack_codes(grouped, spec)
@@ -407,6 +410,9 @@ def _unpack_codes(
     scales = planes.scale.view(torch.float16).reshape(
         geometry.n, geometry.groups_per_row
     )
+    if spec.name == "t5_g128_fp16":
+        from .t5 import unpack
+        return scales, unpack(planes.base).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
     if spec.name == "ptq1_g128_fp16":
         from .ptq1 import unpack
         return scales, unpack(planes.base, planes.high).reshape(
@@ -564,7 +570,7 @@ def dequantize_row_split(
     geometry = row_split_geometry(spec, shape)
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
-    if dtype == torch.bfloat16 and spec.name != "ptq1_g128_fp16":
+    if dtype == torch.bfloat16 and spec.name not in ("ptq1_g128_fp16", "t5_g128_fp16"):
         byte_indices, shifts = _high_indices(
             target.type, target.index, spec.bits, spec.group_size
         )

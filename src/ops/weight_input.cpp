@@ -239,7 +239,9 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                          first.weight.qtype == second.weight.qtype;
     require(q4_q5 || ternary,
             "input projection: requires Q4/Q5 or two ternary parents of the same format");
-    return PairedProjectionWeights{first.weight, second.weight, LinearPolicy::A16Only,
+    const auto pair_policy = first.weight.qtype == QType::T5_G128_FP16
+                                 ? common_policy(inputs) : LinearPolicy::A16Only;
+    return PairedProjectionWeights{first.weight, second.weight, pair_policy,
                                    common_signs(inputs)};
 }
 
