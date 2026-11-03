@@ -24,11 +24,13 @@ std::string sse_error_event(const ApiError& error) {
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     OpenAIChatRequest request;
+    ContextCacheHints cache_hints;
     ModelRegistry::Lease lease;
     try {
         const RequestLimits limits       = request_limits(options_);
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
+        cache_hints                      = parse_chat_context_cache_hints(body);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
         lease                            = lease_model(request.model, req);
         request.model                    = lease.model();
@@ -53,7 +55,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepared = service->prepare(request.generation,
                                     request.stream ? GenerationConsumerMode::Streaming
                                                    : GenerationConsumerMode::Aggregate,
-                                    observation, [&req] { return client_disconnected(req); });
+                                    observation, [&req] { return client_disconnected(req); },
+                                    std::move(cache_hints));
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(

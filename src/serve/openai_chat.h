@@ -34,6 +34,10 @@ struct OpenAIChatRequest {
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
                                                 const RequestLimits& limits);
 
+// A named cache lineage authorizes replacing its suffix on history edits.
+// The key scopes candidates; native prefix and state validation still govern reuse.
+ContextCacheHints parse_chat_context_cache_hints(const RequestJson& body);
+
 struct OpenAIChatResponseIdentity {
     std::string id;
     std::string model;

@@ -1003,9 +1003,44 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     // message, so a tool-calling exchange (many requests, no new user turn between them) would
     // otherwise resume from the start of the exchange instead of from the previous request.
     output.generation.private_cache_boundary_at_prompt_end =
-        body.contains("prompt_cache_key") && body.at("prompt_cache_key").is_string() &&
-        !body.at("prompt_cache_key").get_ref<const std::string&>().empty();
+        parse_chat_context_cache_hints(body).session_key.has_value();
     return output;
+}
+
+ContextCacheHints parse_chat_context_cache_hints(const RequestJson& body) {
+    ContextCacheHints hints;
+    const auto key = [&](const RequestJson& value, const char* field, bool allow_empty) {
+        if (!value.is_string()) { bad_request(std::string(field) + " must be a string", field); }
+        auto result = value.get<std::string>();
+        if ((!allow_empty && result.empty()) || result.size() > ninfer::kMaximumContextCacheSessionKeyBytes) {
+            bad_request(std::string(field) + " must contain " + (allow_empty ? "0" : "1") +
+                            " to " + std::to_string(ninfer::kMaximumContextCacheSessionKeyBytes) + " bytes",
+                        field);
+        }
+        return result;
+    };
+    // OpenCode's openai-compatible adapter forwards the SDK spelling unchanged.
+    for (const char* field : {"prompt_cache_key", "promptCacheKey"}) {
+        if (!body.contains(field) || body.at(field).is_null()) { continue; }
+        auto value = key(body.at(field), field, true);
+        if (value.empty()) { continue; }
+        if (hints.session_key && *hints.session_key != value) {
+            bad_request("prompt_cache_key and promptCacheKey must agree", field);
+        }
+        hints.session_key = std::move(value);
+    }
+    if (body.contains("kvmem") && !body.at("kvmem").is_null()) {
+        const auto& extension = body.at("kvmem");
+        if (!extension.is_object()) { bad_request("kvmem must be an object", "kvmem"); }
+        if (extension.contains("conversation_id") && !extension.at("conversation_id").is_null()) {
+            hints.session_key = key(extension.at("conversation_id"), "kvmem.conversation_id", false);
+        }
+    }
+    if (hints.session_key) {
+        hints.retention = CacheRetentionHint::LiveSession;
+        hints.update_session_index = true;
+    }
+    return hints;
 }
 
 } // namespace ninfer::serve

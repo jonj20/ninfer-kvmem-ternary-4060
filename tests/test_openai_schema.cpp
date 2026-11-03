@@ -1745,6 +1745,62 @@ int test_prompt_cache_key_grants_long_anchor() {
     return failures;
 }
 
+int test_chat_cache_session_binding() {
+    int failures = 0;
+    Json body = base_request();
+    const auto anonymous = parse_chat_context_cache_hints(body);
+    failures += check(!anonymous.session_key && anonymous.retention == ninfer::CacheRetentionHint::Default,
+                      "unkeyed Chat preserves anonymous cache semantics");
+    body["prompt_cache_key"] = "opencode-session-a";
+    auto hints = parse_chat_context_cache_hints(body);
+    failures += check(hints.session_key == "opencode-session-a" &&
+                          hints.retention == ninfer::CacheRetentionHint::LiveSession && hints.update_session_index,
+                      "Chat cache key binds a retained, advancing session lineage");
+    body["store"] = false;
+    failures += check(parse_chat_context_cache_hints(body).session_key == hints.session_key,
+                      "Chat store:false does not disable cache identity");
+    body["prompt_cache_key"] = "opencode-session-b";
+    failures += check(parse_chat_context_cache_hints(body).session_key != hints.session_key,
+                      "different client keys remain distinct owners");
+    body["promptCacheKey"] = "opencode-session-b";
+    failures += check(parse_chat_context_cache_hints(body).session_key == "opencode-session-b",
+                      "matching SDK and wire cache keys are accepted");
+    body["promptCacheKey"] = "different-owner";
+    failures += check(api_error([&] { (void)parse(body); }).param == "promptCacheKey",
+                      "conflicting SDK and wire keys are rejected");
+    body.erase("prompt_cache_key");
+    body["promptCacheKey"] = "opencode-session-b";
+    failures += check(parse_chat_context_cache_hints(body).session_key == "opencode-session-b" &&
+                          parse(body).generation.private_cache_boundary_at_prompt_end,
+                      "OpenCode compatible SDK spelling binds the session and anchor");
+    body["promptCacheKey"] = 17;
+    failures += check(api_error([&] { (void)parse(body); }).param == "promptCacheKey",
+                      "malformed SDK cache key rejected");
+    body.erase("promptCacheKey");
+    body["prompt_cache_key"] = "opencode-session-b";
+    body["kvmem"] = Json{{"conversation_id", "explicit-owner"}};
+    failures += check(parse_chat_context_cache_hints(body).session_key == "explicit-owner",
+                      "explicit conversation identity takes precedence over cache affinity");
+    body.erase("prompt_cache_key");
+    failures += check(parse(body).generation.private_cache_boundary_at_prompt_end,
+                      "explicit owner gets an endpoint anchor without a cache key");
+    for (const auto& invalid : std::vector<Json>{"", 17, std::string(257, 'x')}) {
+        body["kvmem"]["conversation_id"] = invalid;
+        failures += check(api_error([&] { (void)parse(body); }).param == "kvmem.conversation_id",
+                          "invalid explicit owner rejected before execution");
+    }
+    body.erase("kvmem");
+    for (const auto& empty : std::vector<Json>{nullptr, ""}) {
+        body["prompt_cache_key"] = empty;
+        failures += check(!parse_chat_context_cache_hints(body).session_key,
+                          "empty or null cache key preserves anonymous behavior");
+    }
+    body["prompt_cache_key"] = 17;
+    failures += check(api_error([&] { (void)parse_chat_context_cache_hints(body); }).param == "prompt_cache_key",
+                      "non-string cache key rejected");
+    return failures;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
         const int failures = test_messages_and_media();
@@ -1753,6 +1809,7 @@ int main(int argc, char** argv) {
     }
     int failures = 0;
     failures += test_prompt_cache_key_grants_long_anchor();
+    failures += test_chat_cache_session_binding();
     failures += test_graft_extension();
     failures += test_thinking_budget_extension();
     failures += test_request_envelope_and_sampling();

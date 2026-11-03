@@ -991,11 +991,21 @@ Each capability rejection identifies the affected field and the guarantee NInfer
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
 text-only `audio` configuration, and `prediction` are accepted without changing Engine execution.
-Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
+Metadata, user/safety identifiers and service-tier hints are likewise advisory.
 `prompt_cache_key` (at most 256 bytes, beyond the API's 64 so that a gateway can namespace keys per
-user) is not a prefix identity, but a non-empty key, on Chat Completions as on Responses, makes the
-Engine keep a private long-anchor checkpoint at the end of the prompt, so an agent loop with no new
-user turn between requests resumes from its previous request. Unknown top-level fields are ignored.
+user) is not a prefix identity. A non-empty Chat Completions key binds a live cache session,
+advances its session index and keeps a private long anchor at the prompt end, including when
+`store:false`. This matches the client-managed Responses path (`store:false`, no previous response).
+Chat also accepts `promptCacheKey`, as emitted by OpenCode's openai-compatible SDK adapter.
+If both spellings have non-empty values they must agree; a conflict is a request error.
+The optional `kvmem.conversation_id` (1–256 bytes) takes precedence over `prompt_cache_key`.
+Keep the identity stable across append, regenerate and history rollback; use separate identities
+for independent conversations. Shared keys share one cache lineage: editing an earlier prefix
+can discard its later checkpoints, so independently retained branches require distinct owners.
+Every restore still validates the token/media prefix and native KV/state; a matching key alone
+does not make incompatible inputs reusable. Missing, null or empty cache keys remain anonymous.
+Ordinary tool continuation retains its append and resident-only Pressure behavior.
+Unknown top-level fields are ignored.
 
 A string `name` on any message is accepted and ignored, as the optional OpenAI participant label
 that agent frameworks use to tag injected messages and that some clients mirror onto tool results.
