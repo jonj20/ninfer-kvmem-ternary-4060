@@ -315,11 +315,12 @@ bool tile_rows_fast(std::int32_t output_rows, std::int32_t columns) {
 template <std::int32_t kCols, class Epilogue>
 void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaStream_t stream) {
     if (w.qtype == QType::PTQ1_G128_FP16) {
-        // PTQ1_0's tile: its own schedule (64 rows, a single-buffered int8 plane), and the raw high
+        // PTQ1_0's tile: its own schedule (128 rows, a single-buffered int8 plane), and the raw high
         // plane handed to the kernel -- the only argument the T2 instantiation does not take.
         using C                      = T2PrefillI8Ptq1;
         const std::int32_t columns   = tile_columns(x.tokens);
-        const bool rows_fast         = tile_rows_fast(w.n, columns);
+        const std::string key = "ptq1_i8_tile/" + std::to_string(w.n) + "x" + std::to_string(w.k);
+        const bool rows_fast = device_route_schedule(key, x.tokens) == "rows";
         const unsigned column_blocks = static_cast<unsigned>(columns / C::kColumns);
         const unsigned row_blocks    = static_cast<unsigned>(w.n / C::kRows);
         const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
@@ -351,7 +352,7 @@ void project(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaS
     if (!x.ptq1_tile && route(x.tokens) == Route::SmallT) {
         return small_route<Epilogue>(x, {&w, epilogue}, nullptr, stream);
     }
-    if (prefill_tile()) {
+    if (x.ptq1_tile || prefill_tile()) {
         by_width(w.k, [&]<std::int32_t kCols>() { tile_gemm<kCols>(x, w, epilogue, stream); });
         return;
     }
@@ -417,17 +418,17 @@ bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
     const bool ptq1 = w.qtype == QType::PTQ1_G128_FP16;
     const bool admitted = ptq1 ? w.group == 128 && w.group_size == 128 &&
                                      w.scale_dtype == DType::FP16 &&
-                                     prefill_tile() && tokens >= kPtq1TileMinTokens &&
+                                     tokens >= kPtq1TileMinTokens &&
                                      w.qhigh != nullptr && w.high_plane_bytes != 0
                               : w.qtype == QType::T2_G128_FP16 && route(tokens) != Route::None;
     return admitted && w.layout == QuantLayout::RowSplit && w.qdata != nullptr &&
            w.scales != nullptr && w.padded_shape[1] == w.k &&
-           t2_a8_shape_supported(w.n, w.k);
+           (ptq1 ? ptq1_a8_shape_supported(w.n, w.k) : t2_a8_shape_supported(w.n, w.k));
 }
 
 std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens, bool ptq1_tile) {
     if (ptq1_tile) {
-        if (!prefill_tile() || max_tokens < kPtq1TileMinTokens) { return 0; }
+        if (max_tokens < kPtq1TileMinTokens) { return 0; }
         WorkspaceLayoutBuilder layout;
         (void)t2_a8_layout_activations(layout, input_rows, max_tokens, true);
         return layout.peak_bytes(1);
@@ -482,14 +483,15 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
 
 std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t max_tokens, bool ptq1_tile) {
-    if (!t2_a8_admits(policy) || !t2_a8_shape_supported(output_rows, input_rows)) { return 0; }
+    if (!t2_a8_admits(policy) || !(ptq1_tile ? ptq1_a8_shape_supported(output_rows, input_rows)
+                                           : t2_a8_shape_supported(output_rows, input_rows))) { return 0; }
     return t2_a8_activation_bytes(input_rows, max_tokens, ptq1_tile);
 }
 
 bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input_rows,
                               std::int32_t tokens, bool ptq1_tile) {
     if (ptq1_tile) {
-        if (!prefill_tile() || tokens < kPtq1TileMinTokens) { return false; }
+        if (tokens < kPtq1TileMinTokens) { return false; }
         const auto columns = static_cast<std::size_t>(tile_columns(tokens));
         (void)layout.alloc_bytes(columns * input_rows);
         (void)layout.alloc_bytes(columns * (input_rows / T2PrefillI8::kGroupK) * sizeof(__half));
@@ -514,8 +516,10 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t tokens     = x.ne[1];
     if (x.dtype != DType::BF16 || x.data == nullptr || !x.is_contiguous() || x.ne[2] != 1 ||
-        x.ne[3] != 1 || (ptq1_tile ? !prefill_tile() || tokens < kPtq1TileMinTokens
-                                                : route(tokens) == Route::None) || !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
+        x.ne[3] != 1 || (ptq1_tile ? tokens < kPtq1TileMinTokens
+                                                : route(tokens) == Route::None) ||
+        !(ptq1_tile ? ptq1_a8_shape_supported(T2PrefillI8Ptq1::kRows, input_rows)
+                    : t2_a8_shape_supported(T2PrefillI8::kRows, input_rows))) {
         throw std::invalid_argument("t2 a8: x must be a contiguous BF16 [K, T] of a registered K");
     }
     if (!ptq1_tile && route(tokens) == Route::SmallT) {
@@ -536,7 +540,7 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         CUDA_CHECK(cudaGetLastError());
         return {code_data, scale_data, tokens, input_rows, ptq1_tile};
     }
-    if (prefill_tile()) {
+    if (ptq1_tile || prefill_tile()) {
         using C                    = T2PrefillI8;
         const std::int32_t columns = tile_columns(tokens);
         const std::size_t count    = static_cast<std::size_t>(columns);

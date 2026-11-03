@@ -1,4 +1,5 @@
 #include "ops/linear/t2/t2_dispatch.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -108,16 +109,7 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
         throw std::invalid_argument("t2 linear: requires a row-split weight");
     }
     if (w.qtype == QType::PTQ1_G128_FP16) {
-        (void)select_t2_launch(w.n, w.k, x.ne[1], policy);
-        if (w.qhigh == nullptr || w.high_plane_bytes == 0 || w.group != 128 ||
-            w.scale_dtype != DType::FP16 || w.padded_shape[1] != w.k) {
-            throw std::invalid_argument("PTQ1 linear: invalid planes or group geometry");
-        }
-        if (x.ne[1] <= 16) {
-            launch_t2_small_t_v2_ptq1(x, w, out, stream);
-        } else {
-            launch_t2_ptq1_wide_t(x, w, out, out.ne[0], stream);
-        }
+        ptq1_dispatch(x, w, out, policy, stream);
         return;
     }
     const T2Launch launch = out.dtype == DType::FP32

@@ -31,6 +31,12 @@ public:
     // rather than per format, because a registered route exists only for the profiles a kernel was
     // written for; any other projection keeps what its Use permits.
     void integer_route(LinearParameters& p, QType format, std::int32_t n, std::int32_t k) const {
+        if (model_.options().prefill_a8 && format == QType::T2_G128_FP16 &&
+            p.weight.qtype == QType::PTQ1_G128_FP16 && p.weight.n == n && p.weight.k == k &&
+            p.policy == ops::LinearPolicy::A16Only) {
+            p.policy = ops::LinearPolicy::AllowA8Int;
+            return;
+        }
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
         if (p.policy == ops::LinearPolicy::A16Only && (p.weight.qtype == format || (is_ternary(format) && is_ternary(p.weight.qtype))) &&
@@ -51,6 +57,18 @@ public:
     void integer_route_pair(ops::ProjectionWeights& projection, QType first_format,
                             std::int32_t first_rows, QType second_format, std::int32_t second_rows,
                             std::int32_t input_rows) const {
+        if (model_.options().prefill_a8 && first_format == QType::T2_G128_FP16 &&
+            second_format == QType::T2_G128_FP16) {
+            auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);
+            if (pair != nullptr && pair->policy == ops::LinearPolicy::A16Only &&
+                pair->first.qtype == QType::PTQ1_G128_FP16 &&
+                pair->second.qtype == QType::PTQ1_G128_FP16 &&
+                pair->first.n == first_rows && pair->second.n == second_rows &&
+                pair->first.k == input_rows && pair->second.k == input_rows) {
+                pair->policy = ops::LinearPolicy::AllowA8Int;
+                return;
+            }
+        }
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
         auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);

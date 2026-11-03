@@ -129,13 +129,17 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     case QType::T2_G128_FP16:
         group = 128;
         break;
+    case QType::PTQ1_G128_FP16:
+        group = 128;
+        high_bytes = 2;
+        break;
     default:
         throw std::invalid_argument("calibration: unsupported synthetic weight format");
     }
     const auto align    = [](std::uint64_t value) { return (value + 255) / 256 * 256; };
     const std::uint64_t groups =
         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k / group);
-    const std::uint64_t low_bytes    = groups * 32;
+    const std::uint64_t low_bytes    = groups * (qtype == QType::PTQ1_G128_FP16 ? 24 : 32);
     const std::uint64_t high_total   = groups * static_cast<std::uint64_t>(high_bytes);
     const std::uint64_t high_offset  = align(low_bytes);
     const std::uint64_t scale_offset = high_offset + align(high_total);
@@ -788,6 +792,40 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         auto bands = sweep(family, timer, options);
         if (!bands.empty()) {
             profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
+}
+
+// PTQ1's compact planes and 128-row kernel have their own measurements. A T2
+// profile cannot steer this family, even when both artifacts describe Bonsai.
+void calibrate_ptq1(ops::DeviceRouteProfile& profile, Timer& timer,
+                    const CalibrationOptions& options) {
+    constexpr std::int32_t max_tokens = 512;
+    for (const auto [n, k] : {std::pair{4096, 5120}, std::pair{12288, 5120},
+                             std::pair{7168, 5120}, std::pair{5120, 6144},
+                             std::pair{34816, 5120}, std::pair{5120, 17408},
+                             std::pair{248320, 5120}}) {
+        const std::string key = "ptq1_i8_tile/" + std::to_string(n) + "x" + std::to_string(k);
+        if (!options.only.empty() && key.rfind(options.only, 0) != 0) { continue; }
+        auto weight = row_split_weight(QType::PTQ1_G128_FP16, n, k);
+        auto input = bf16_buffer(static_cast<std::size_t>(k) * max_tokens);
+        auto output = bf16_buffer(static_cast<std::size_t>(n) * max_tokens);
+        WorkspaceArena workspace(ops::detail::t2_a8_workspace_bytes(
+            n, k, ops::LinearPolicy::AllowA8Int, max_tokens, true));
+        const Family family{key, {33, 64, 65, 128, 256, 512},
+            [&](std::int32_t cols, cudaStream_t stream) {
+                auto scope = workspace.scope();
+                Tensor x(input.p, DType::BF16, {k, cols});
+                Tensor y(output.p, DType::BF16, {n, cols});
+                ops::detail::t2_a8_linear(x, weight.weight, y, workspace, stream);
+            },
+            [&](std::int32_t cols) {
+                return std::pair<const void*, std::size_t>{output.p, static_cast<std::size_t>(n) * cols};
+            }, {}};
+        auto bands = sweep(family, timer, options);
+        if (!bands.empty()) {
+            profile.routes[key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
     }
@@ -1540,6 +1578,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     const bool attention   = projections && options.attention && !gguf_only;
     if (projections && options.ternary && !gguf_only) {
         calibrate_ternary(profile, timer, options);
+        calibrate_ptq1(profile, timer, options);
     }
     if (options.groupwise) {
         if (projections && !gguf_only) {

@@ -46,6 +46,10 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
             add(std::string("t2_i8_small/") + shape, t2_small);
         }
         add("t2_i8_route", {"small", "tile"});
+        for (const char* shape : {"4096x5120", "12288x5120", "7168x5120", "5120x6144",
+                                  "34816x5120", "5120x17408", "248320x5120"}) {
+            add(std::string("ptq1_i8_tile/") + shape, {"rows", "cols"});
+        }
 
         // Qwen3.6/3.8 groupwise-int fused projections, and the switch of each onto the unified
         // templates.

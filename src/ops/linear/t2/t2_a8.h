@@ -12,6 +12,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -22,7 +23,6 @@
 namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kT2A8MinTokens = 64;
-inline constexpr std::int32_t kPtq1TileMinTokens = 33;
 // The widths the small-T kernel takes by default; NINFER_T2_I8_SMALL=off|lo,hi overrides them.
 // Against the 128x64 prefill tile the small-T launches stop paying from 96 columns on the RTX 3090
 // (a GDN layer's four projections: 790 vs 918 us at 96, 1091 vs 1840 us at 192; even at 64).

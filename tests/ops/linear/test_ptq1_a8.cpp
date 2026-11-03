@@ -1,4 +1,5 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
 #include <array>
 #include <exception>
@@ -18,9 +19,7 @@ constexpr Invocation a8(std::int32_t t) {
     return {t, CallForm::Policy, ops::LinearPolicy::AllowA8Int};
 }
 
-// The ternary integer-activation routes through one policy: the small-T kernel (1..192 tokens, in
-// launches of one, two and four column tiles) and above it the prefill GEMM, which pads T to its
-// cheapest tile width inside.
+// PTQ1 keeps A16 below 33 tokens and uses its own padded INT8 tile above that boundary.
 int ptq1_a8_conformance() {
     int failures = 0;
 
@@ -56,6 +55,12 @@ int main() {
     }
 
     try {
+        if (!ops::detail::ptq1_a8_shape_supported(128, 5120) ||
+            ops::detail::ptq1_a8_shape_supported(64, 5120) ||
+            ops::detail::ptq1_a8_shape_supported(129, 5120) ||
+            ops::detail::ptq1_a8_shape_supported(128, 4096)) {
+            throw std::runtime_error("PTQ1 tile shape admission mismatch");
+        }
         const int failures = ptq1_a8_conformance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " PTQ1_A8 Linear\n";
         return failures == 0 ? 0 : 1;
