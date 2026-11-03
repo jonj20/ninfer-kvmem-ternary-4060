@@ -363,6 +363,98 @@ void native_uses() {
         "combined coverage hid an incorrect gate/up boundary");
 }
 
+void resident_vision_stage_sizing() {
+    ModelFixture fixture;
+    auto& config = fixture.file.root["components"]["text"]["config"];
+    config["num_hidden_layers"] = 8;
+    config["layer_types"] = std::vector<std::string>(8, "full_attention");
+    // Sizing only: reuse the represented layer geometry on the single sizing rank.
+    const auto bindings = fixture.file.root["bindings"];
+    const auto uses = fixture.file.root["uses"];
+    for (unsigned layer = 1; layer < 8; ++layer) {
+        for (const auto& [name, binding] : bindings.items()) {
+            if (!name.starts_with("text/layers/0/")) { continue; }
+            auto next = name;
+            next.replace(12, 1, std::to_string(layer));
+            fixture.file.root["bindings"][next] = binding;
+        }
+        for (auto use : uses) {
+            auto parameter = use["parameter"].get<std::string>();
+            if (!parameter.starts_with("text/layers/0/")) { continue; }
+            auto input = use["input"].get<std::string>();
+            parameter.replace(12, 1, std::to_string(layer));
+            input.replace(12, 1, std::to_string(layer));
+            use["parameter"] = parameter;
+            use["input"] = input;
+            fixture.file.root["uses"].push_back(use);
+        }
+    }
+    fixture.file.root["components"]["vision"] = {
+        {"target", "text"},
+        {"config", {{"model_type", "qwen3_5_vision"}, {"depth", 1}, {"hidden_size", 128},
+                    {"intermediate_size", 256}, {"num_heads", 4}, {"patch_size", 2},
+                    {"temporal_patch_size", 1}, {"spatial_merge_size", 1},
+                    {"num_position_embeddings", 4096}}}};
+    std::uint64_t vision_bytes = 0;
+    const auto parameter = [&](const std::string& name, std::vector<std::uint64_t> shape,
+                               const std::string& input = "") {
+        std::uint64_t bytes = 2; // Independent BF16 byte count, no alignment or binding traversal.
+        for (auto extent : shape) { bytes *= extent; }
+        vision_bytes += bytes;
+        fixture.parameter("vision/" + name, std::move(shape), input);
+    };
+    parameter("patch_embedding", {128, 12}, "vision/patch_input");
+    parameter("patch_embedding_bias", {128});
+    parameter("position_embedding", {4096, 128});
+    const std::string p = "layers/0/";
+    for (const auto* norm : {"norm1", "norm2"}) {
+        parameter(p + norm + "_weight", {128});
+        parameter(p + norm + "_bias", {128});
+    }
+    for (const auto* role : {"query", "key", "value", "output"}) {
+        parameter(p + "attention/" + role, {128, 128},
+                  std::string("vision/layers/0/attention_") +
+                      (std::string(role) == "output" ? "output" : "input"));
+        parameter(p + "attention/" + role + "_bias", {128});
+    }
+    parameter(p + "mlp/fc1", {256, 128}, "vision/layers/0/mlp_input");
+    parameter(p + "mlp/fc1_bias", {256});
+    parameter(p + "mlp/fc2", {128, 256}, "vision/layers/0/mlp_activation");
+    parameter(p + "mlp/fc2_bias", {128});
+    parameter("merger/norm_weight", {128});
+    parameter("merger/norm_bias", {128});
+    parameter("merger/fc1", {128, 128}, "vision/merger/input");
+    parameter("merger/fc1_bias", {128});
+    parameter("merger/fc2", {128, 128}, "vision/merger/activation");
+    parameter("merger/fc2_bias", {128});
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const qwen::StageSizing sizing{.kv_storage = KvCacheStorage::BFloat16, .state_slots = 2};
+    LoadOptions resident{.vision = true, .ranks = 2};
+    auto cpu = resident;
+    cpu.vision_residency = VisionResidency::Cpu;
+    auto disabled = resident;
+    disabled.vision = false;
+    bool changed_split = false;
+    for (std::uint64_t spare : {2ULL << 20, 4ULL << 20, 8ULL << 20}) {
+        const std::array<std::uint64_t, 2> budget{(2560ULL << 20) + spare,
+                                                  (1536ULL << 20) + spare};
+        const auto text_split = qwen::default_stage_layers(reader, disabled, sizing, budget);
+        require(qwen::default_stage_layers(reader, cpu, sizing, budget) == text_split,
+                "CPU Vision was charged as resident device weights");
+        const auto split = qwen::default_stage_layers(reader, resident, sizing, budget);
+        require(split.size() == 2 && split[0] > 0 && split[1] > 0 && split[0] + split[1] == 8,
+                "resident Vision automatic split does not cover all layers");
+        changed_split |= split != text_split;
+        auto compensated = budget;
+        compensated[0] += vision_bytes;
+        require(qwen::default_stage_layers(reader, resident, sizing, compensated) == text_split,
+                "resident Vision must be charged exactly once, on the head device");
+    }
+    require(changed_split, "fixture did not exercise the resident Vision memory cost");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -396,6 +488,7 @@ int main() {
         logical_data_and_instances();
         shared_stage_auxiliaries();
         native_uses();
+        resident_vision_stage_sizing();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
