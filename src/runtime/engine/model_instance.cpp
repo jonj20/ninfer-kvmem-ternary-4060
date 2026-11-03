@@ -22,6 +22,7 @@
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/graph_probe.h"
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
@@ -939,8 +940,43 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
         }
     }
-    const EngineOptions planning_options =
+    EngineOptions planning_options =
         artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
+    // Calibrate dense single-device execution uniformly, including MTP and DFlash2.
+    // Expert streaming, grafts and suspend need separate qualification of
+    // temporary Program ownership. Do not reopen production disk stores in a probe.
+    if (options.use_cuda_graph && options.cuda_graph_allowance_bytes == 0 &&
+        device.size() == 1 &&
+        instance->model->expert_sources().layers.empty() && options.grafts.empty() &&
+        !options.suspend.enabled && options.kvmem.disk_bytes == 0 &&
+        options.context_cache.disk_kv_path.empty()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "CUDA graph probe starting");
+        const auto result = ninfer::detail::calibrate_graph_allowance([&] {
+            return models::qwen3_5::measure_cuda_graph_bytes(
+                instance->parameters, device, planning_options);
+        });
+        if (result.allowance) {
+            options.cuda_graph_allowance_bytes = *result.allowance;
+            planning_options.cuda_graph_allowance_bytes = *result.allowance;
+            if (result.second) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                    "CUDA graph probe first %.1f MiB, second %.1f MiB; planning allowance %.1f MiB",
+                    static_cast<double>(*result.first) / 1048576.0,
+                    static_cast<double>(*result.second) / 1048576.0,
+                    static_cast<double>(*result.allowance) / 1048576.0);
+            } else {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                    "CUDA graph probe measured %.1f MiB; planning allowance %.1f MiB (second %s)",
+                    static_cast<double>(*result.first) / 1048576.0,
+                    static_cast<double>(*result.allowance) / 1048576.0,
+                    *result.first > ninfer::detail::kGraphProbeFloor ? "unavailable" : "not needed");
+            }
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "CUDA graph probe unavailable; retaining static allowance");
+        }
+    }
     const auto curve = models::qwen3_5::make_sequence_planner(
         instance->parameters, device, planning_options, graft_main_pages).capacity_curve();
     std::vector<std::size_t> free_by_rank =

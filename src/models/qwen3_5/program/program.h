@@ -1464,6 +1464,11 @@ struct RuntimeContractAccess {
                                                     const EngineOptions& options,
                                                     std::uint32_t resident_main_pages = 0);
 
+// A temporary Program captures the configured graphs, then releases its arenas.
+// Allocation pressure returns no reading; execution errors must propagate.
+[[nodiscard]] std::optional<std::size_t> measure_cuda_graph_bytes(
+    const execution::Parameters&, DeviceContext&, const EngineOptions&);
+
 // Overlay Vision residency: sizes one encode window for these options, checks that the evictable
 // weight tail covers it and captures the weight pool's window mirror. Call once after load and
 // before sequence planning, so the pinned mirror is already charged when KV capacity resolves.

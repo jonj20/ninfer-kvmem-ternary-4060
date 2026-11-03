@@ -227,6 +227,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);
 
+[[nodiscard]] std::unique_ptr<SequencePlanImpl>
+make_graph_probe_plan(const execution::Parameters&, DeviceContext&, const EngineOptions&);
+
 // Resolves the single Host RAM budget into the plan's context-cache shape: one StateImage per
 // position it retains and Host KV for everything else. StateImages are the fixed per-position cost
 // of a checkpoint and Host KV the per-token cost, so the budget first covers the inventory the

@@ -3,6 +3,8 @@
 #include "models/qwen3_5/program/graft_injection.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/resident_memory.h"
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -833,6 +835,34 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       startup_observer, std::move(experts));
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
+
+std::optional<std::size_t> measure_cuda_graph_bytes(
+    const execution::Parameters& parameters, DeviceContext& device, const EngineOptions& options) {
+    if (!options.use_cuda_graph) { return std::nullopt; }
+    auto probe_options = options;
+    probe_options.cuda_graph_allowance_bytes = 0;
+    try {
+        auto plan = detail::make_graph_probe_plan(parameters, device, probe_options);
+        auto probe = create_program(parameters, SequencePlan(std::move(plan)), device,
+                                    StartupObserver{});
+        const auto measured = probe->memory_summary().cuda_graph_measured_bytes;
+        probe.reset();
+        device.synchronize();
+        return measured;
+    } catch (const CudaError& error) {
+        if (error.status() != cudaErrorMemoryAllocation) { throw; }
+        const auto pending = cudaGetLastError();
+        if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
+            CUDA_CHECK(pending);
+        }
+    } catch (const core::VramCapacityError&) {
+        // The real planner retains the static allowance when the probe cannot fit.
+    } catch (const std::bad_alloc&) {
+        // Includes Host allocation pressure; all temporary owners have unwound.
+    }
+    device.synchronize();
+    return std::nullopt;
 }
 
 void Program::inject_graft(const PromptGraft& graft) {

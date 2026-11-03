@@ -26,3 +26,11 @@ https://github.com/melis2023/ninfer-kvmem-actkv
 Changes here: preserved current NVFP4/INT8 dispatch and Blackwell scale handling;
 priced workspace for all admitted GGUF blocks; added native shape/conv oracles,
 exact artifact import checks and a bounded weight-only NVFP4 conversion method.
+
+CUDA Graph startup calibration
+==============================
+Adapted from melis2023/ninfer-kvmem-actkv, revision 664cb6daa8cba30dfe39b0d10113a72b20587853,
+including b4d8096 (probe) and 591537b (repeat above-floor measurement).
+Contributor: melis2023 <zhuangisme@gmail.com>.
+Changes here: automatic calibration for dense single-device MTP/DFlash2/ordinary execution, typed
+recoverable allocation fallback, fatal CUDA execution errors preserved, and regression tests.

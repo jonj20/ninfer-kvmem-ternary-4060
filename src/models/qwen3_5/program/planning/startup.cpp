@@ -1674,6 +1674,20 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 }
 
 std::unique_ptr<SequencePlanImpl>
+make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
+                      const EngineOptions& options) {
+    auto planner = make_sequence_planner_impl(parameters, device, options, 0);
+    auto inputs = planner->inputs;
+    // Match the window used by prepare_graphs(), including the n-gram graph family.
+    // This is a full physical window, not one dummy page: graph preparation runs kernels.
+    if (inputs.kvmem_window_tokens && inputs.kvmem_window_tokens < inputs.capacity) {
+        inputs.capacity = inputs.kvmem_window_tokens;
+    }
+    const auto pages = std::max(page_count(inputs.capacity), inputs.max_concurrency);
+    return build_sequence_candidate(inputs, pages);
+}
+
+std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups) {
     if (planner == nullptr || planner->minimum == nullptr) {
