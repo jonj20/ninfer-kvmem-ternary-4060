@@ -10,7 +10,7 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                         &kNvfp4N5120K6144, &kNvfp4N5120K17408, &kNvfp4N8192K4096};
+                         &kNvfp4N5120K6144, &kNvfp4N5120K17408, &kNvfp4DFlash2Feature, &kNvfp4DFlash2FeatureT, &kNvfp4DFlash2Qkv, &kNvfp4DFlash2AttnOut, &kNvfp4DFlash2ConvProj, &kNvfp4DFlash2Selector, &kNvfp4N8192K4096};
 
 const Nvfp4LinearShape* find_shape(std::int32_t n, std::int32_t k) {
     for (const auto* shape : kShapes)

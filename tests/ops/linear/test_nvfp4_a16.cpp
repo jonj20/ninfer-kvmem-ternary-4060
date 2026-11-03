@@ -42,6 +42,16 @@ int run_nvfp4_a16() {
                         std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
+    // DFlash2 feature, fused QKV, attention output, convolution projection and selector.
+    const std::vector<Invocation> draft_calls{{1},{2},{3},{5},{6},{16},{32},{33},
+        {6,CallForm::Policy,ops::LinearPolicy::A16Only,true}};
+    for (auto [n,k] : {std::pair{25600,5120}, std::pair{5120,25600},
+                       std::pair{6144,5120}, std::pair{5120,4096},
+                       std::pair{1280,5120}, std::pair{256,5120}}) {
+        failures += run_shape("NVFP4_DFLASH2",ActivationCompute::A16,make_nvfp4_weight,
+            {n,k,739U,Comparison::SampledRows,true,draft_calls});
+        failures += verify_workspace_envelopes(QType::NVFP4,n,k);
+    }
     return failures;
 }
 

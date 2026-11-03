@@ -1,4 +1,6 @@
 target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/dflash2.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/dflash2_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_int8_grouped.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_int8_fused_norm_quant.cu"

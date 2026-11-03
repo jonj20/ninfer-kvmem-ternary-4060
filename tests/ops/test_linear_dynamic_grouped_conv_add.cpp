@@ -347,7 +347,8 @@ int main() {
             run_profile(17408, QType::Q5_G64_FP16) +
             run_profile(4096,QType::GGUF_Q3_K) + run_profile(17408,QType::GGUF_Q3_K) +
             run_profile(4096,QType::GGUF_Q4_K) + run_profile(17408,QType::GGUF_Q4_K) +
-            run_profile(17408,QType::GGUF_Q6_K);
+            run_profile(17408,QType::GGUF_Q6_K) +
+            run_profile(4096,QType::NVFP4) + run_profile(17408,QType::NVFP4);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

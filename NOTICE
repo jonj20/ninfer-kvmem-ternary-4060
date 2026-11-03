@@ -17,3 +17,12 @@ Adapted from JGamboa/ninfer-4090-windows, commit e905787f067de89ef6ef28c52d65a2c
 https://github.com/JGamboa/ninfer-4090-windows (Apache License 2.0).
 Changes: RowSplit artifact integration, explicit existing Hadamard producer boundary,
 strided split-parent destinations, SM120 qualification, and independent codec/oracle tests.
+
+DFlash2 GGUF and NVFP4 draft projections
+======================================
+Adapted from melis2023/ninfer-kvmem-actkv, revision 664cb6daa8cba30dfe39b0d10113a72b20587853.
+Contributor: melis2023 <zhuangisme@gmail.com>.
+https://github.com/melis2023/ninfer-kvmem-actkv
+Changes here: preserved current NVFP4/INT8 dispatch and Blackwell scale handling;
+priced workspace for all admitted GGUF blocks; added native shape/conv oracles,
+exact artifact import checks and a bounded weight-only NVFP4 conversion method.

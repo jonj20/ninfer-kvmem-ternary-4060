@@ -42,4 +42,12 @@ extern const Nvfp4LinearShape kNvfp4N8192K4096;
 constexpr bool nvfp4_shape_tile_aligned(std::int32_t n, std::int32_t k) {
     return n > 0 && k > 0 && n % 128 == 0 && k % 64 == 0;
 }
+
+// DFlash2 weight-only A16 projections (melis2023).
+extern const Nvfp4LinearShape kNvfp4DFlash2Feature;
+extern const Nvfp4LinearShape kNvfp4DFlash2FeatureT;
+extern const Nvfp4LinearShape kNvfp4DFlash2Qkv;
+extern const Nvfp4LinearShape kNvfp4DFlash2AttnOut;
+extern const Nvfp4LinearShape kNvfp4DFlash2ConvProj;
+extern const Nvfp4LinearShape kNvfp4DFlash2Selector;
 } // namespace ninfer::ops::detail::unified

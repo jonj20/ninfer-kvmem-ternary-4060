@@ -11,7 +11,7 @@
 namespace ninfer::ops::detail {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                         &kNvfp4N5120K6144, &kNvfp4N5120K17408};
+                         &kNvfp4N5120K6144, &kNvfp4N5120K17408, &kNvfp4DFlash2Feature, &kNvfp4DFlash2FeatureT, &kNvfp4DFlash2Qkv, &kNvfp4DFlash2AttnOut, &kNvfp4DFlash2ConvProj, &kNvfp4DFlash2Selector};
 
 LinearRouteTable route_table(LinearPolicy policy, std::int32_t width) {
     return linear_route_table(allows_nvfp4_int8(policy) ? LinearRouteFamily::Nvfp4Int8

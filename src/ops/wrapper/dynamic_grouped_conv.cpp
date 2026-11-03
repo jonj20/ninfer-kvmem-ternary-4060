@@ -3,6 +3,7 @@
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <array>
 #include <cmath>
@@ -228,6 +229,15 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
                    "finish_delta");
     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
+    if (projection_weight.qtype == QType::NVFP4) {
+        if (projection_weight.n != kHidden || projection_weight.k != input_rows)
+            throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
+        (void)detail::validate_nvfp4_weight(projection_weight, kAddOp);
+        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
+        detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
+            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
+        return;
+    }
     if (materialized_projection(projection_weight, input_rows)) {
         require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
                                   workspace);
