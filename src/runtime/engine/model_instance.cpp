@@ -353,9 +353,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-        // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
+        // Layer stages return target features to the rank-0 drafter. The pinned
+        // tensor-parallel executor does not implement these feature taps.
         const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
-            options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
+            options.max_concurrency <= kMaximumConcurrency && !options.tensor_parallel &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
             ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
@@ -396,7 +397,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
             throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
-                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
                 "and disabled prefix cache");
         }
     }

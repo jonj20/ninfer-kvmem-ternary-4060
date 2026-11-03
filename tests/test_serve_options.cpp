@@ -407,7 +407,7 @@ int run_serve_option_tests() {
         }
     }
     for (const auto& extra : std::vector<std::vector<std::string>>{
-             {"--max-concurrency", "9"}, {"--devices", "0,1"},
+             {"--max-concurrency", "9"}, {"--devices", "0,1", "--tensor-parallel"},
              {"--draft-tokens", "0"}, {"--draft-tokens", "16"}}) {
         auto args = memory_args;
         args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
@@ -415,6 +415,19 @@ int run_serve_option_tests() {
         bool rejected = false;
         try { (void)parse(args); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "unsupported KVMem DFlash2 configuration accepted");
+    }
+    for (const auto lanes : {1U, 2U, 8U}) {
+        auto args = memory_args;
+        args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", "5",
+            "--devices", "1,0", "--stage-layers", "40,24",
+            "--max-concurrency", std::to_string(lanes)});
+        const auto parsed = make_engine_options(parse(args));
+        failures += check(parsed.devices == std::vector<int>({1, 0}) &&
+            parsed.stage_layers == std::vector<std::uint32_t>({40, 24}) &&
+            parsed.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+            parsed.speculative.draft_tokens == 5 && !parsed.tensor_parallel &&
+            parsed.kv_capacity.explicit_tokens == lanes * 512,
+            "KVMem DFlash2 layer pipeline lost device order, split, drafts or logical capacity");
     }
     for (const auto& extra : std::vector<std::vector<std::string>>{
              {"--spec", "mtp", "--draft-tokens", "0"},

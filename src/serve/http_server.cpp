@@ -1113,7 +1113,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
     spec.ngram_draft_tokens = options.speculative.ngram_draft_tokens;
     props["speculative"] = kvmem::speculative_json<nlohmann::json>(spec,
         {{kvmem::SpeculativeAlgorithm::Mtp, 15, true, true, 8, 8, "embedded"},
-         {kvmem::SpeculativeAlgorithm::DFlash2, 15, false, true, kMaximumConcurrency, 1, "embedded"}}, metrics_.speculative_statistics());
+         {kvmem::SpeculativeAlgorithm::DFlash2, 15, false, true, kMaximumConcurrency, 8, "embedded"}}, metrics_.speculative_statistics());
     const auto& execution = service.engine_options();
     props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
         {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},

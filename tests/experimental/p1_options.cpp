@@ -124,6 +124,26 @@ int main() {
                 throw std::runtime_error("KVMem normalization changed per-request working capacity");
             }
         }
+        for (const auto lanes : {1U, 2U, 8U}) {
+            auto staged = base;
+            staged.devices = {1, 0};
+            staged.stage_layers = {40, 24};
+            staged.max_concurrency = lanes;
+            staged.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256 * lanes);
+            staged.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+            staged.speculative.draft_tokens = 5;
+            const auto accepted = ninfer::runtime::normalize_engine_options(staged);
+            if (accepted.devices != staged.devices || accepted.stage_layers != staged.stage_layers ||
+                accepted.speculative.backend != ninfer::SpeculativeBackend::DFlash2 ||
+                accepted.kvmem.device_tokens() != 256)
+                throw std::runtime_error("KVMem DFlash2 layer pipeline changed its placement or window");
+            staged.stage_layers.clear();
+            staged.tensor_parallel = true;
+            bool rejected = false;
+            try { (void)ninfer::runtime::normalize_engine_options(staged); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) throw std::runtime_error("KVMem DFlash2 accepted unsupported tensor parallelism");
+        }
         auto vision = base;
         vision.enable_vision = true;
         vision.vision_residency = ninfer::VisionResidency::Resident;
