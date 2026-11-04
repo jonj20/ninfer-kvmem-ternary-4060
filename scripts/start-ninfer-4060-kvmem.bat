@@ -139,7 +139,7 @@ set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
 set "APPS=%ROOT%\build_4060\apps"
 set "EXE=%APPS%\ninfer-serve.exe"
-set "MODEL=E:\gguf\qwen3.6-35b-a3b\Ternary-Bonsai-2-27B-PTQ1_0-vl_mtp_q4q5.ninfer"
+set "MODEL=E:\gguf\qwen3.6-35b-a3b\ninfer-bonsai-27b\Ternary-Bonsai-2-27B-PTQ1_0-vl_mtp_q4q5.ninfer"
 
 set "VCPKG=D:\dev\vcpkg"
 set "CUDA=D:\dev\nvkit"

@@ -833,7 +833,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--kvmem-budget N` | device KV working-set budget in tokens (multiples of 128; `0` keeps the whole context resident); once the context exceeds it, attention retains only a sink prefix and the newest tail; ignored while `--spec dflash` or `--spec dflash2` is enabled (`--spec mtp` joins staging through its cache-position pipeline); a nonzero budget requires `--kv-capacity` to cover the budget plus one prefill chunk (and, under MTP, one draft lead per lane) and a Host KV tier, disables prefix capture, and lets prompts without a reusable prefix reach `--max-context` | `0` |
+| `--kvmem-budget N` | device KV working-set budget in tokens (multiples of 128; `0` keeps the whole context resident); once the context exceeds it, attention retains the selected window (recency: sink prefix plus newest tail; retrieval: those plus the best-scoring interior blocks); ignored while `--spec dflash` or `--spec dflash2` is enabled (`--spec mtp` joins staging through its cache-position pipeline); a nonzero budget requires `--kv-capacity` to cover the budget plus one prefill chunk (and, under MTP, one draft lead per lane), must fit one prefill chunk or MTP verify range plus a sink block, and needs a Host KV tier; it disables prefix capture and lets prompts without a reusable prefix reach `--max-context` | `0` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1049,18 +1049,21 @@ minimum `--host-kv-mib` that would satisfy it. Host KV is pinned one growth chun
 requests use it, so a wide window costs no host RAM up front.
 
 `--kvmem-budget` bounds the Device KV working set to a window of that many tokens: a retained sink
-prefix plus the newest tail, reselected every round. Pages that leave the window move to the
+prefix plus the newest tail, reselected every round; `--kvmem-select retrieval` also admits the
+best-scoring interior blocks on ordinary decode, while prefill and MTP verify reselect recency so
+their contiguous call range stays in one retained run. Pages that leave the window move to the
 pinned Host KV tier and return when a later reselect needs them, so one logical sequence still
 spans `--max-context` and a fresh prompt — one that reuses no cached prefix — may reach
 `--max-context` even though `--kv-capacity` holds only the window. A nonzero budget requires
 `--kv-capacity` to cover the budget plus one `--prefill-chunk` (the pool must hold the window and
-the prefill chunk in flight) and a Host KV tier; with `--host-kv-mib 0` the tier is sized from
+the prefill chunk in flight), must fit one prefill chunk or MTP verify range plus a sink block and
+an alignment block, and needs a Host KV tier; with `--host-kv-mib 0` the tier is sized from
 `--max-context` minus the window. A request that reuses a cached prefix stays bounded by
 `--kv-capacity`, because restoring a prefix publishes every page on Device before the first
 reselect. While a budget is active, prefix capture and continuation publishing are disabled, so a
-windowed run creates no new reusable checkpoints. The option is ignored while `--spec` is
-enabled, and startup refuses a pool below the budget, naming the required `--kv-capacity`.
-Selection is recency-only (sink plus newest tail); retrieval scoring is not implemented.
+windowed run creates no new reusable checkpoints. The option is ignored while `--spec dflash` or
+`--spec dflash2` is enabled (`--spec mtp` shares the window through its staging pipeline), and
+startup refuses a pool below the budget, naming the required `--kv-capacity`.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion (under `--kvmem-budget` the Device claim is capped at the pool and topped up as pages

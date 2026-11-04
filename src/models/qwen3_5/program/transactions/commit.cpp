@@ -361,7 +361,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const std::int32_t cache_position_delta =
-                    reselect_sequence_window(sequence, cursor, cursor + count - 1U);
+                    reselect_sequence_window(sequence, cursor, cursor + count - 1U,
+                                             /*prefill=*/true);
                 const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                     schedule_state, sequence.ledger, count, std::nullopt, false,
                     cache_position_delta);

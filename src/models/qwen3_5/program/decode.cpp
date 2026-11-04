@@ -317,7 +317,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             // Mapping first: a moved window republishes pages the query itself addresses.
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
             const std::int32_t cache_delta =
-                reselect_sequence_window(sequence, frontier, frontier);
+                reselect_sequence_window(sequence, frontier, frontier, /*prefill=*/false);
             // Cache rows are the current window's rows; rope rows stay absolute token positions.
             const auto window_pos = static_cast<std::uint32_t>(
                 static_cast<std::int64_t>(frontier) + static_cast<std::int64_t>(cache_delta));
@@ -531,8 +531,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
-            const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t extent        = std::min(usable_drafts[row], verify_drafts);
+const std::uint32_t frontier      = sequence.execution_frontier;
+            const std::uint32_t raw_extent    = std::min(usable_drafts[row], verify_drafts);
+            // Keep the whole verify range inside one retained run. Early in the sink the tail is
+            // not retained, so speculation there is limited to the sink's remaining tokens.
+            const std::uint32_t sink_blocks =
+                std::max<std::uint32_t>(1, (kvmem_config.sink_tokens + kvmem_config.block_tokens - 1U) /
+                                               kvmem_config.block_tokens);
+            const std::uint32_t sink_end_tokens = sink_blocks * kvmem_config.block_tokens;
+            std::uint32_t extent                = raw_extent;
+            std::uint32_t window_end =
+                std::min(capacity - 1U, frontier + extent + draft_window);
+            if (sink_end_tokens != 0 && frontier < sink_end_tokens &&
+                window_end >= sink_end_tokens) {
+                window_end = sink_end_tokens > frontier ? sink_end_tokens - 1U : frontier;
+            }
+            if (window_end < frontier + extent) {
+                extent = window_end >= frontier ? window_end - frontier : 0U;
+            }
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -549,23 +565,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
-            // Mapping first: a moved window republishes pages the query itself addresses. Reselect
-            // then renumbers the retained rows for [frontier, window_end], which covers the verify
-            // columns and every AR step this round may touch. The resulting per-lane row shift is
-            // broadcast into every verify/AR cache row.
-            //
-            // The published window extends through the draft lead, so BOTH KV spaces are mapped
-            // through the same token count: set_window refuses a window that claims more tokens
-            // than the address maps, and the verified-column count (extent + 1) can sit a few
-            // tokens below the lead inside one page-aligned run, which used to trip that check on
-            // the first decode round after a boundary. `window_end` also clamps to the last
-            // admissible position so a round near the context ceiling does not ask for a token
-            // past --max-context.
-            const std::uint32_t window_end =
-                std::min(capacity - 1U, frontier + extent + draft_window);
             ensure_sequence_kv_mapped(sequence, window_end + 1U, window_end + 1U);
             const std::int32_t cache_delta =
-                reselect_sequence_window(sequence, frontier, window_end);
+                reselect_sequence_window(sequence, frontier, window_end, /*prefill=*/false);
             mtp_host_ingress->cache_position_deltas[row] = cache_delta;
             mtp_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);

@@ -1306,15 +1306,17 @@ private:
     // against the newest captured mean and spends the leftover budget on the best matches, falling
     // back to recency while no block has been captured yet.
     [[nodiscard]] qwen3_5::detail::KVMemPlan select_window_blocks(
-        SequenceState& sequence, qwen3_5::detail::KVMemBlockStore& store);
+        SequenceState& sequence, qwen3_5::detail::KVMemBlockStore& store, bool prefill);
     // Sync the sequence's block mirror to cover [call_min, call_max], reselect its window and
-    // republish the text KV execution table when the window moved. Returns the row shift every
-    // cache position of that call must apply (0 while the window is the identity), or 0 without
-    // touching the table when speculative target verification owns the round (phase 6 gives the
-    // draft pool its own store; until then it reads this table with absolute positions).
+    // republish the text KV execution table when the window moved. `prefill` forces the recency
+    // selection: a prefill chunk writes a contiguous range that a top-k selection is not required
+    // to retain, while recency always keeps the range the call writes into. Returns the row shift
+    // every cache position of that call must apply (0 while the window is the identity), or 0
+    // without touching the table when speculative target verification owns the round (phase 6
+    // gives the draft pool its own store; until then it reads this table with absolute positions).
     [[nodiscard]] std::int32_t reselect_sequence_window(SequenceState& sequence,
                                                         std::uint32_t call_min,
-                                                        std::uint32_t call_max);
+                                                        std::uint32_t call_max, bool prefill);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

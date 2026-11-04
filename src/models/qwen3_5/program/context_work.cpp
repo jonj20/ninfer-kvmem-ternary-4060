@@ -33,12 +33,10 @@ std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept {
 
 std::uint32_t kv_resident_pages_for_window(const KVMemWindow& window,
                                             std::uint32_t mapped_pages) noexcept {
-    const std::uint32_t page       = static_cast<std::uint32_t>(kPagedKVPageSize);
-    const std::uint32_t sink_pages = std::min(window.sink_end / page, mapped_pages);
-    const std::uint32_t recent_page = window.recent_begin / page;
-    const std::uint32_t retained_tail =
-        mapped_pages > recent_page ? mapped_pages - recent_page : 0U;
-    return sink_pages + retained_tail;
+    // The identity keeps every mapped page resident (the dense full-attention layout). A hole
+    // window keeps exactly the pages its block map retains.
+    return window.is_identity() ? mapped_pages
+                                : std::min(window.retained_pages, mapped_pages);
 }
 
 std::size_t context_resource_index(runtime::ContextResourceClass resource) {

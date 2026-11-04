@@ -1591,8 +1591,10 @@ void ProgramImpl::accumulate_kvmem_scores(SequenceState& sequence,
         if (segment.tokens == 0) { continue; }
         // kvmem_block_shares derives the same block partition the reduction used, so column b of the
         // segment lands on the block share b covers.
-        const std::vector<qwen3_5::detail::KVMemBlockShare> shares = qwen3_5::detail::kvmem_block_shares(
-            segment.first_position, static_cast<std::int64_t>(segment.tokens), block_tokens);
+        const std::vector<qwen3_5::detail::KVMemBlockShare> shares =
+            qwen3_5::detail::kvmem_store_block_shares(*sequence.kvmem,
+                                                      static_cast<std::uint32_t>(segment.first_position),
+                                                      segment.tokens);
         for (std::size_t b = 0; b < shares.size(); ++b) {
             fold(shares[b].block_id,
                  segment.offset + static_cast<std::uint32_t>(b) * key_width, shares[b].tokens);
@@ -1622,7 +1624,7 @@ void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
     // receives this token's contribution.
     const float* host = static_cast<const float*>(kvmem_sums_host->data()) +
                         static_cast<std::size_t>(column) * key_width;
-    const std::uint32_t block_id = token_position / block_tokens;
+    const std::uint32_t block_id = sequence.kvmem->block_id_containing(token_position);
     // The lane contributed exactly one token, so the mean completes only when this token fills the
     // block; a block already promoted (or not yet mirrored) is skipped.
     if (block_id >= sequence.kvmem->block_count() || scores.has_mean(block_id)) { return; }
@@ -1632,28 +1634,33 @@ void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
     if (scores.captured_tokens(block_id) == block_tokens) { scores.finalize(block_id); }
 }
 
-KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockStore& store) {
-    if (!retrieval_selection_active()) { return store.select_recency(); }
-    const std::optional<AttentionConfig>& attention = parameters.model.config().text.attention;
-    if (!attention) { throw std::logic_error("Qwen3.5 text model has no attention geometry"); }
-    const auto key_width = static_cast<std::uint32_t>(attention->key_width());
-    if (!sequence.kvmem_scores) {
-        sequence.kvmem_scores.emplace(kvmem_config.block_tokens, key_width, attention->head_dim);
+KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockStore& store,
+                                            bool prefill) {
+    (void)sequence;
+    // A prefill chunk writes a contiguous range and MTP verification reads a contiguous verify
+    // range; neither is required to survive a top-k selection, so both stay on recency. Retrieval
+    // only chooses extra interior blocks for the single-token ordinary decode call.
+    if (prefill || speculative_backend == SpeculativeBackend::Mtp) {
+        return store.select_recency();
     }
-    KVMemScoreStore& scores = *sequence.kvmem_scores;
-    // The query is the newest completed block: the agent step's own text is the most recent
-    // context, which is exactly what a retrieval round wants to find more of. Until one exists
-    // (the first chunk of a request) there is nothing to rank against and recency is exact.
-    std::uint32_t query_block = scores.block_count();
-    while (query_block > 0 && !scores.has_mean(query_block - 1U)) { --query_block; }
-    if (query_block == 0) { return store.select_recency(); }
-    const std::vector<float>& query = scores.mean(query_block - 1U);
-    store.set_scores(scores.score(query.data(), key_width));
-    return store.select_topk();
+    if (!retrieval_selection_active()) { return store.select_recency(); }
+    if (sequence.kvmem_scores) {
+        const std::optional<AttentionConfig>& attention = parameters.model.config().text.attention;
+        if (attention) {
+            std::uint32_t query_block = sequence.kvmem_scores->block_count();
+            while (query_block > 0 && !sequence.kvmem_scores->has_mean(query_block - 1U)) { --query_block; }
+            if (query_block > 0) {
+                const std::vector<float>& query = sequence.kvmem_scores->mean(query_block - 1U);
+                store.set_scores(sequence.kvmem_scores->score(query.data(), static_cast<std::uint32_t>(attention->key_width())));
+                return store.select_topk();
+            }
+        }
+    }
+    return store.select_recency();
 }
 
 std::int32_t ProgramImpl::reselect_sequence_window(SequenceState& sequence, std::uint32_t call_min,
-                                                   std::uint32_t call_max) {
+                                                   std::uint32_t call_max, bool prefill) {
     // Masked draft backends read this table with absolute positions and have no cache-position
     // pipeline yet, so they keep the identity window (stage 6b). MTP verification consumes the
     // window row shift through the verify/AR cache positions instead (mtp-kvmem-plan.md D4).
@@ -1675,12 +1682,13 @@ std::int32_t ProgramImpl::reselect_sequence_window(SequenceState& sequence, std:
     if (sequence.kvmem_scores && sequence.kvmem_scores->block_count() > store.block_count()) {
         sequence.kvmem_scores->truncate(store.block_count());
     }
-    const KVMemPlan plan   = select_window_blocks(sequence, store);
+    const KVMemPlan plan     = select_window_blocks(sequence, store, prefill);
     const KVMemWindow window = store.window_for(plan, call_min, call_max);
     store.apply(plan);
     // Tier publication: restore re-entries, republish (window-aware), demote the dropped pages.
-    // window_for proved the call sits on one side of the window, where rel() is either the
-    // identity (below sink_end) or one constant page shift (at or above recent_begin).
+    // window_for proved every block in [call_min, call_max] is retained, so rel(call_min) is the
+    // window row of the call's first token and the caller shifts its cache positions by the
+    // difference. Interior blocks selected by retrieval sit at their dense rows in between.
     apply_window_transition(sequence, window);
     return static_cast<std::int32_t>(window.rel(call_min)) -
            static_cast<std::int32_t>(call_min);
@@ -1729,7 +1737,7 @@ void ProgramImpl::stage_out_window_holes(const KVWindowSpace& space, KVAddressSp
     const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
     const std::uint32_t mapped    = addresses.mapped_pages(handle);
     const auto retained           = [&](std::uint32_t page) {
-        return page * page_size < window.sink_end || page * page_size >= window.recent_begin;
+        return window.retains(page * page_size);
     };
     // Pages outside the window that still hold Device residency: drop directly when a current
     // Host replica already stands behind them, back up first otherwise. A stale Host replica
@@ -1825,7 +1833,7 @@ void ProgramImpl::apply_window_space_transition(const KVWindowSpace& space, KVAd
     const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
     const std::uint32_t mapped    = addresses.mapped_pages(handle);
     const auto retained           = [&](std::uint32_t page) {
-        return page * page_size < window.sink_end || page * page_size >= window.recent_begin;
+        return window.retains(page * page_size);
     };
     std::vector<std::uint32_t> entries;
     for (std::uint32_t page = 0; page < mapped; ++page) {
@@ -1835,13 +1843,10 @@ void ProgramImpl::apply_window_space_transition(const KVWindowSpace& space, KVAd
         }
     }
     const bool restored = stage_in_demoted_pages(space, handle, entries);
-    // A moved window is the only reason to pay for a republish; the address keeps its window
-    // across deactivate and activation republishes window-aware through commit_activation.
-    const KVMemWindow current = addresses.window(handle);
-    if (current.sink_end != window.sink_end || current.recent_begin != window.recent_begin ||
-        current.window_tokens != window.window_tokens) {
-        addresses.set_window(handle, window, device.stream);
-    }
+    // set_window always records the new window (token growth inside a retained page included) but
+    // only republishes when the block->row layout moved; the address keeps its window across
+    // deactivate and activation republishes window-aware through commit_activation.
+    addresses.set_window(handle, window, device.stream);
     stage_out_window_holes(space, handle, window);
     // Stage-in copies are read by attention through the freshly published table before reselect
     // returns; the stage-out sync above does not order them when no backup ran.

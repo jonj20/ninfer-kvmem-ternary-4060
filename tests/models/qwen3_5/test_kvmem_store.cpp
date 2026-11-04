@@ -131,17 +131,19 @@ void test_window_is_identity_when_the_context_fits() {
            "full-budget selection is every block in order");
 
     const store::KVMemWindow window = block_store.window_for(plan, 0, 4 * kBlock - 1);
+    expect(window.is_identity(), "a context that fits the budget is the identity view");
     expect(!window.has_hole(), "a context that fits the budget has no hole");
+    expect_eq(window.block_tokens, kBlock, "the window records its block geometry");
+    expect_eq(window.total_tokens, 4 * kBlock, "the window records the selected context");
     expect_eq(window.window_tokens, 4 * kBlock, "the window covers the whole context");
-    expect_eq(window.sink_end, 0, "identity window has a zero sink boundary");
-    expect_eq(window.recent_begin, 0, "identity window has a zero recent boundary");
+    expect_eq(window.retained_pages, 8, "the identity covers every page of the context");
+    expect(window.row_base_by_block.empty(), "the identity leaves the block map empty");
     for (std::uint32_t abs_pos = 0; abs_pos < 4 * kBlock; ++abs_pos) {
         if (window.rel(abs_pos) != abs_pos) {
             expect(false, "identity window must map every position to itself");
             break;
         }
     }
-    expect(window.page_shift_tokens() == 0, "identity window shifts nothing");
 }
 
 void test_window_renumbers_sink_and_tail_into_one_prefix() {
@@ -154,13 +156,16 @@ void test_window_renumbers_sink_and_tail_into_one_prefix() {
     const store::KVMemWindow window = block_store.window_for(plan, total - 1, total - 1);
 
     expect(window.has_hole(), "a budget that skips a block has a hole");
-    expect_eq(window.sink_end, kBlock, "one sink block");
-    expect_eq(window.recent_begin, 2 * kBlock, "the tail starts at block 2");
+    expect_eq(window.total_tokens, total, "the window records the full context");
     expect_eq(window.window_tokens, 4 * kBlock, "window tokens equal the selected token count");
-    expect(window.sink_end % kPage == 0 && window.recent_begin % kPage == 0,
-           "both boundaries are page aligned (I2)");
-    expect(window.page_shift_tokens() == -static_cast<std::int64_t>(kBlock),
-           "the recent tail shifts down by exactly one block");
+    expect_eq(window.retained_pages, 8, "four retained blocks cover eight pages");
+    expect_eq(window.row_base_by_block.size(), 5, "one map entry per context block");
+    expect_eq(window.row_base_by_block[0], 0, "sink block starts at row 0");
+    expect(window.row_base_by_block[1] == std::numeric_limits<std::uint32_t>::max(),
+           "the skipped middle block has no row");
+    expect_eq(window.row_base_by_block[2], kBlock, "the tail starts right after the sink");
+    expect_eq(window.row_base_by_block[3], 2 * kBlock, "the next tail block follows");
+    expect_eq(window.row_base_by_block[4], 3 * kBlock, "the newest block is last");
 
     // The renumbered rows must be a dense prefix: sink rows 0..127, tail rows 128..511.
     expect_eq(window.rel(0), 0, "sink starts at window row 0");
@@ -172,7 +177,7 @@ void test_window_renumbers_sink_and_tail_into_one_prefix() {
     // causal mask select exactly the retained positions at or before the query.
     std::vector<std::uint32_t> retained;
     for (std::uint32_t abs_pos = 0; abs_pos < total; ++abs_pos) {
-        if (window.retains(abs_pos, total)) { retained.push_back(abs_pos); }
+        if (window.retains(abs_pos)) { retained.push_back(abs_pos); }
     }
     expect_eq(static_cast<std::uint32_t>(retained.size()), 4 * kBlock,
               "retained positions number exactly the window");
@@ -186,8 +191,8 @@ void test_window_renumbers_sink_and_tail_into_one_prefix() {
     }
     expect(order_holds, "rel() order over retained positions equals true-position order");
 
-    expect(!window.retains(kBlock, total), "hole positions are not retained");
-    expect(window.retains(total - 1, total), "the frontier is retained");
+    expect(!window.retains(kBlock), "hole positions are not retained");
+    expect(window.retains(total - 1), "the frontier is retained");
 }
 
 void test_window_rejects_a_call_inside_the_hole() {
@@ -218,8 +223,9 @@ void test_frontier_block_survives_a_budget_of_one_block() {
            "a one-block budget must spend its slot on the frontier, not the sink");
 
     const store::KVMemWindow window = block_store.window_for(plan, 5 * kBlock - 1, 5 * kBlock - 1);
-    expect_eq(window.sink_end, 0, "no sink remains when only the tail fits");
-    expect_eq(window.recent_begin, 4 * kBlock, "the tail starts at the frontier block");
+    expect_eq(window.retained_pages, 2, "only the frontier block's two pages remain");
+    expect(window.block_retained(4) && !window.block_retained(0),
+           "the frontier block is retained and the dropped sink is not");
     expect_eq(window.rel(5 * kBlock - 1), kBlock - 1, "the frontier maps to the last window row");
     expect(throws([&] { (void)block_store.window_for(plan, 0, 10); }),
            "the dropped prefix is no longer visible");
@@ -242,8 +248,8 @@ void test_selection_diff_is_incremental() {
     expect_eq(second.stage_in[0], 5, "the newest block is the one entering");
 
     const store::KVMemWindow window = block_store.window_for(second, 6 * kBlock - 1, 6 * kBlock - 1);
-    expect(window.sink_end % kPage == 0 && window.recent_begin % kPage == 0,
-           "a sliding window keeps both boundaries page aligned");
+    expect_eq(window.retained_pages, 8, "a sliding window still retains four blocks of pages");
+    expect_eq(window.row_base_by_block[3], kBlock, "the oldest tail block starts after the sink");
     expect_eq(window.rel(6 * kBlock - 1), 4 * kBlock - 1,
               "the window still ends at its last row after a slide");
 }
@@ -260,6 +266,27 @@ void test_topk_degenerates_to_recency_without_scores() {
     expect(ids_of(plan) == std::vector<std::uint32_t>({0, 1, 3, 4}),
            "a scored middle block displaces the lowest scored tail block");
     expect_eq(static_cast<std::uint32_t>(plan.selected.size()), 4, "top-k still honors the budget");
+}
+
+void test_window_supports_blocks_wider_than_one_page_pair() {
+    store::KVMemConfig cfg;
+    cfg.block_tokens  = 256;
+    cfg.budget_tokens = 512;
+    cfg.sink_tokens   = 0;
+    cfg.recent_blocks = 0;
+    store::KVMemBlockStore block_store(cfg);
+    block_store.register_append(3 * 256);
+    const store::KVMemPlan plan = block_store.select_recency();
+    expect(ids_of(plan) == std::vector<std::uint32_t>({0, 2}),
+           "a two-block budget keeps the sink and the newest wide block");
+
+    const store::KVMemWindow window = block_store.window_for(plan, 3 * 256 - 1, 3 * 256 - 1);
+    expect_eq(window.block_tokens, 256, "the window keeps the configured block size");
+    expect_eq(window.retained_pages, 8, "two 256-token blocks cover eight pages");
+    expect_eq(window.row_base_by_block[2], 256, "the tail starts after the wide sink");
+    expect_eq(window.rel(2 * 256), 256, "the tail maps to its dense row");
+    expect(window.retains(512) && !window.retains(300),
+           "retains() uses the configured block size, not a hard-coded 128");
 }
 
 void test_config_validation() {
@@ -432,9 +459,8 @@ void test_topk_selection_uses_the_scores() {
 
     store::KVMemScoreStore scores = make_score_store();
     for (std::uint32_t id = 0; id < blocks; ++id) {
-        const Token token(kWidth, 0.0F);
         std::vector<float> summed(kWidth, 0.0F);
-        summed[0] = static_cast<float>(id);
+        summed[0] = id == 2 ? 10.0F : (id == 1 ? 5.0F : 0.0F);
         scores.accumulate(id, summed.data(), kBlock);
         scores.finalize(id);
     }
@@ -443,9 +469,47 @@ void test_topk_selection_uses_the_scores() {
     selection.set_scores(scores.score(query.data(), kWidth));
     const store::KVMemPlan plan = selection.select_topk();
     // Budget of three blocks: sink block 0, the newest tail block 4, and the best-scoring middle
-    // block 3.
-    expect(ids_of(plan) == std::vector<std::uint32_t>({0, 3, 4}),
-           "retrieval keeps the sink, the best-scoring block and the frontier block");
+    // block 2 - a true interior block with holes on both sides of it.
+    expect(ids_of(plan) == std::vector<std::uint32_t>({0, 2, 4}),
+           "retrieval keeps the sink, an interior best-scoring block and the frontier block");
+}
+
+// The point of retrieval is an interior block that neither recency nor the call range would keep.
+// The window must publish it at its dense row so attention can read it alongside the sink and tail.
+void test_window_retains_interior_topk_blocks() {
+    constexpr std::uint32_t blocks = 6;
+    store::KVMemConfig cfg;
+    cfg.block_tokens  = kBlock;
+    cfg.budget_tokens = 4 * kBlock;
+    cfg.sink_tokens   = 0;
+    cfg.recent_blocks = 0;
+    store::KVMemBlockStore selection(cfg);
+    selection.register_append(blocks * kBlock);
+
+    store::KVMemScoreStore scores = make_score_store();
+    for (std::uint32_t id = 0; id < blocks; ++id) {
+        std::vector<float> summed(kWidth, 0.0F);
+        summed[0] = (id == 1 || id == 3) ? 10.0F : 0.0F;
+        scores.accumulate(id, summed.data(), kBlock);
+        scores.finalize(id);
+    }
+    Token query(kWidth, 0.0F);
+    query[0] = 1.0F;
+    selection.set_scores(scores.score(query.data(), kWidth));
+    const store::KVMemPlan plan = selection.select_topk();
+    expect(ids_of(plan) == std::vector<std::uint32_t>({0, 1, 3, 5}),
+           "top-k keeps the sink, two interior blocks and the frontier block");
+
+    const std::uint32_t total = blocks * kBlock;
+    const store::KVMemWindow window = selection.window_for(plan, total - 1, total - 1);
+    expect(window.has_hole(), "the skipped interior blocks are holes");
+    expect_eq(window.retained_pages, 8, "four retained blocks cover eight pages");
+    expect_eq(window.rel(1 * kBlock + 5), kBlock + 5, "the first interior block keeps its dense row");
+    expect_eq(window.rel(3 * kBlock + 7), 2 * kBlock + 7, "the second interior block follows");
+    expect(window.retains(1 * kBlock) && window.retains(3 * kBlock) &&
+               !window.retains(2 * kBlock) && !window.retains(4 * kBlock),
+           "retains() agrees with the selected interior blocks");
+    expect_eq(window.rel(total - 1), 4 * kBlock - 1, "the frontier closes the dense prefix");
 }
 
 // The captured range is partitioned into one share per block it touches, exactly as the reduction
@@ -529,10 +593,12 @@ int main() {
     test_frontier_block_survives_a_budget_of_one_block();
     test_selection_diff_is_incremental();
     test_topk_degenerates_to_recency_without_scores();
+    test_window_supports_blocks_wider_than_one_page_pair();
     test_config_validation();
     test_score_matches_the_mean_k_oracle();
     test_scores_survive_partial_capture_and_truncation();
     test_topk_selection_uses_the_scores();
+    test_window_retains_interior_topk_blocks();
     test_block_shares_partition_the_captured_range();
 
     if (failures == 0) { std::cout << "ok\n"; }

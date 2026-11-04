@@ -17,6 +17,8 @@
 // See docs/maintainer/kvmem-port.md 2.12.
 
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -58,37 +60,75 @@ struct KVMemPlan {
 
 // Renumbered-prefix view of one selection (docs/maintainer/kvmem-port.md 2.12).
 //
-// A selection is always the union of a retained sink prefix [0, sink_end) and a retained recent
-// tail [recent_begin, total_tokens), with a hole between them whenever the budget cannot hold the
-// whole context; when it can, both boundaries are zero and rel() is the identity. rel() maps a
-// retained absolute position onto a dense prefix of window rows, so the unchanged causal mask
-// `row <= cache_positions[t]` selects exactly the retained positions at or before the query.
+// `row_base_by_block[id]` is the dense window row of the first token of block `id`, or UINT32_MAX
+// when the selection dropped that block. The map is empty exactly when the selection retains every
+// block (the identity view), so rel() and retains() stay branch-light on the full-context path.
+// A selection may retain arbitrary interior blocks: every retained page is published contiguously
+// in ascending true-position order, so the unchanged causal mask `row <= cache_positions[t]`
+// selects exactly the retained positions at or before the query.
 //
 // rel() is defined only for retained positions. Hole positions are never selected and must never
-// be queried (invariants I1 and I3); the store validates I2, that both boundaries are multiples
-// of the 64-token page, which is what makes a reselect a pure execution-table update with no
-// device byte movement.
+// be queried (invariants I1 and I3); the store validates I2, that block boundaries are whole
+// 64-token pages, which is what makes a reselect a pure execution-table update with no device byte
+// movement.
 struct KVMemWindow {
-    std::uint32_t sink_end      = 0;
-    std::uint32_t recent_begin  = 0;
+    // Selection block granularity. Zero only for a default-constructed identity window.
+    std::uint32_t block_tokens = 0;
+    // Absolute tokens the selection covers (the block store's total at selection time).
+    std::uint32_t total_tokens = 0;
+    // Tokens the retained blocks hold.
     std::uint32_t window_tokens = 0;
+    // 64-token pages the retained blocks cover; the execution table's contiguous row count.
+    std::uint32_t retained_pages = 0;
+    std::vector<std::uint32_t> row_base_by_block;
 
-    [[nodiscard]] bool has_hole() const noexcept { return recent_begin > sink_end; }
+    [[nodiscard]] bool is_identity() const noexcept { return row_base_by_block.empty(); }
 
-    // Window row of a retained absolute position; undefined for hole positions.
-    [[nodiscard]] std::uint32_t rel(std::uint32_t abs_pos) const noexcept {
-        return abs_pos < sink_end ? abs_pos : abs_pos - recent_begin + sink_end;
+    [[nodiscard]] bool block_retained(std::uint32_t block_id) const noexcept {
+        if (is_identity()) { return true; }
+        return block_id < row_base_by_block.size() &&
+               row_base_by_block[block_id] != std::numeric_limits<std::uint32_t>::max();
     }
 
-    // Whether an absolute position belongs to the retained union over a context of total tokens.
-    [[nodiscard]] bool retains(std::uint32_t abs_pos, std::uint32_t total_tokens) const noexcept {
-        return abs_pos < sink_end || (abs_pos >= recent_begin && abs_pos < total_tokens);
+    [[nodiscard]] bool has_hole() const noexcept {
+        if (is_identity()) { return false; }
+        for (const std::uint32_t base : row_base_by_block) {
+            if (base == std::numeric_limits<std::uint32_t>::max()) { return true; }
+        }
+        return false;
     }
 
-    // Token delta applied to every recent-tail position. Always a non-positive multiple of the
-    // page size, so rel()>>6 == abs>>6 + delta/64 and page offsets are untouched.
-    [[nodiscard]] std::int64_t page_shift_tokens() const noexcept {
-        return static_cast<std::int64_t>(sink_end) - static_cast<std::int64_t>(recent_begin);
+    // Window row of a retained absolute position. Throws std::out_of_range for a hole or a
+    // position outside the selected context, because a silent fallback would read the wrong KV.
+    [[nodiscard]] std::uint32_t rel(std::uint32_t abs_pos) const {
+        if (is_identity()) { return abs_pos; }
+        if (block_tokens == 0) {
+            throw std::out_of_range("kvmem window has no block geometry");
+        }
+        const std::uint32_t block_id = abs_pos / block_tokens;
+        if (block_id >= row_base_by_block.size() ||
+            row_base_by_block[block_id] == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::out_of_range("kvmem window does not retain this position");
+        }
+        return row_base_by_block[block_id] + (abs_pos - block_id * block_tokens);
+    }
+
+    // Whether an absolute position belongs to the retained union. The identity view retains the
+    // whole address space (including pages mapped ahead of the context), matching the dense
+    // publication every caller assumes before a budget opens a hole.
+    [[nodiscard]] bool retains(std::uint32_t abs_pos) const noexcept {
+        if (is_identity()) { return true; }
+        if (block_tokens == 0 || abs_pos >= total_tokens) { return false; }
+        return block_retained(abs_pos / block_tokens);
+    }
+
+    // Whether a reselect can keep the published execution table: same block geometry, same
+    // retained page count and the same block->row map. Token growth inside an already retained page
+    // does not move a row.
+    [[nodiscard]] bool same_layout(const KVMemWindow& other) const noexcept {
+        return block_tokens == other.block_tokens &&
+               retained_pages == other.retained_pages &&
+               row_base_by_block == other.row_base_by_block;
     }
 };
 
@@ -131,8 +171,8 @@ public:
     // next attention call. Pure: it reads `plan.selected`, the block table and the range only.
     // Throws std::logic_error when a validated invariant would be violated, because every one of
     // them fails silently at output rather than crashing:
-    //   I1 the next call's position range lies inside the retained union
-    //   I2 both boundaries are multiples of the 64-token page (no byte movement on reselect)
+    //   I1 every block the next call's position range touches is retained
+    //   I2 block boundaries are multiples of the 64-token page (no byte movement on reselect)
     //   the window fits the configured budget
     [[nodiscard]] KVMemWindow window_for(const KVMemPlan& plan, std::uint32_t call_min_pos,
                                          std::uint32_t call_max_pos) const;
@@ -231,5 +271,13 @@ struct KVMemBlockShare {
 // misattributes partial sums instead of failing.
 [[nodiscard]] std::vector<KVMemBlockShare>
 kvmem_block_shares(std::int64_t first_position, std::int64_t tokens, std::uint32_t block_tokens);
+
+// Blocks that the token range [first_position, first_position + tokens) touches in this store's
+// actual (possibly truncated and re-appended) block layout. Unlike kvmem_block_shares above, this
+// uses the store's real block boundaries, so capture stays correct after a non-block-aligned
+// truncation or prefix fork.
+[[nodiscard]] std::vector<KVMemBlockShare>
+kvmem_store_block_shares(const KVMemBlockStore& store, std::uint32_t first_position,
+                         std::uint32_t tokens);
 
 } // namespace ninfer::models::qwen3_5::detail

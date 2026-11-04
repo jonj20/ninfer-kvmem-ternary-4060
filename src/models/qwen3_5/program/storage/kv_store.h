@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstdint>
+#include <limits>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -1571,34 +1571,70 @@ public:
     }
 
     // Republish this address space through a new renumbered window. Survivors keep their Device
-    // pages; only the execution table moves. Throws when the window is not page aligned, reaches
-    // past the committed frontier, or would publish a page that is not mapped.
+    // pages; only the execution table moves. Throws when the block geometry is not a whole number
+    // of pages, the window reaches past the mapped pages, or its block map is inconsistent.
     //
     // The transition also moves per-page reference ownership with window membership: a page that
     // leaves the retained union loses this address's active reference and writer claim (which is
     // what lets the caller then stage it out to Host), and a page that re-enters regains both -
     // the caller must have restored its Device residency (stage-in) before calling. Pages that
     // stay in either state are untouched, so repeated reselects over an unchanged window are
-    // reference-neutral.
+    // reference-neutral. The execution table is only republished when the block->row layout moved;
+    // token growth inside an already retained page does not change a row.
     void set_window(KVAddressSpaceHandle handle, const KVMemWindow& window,
                     cudaStream_t stream = nullptr) {
         Address& address = require_active(handle);
         const std::uint32_t page = page_size_tokens();
-        if (window.sink_end % page != 0 || window.recent_begin % page != 0) {
-            throw std::invalid_argument("KV window boundary is not page aligned");
+        if (window.block_tokens == 0 || window.block_tokens % page != 0) {
+            throw std::invalid_argument("KV window block size is not a whole number of pages");
         }
-        if (window.sink_end > address.committed_frontier ||
-            window.recent_begin > address.committed_frontier) {
-            throw std::invalid_argument("KV window boundary is past the committed frontier");
+        if (window.total_tokens > address.page_count * page) {
+            throw std::invalid_argument("KV window reaches past the mapped pages");
         }
-        if (window.window_tokens > window.sink_end + address.page_count * page -
-                                         window.recent_begin) {
-            throw std::invalid_argument("KV window claims more tokens than it maps");
+        if (window.retained_pages > address.page_count) {
+            throw std::invalid_argument("KV window retains more pages than are mapped");
         }
+        if (window.window_tokens > window.total_tokens ||
+            window.window_tokens > window.retained_pages * page) {
+            throw std::invalid_argument("KV window claims more tokens than it retains");
+        }
+        const std::uint32_t block_count = blocks_for_tokens(window.total_tokens,
+                                                            window.block_tokens);
+        if (window.is_identity()) {
+            if (window.retained_pages != pages_for_tokens(window.total_tokens)) {
+                throw std::invalid_argument("KV identity window has an inconsistent page count");
+            }
+        } else {
+            if (window.row_base_by_block.size() != block_count) {
+                throw std::invalid_argument("KV window block map does not cover the context");
+            }
+            std::uint32_t expected_row   = 0;
+            std::uint32_t expected_pages = 0;
+            for (std::uint32_t block = 0; block < block_count; ++block) {
+                if (window.row_base_by_block[block] ==
+                    std::numeric_limits<std::uint32_t>::max()) {
+                    continue;
+                }
+                if (window.row_base_by_block[block] != expected_row) {
+                    throw std::invalid_argument("KV window block map is not a dense row prefix");
+                }
+                const std::uint32_t begin = block * window.block_tokens;
+                const std::uint32_t tokens =
+                    std::min(window.block_tokens, window.total_tokens - begin);
+                expected_row += tokens;
+                expected_pages += pages_for_tokens(tokens);
+            }
+            if (expected_row != window.window_tokens ||
+                expected_pages != window.retained_pages) {
+                throw std::invalid_argument("KV window block map disagrees with its counts");
+            }
+        }
+
+        const bool layout_changed =
+            address.window_needs_publish || !address.window.same_layout(window);
         for (std::uint32_t page_index = 0; page_index < address.page_count; ++page_index) {
             const LogicalKVPageHandle logical = membership(address, page_index);
-            const bool retained = page_index * page < window.sink_end ||
-                                  page_index * page >= window.recent_begin;
+            const bool retained = window_retains_page(window, page_index);
             const std::size_t cell = flag_cell(address, page_index);
             if (!retained && demoted_[cell] == 0) {
                 if (pages_->writer_references(logical) != 0) {
@@ -1621,7 +1657,7 @@ public:
             }
         }
         address.window = window;
-        publish_window(address, stream);
+        if (layout_changed) { publish_window(address, stream); }
     }
 
     [[nodiscard]] KVMemWindow window(KVAddressSpaceHandle handle) const {
@@ -1634,6 +1670,9 @@ public:
         const Address& address = require_active(handle);
         if (logical_page >= address.page_count) {
             throw std::invalid_argument("KV window page query is past the mapped pages");
+        }
+        if (!window_retains_page(address.window, logical_page)) {
+            throw std::invalid_argument("KV window page query names a hole");
         }
         return window_page(address, logical_page);
     }
@@ -1666,8 +1705,15 @@ public:
             }
             pages_->physical_pool().resize_reservation(address.reservation, reachable);
         }
-        // The identity window maps page p to window page p, so every existing caller is unaffected.
-        const std::uint32_t window_begin = window_page(address, begin);
+        // The identity window maps page p to window page p. A hole window appends the new tail
+        // pages after the retained prefix; pages mapped ahead of the window's total are the only
+        // ones that can be in flight here, so their row is retained_pages plus their offset past
+        // that total. Repeated growth without a reselect therefore keeps advancing the row.
+        const std::uint32_t window_begin =
+            address.window.is_identity()
+                ? begin
+                : address.window.retained_pages +
+                      (begin - pages_for_tokens(address.window.total_tokens));
         if (window_begin + count > tables_->logical_page_capacity()) {
             throw std::logic_error("KV window page range exceeds the execution table capacity");
         }
@@ -1783,6 +1829,12 @@ public:
             pages_->destructive_truncate(membership(address, target - 1U), columns);
         }
         address.committed_frontier = frontier;
+        if (!address.window.is_identity() && address.window.total_tokens > frontier) {
+            // The block map named blocks this truncation removed. Fall back to the dense identity;
+            // the next reselect publishes a real window over the surviving context.
+            address.window              = KVMemWindow{};
+            address.window_needs_publish = true;
+        }
     }
 
     [[nodiscard]] bool can_destructive_truncate_inactive(
@@ -1838,6 +1890,10 @@ public:
         }
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = 0;
+        if (!address.window.is_identity() && address.window.total_tokens > frontier) {
+            address.window               = KVMemWindow{};
+            address.window_needs_publish = true;
+        }
         rebuild_checkpoint_protection();
     }
 
@@ -1879,6 +1935,10 @@ public:
         }
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = std::min(address.checkpoint_frontier, frontier);
+        if (!address.window.is_identity() && address.window.total_tokens > frontier) {
+            address.window               = KVMemWindow{};
+            address.window_needs_publish = true;
+        }
         rebuild_checkpoint_protection();
     }
 
@@ -2044,8 +2104,12 @@ private:
         // docs/maintainer/kvmem-port.md 2.12). The default is the identity, which is exactly the
         // dense full-attention layout every existing caller assumes.
         KVMemWindow window;
-        bool occupied = false;
-        bool active   = false;
+        // A truncation can invalidate `window` and reset it to the identity sentinel while the
+        // published execution table still holds the old layout. The next set_window must then
+        // republish even when the new window is also the identity.
+        bool window_needs_publish = false;
+        bool occupied             = false;
+        bool active               = false;
     };
 
     [[nodiscard]] static std::size_t checked_membership_cells(std::uint32_t addresses,
@@ -2178,58 +2242,83 @@ private:
         return static_cast<std::uint32_t>(kPagedKVPageSize);
     }
 
-    [[nodiscard]] static std::uint32_t window_sink_pages(const Address& address) noexcept {
-        return address.window.sink_end / page_size_tokens();
+    [[nodiscard]] static std::uint32_t blocks_for_tokens(std::uint32_t tokens,
+                                                         std::uint32_t block_tokens) noexcept {
+        return tokens == 0 ? 0U : 1U + (tokens - 1U) / block_tokens;
     }
 
-    [[nodiscard]] static std::uint32_t window_recent_page(const Address& address) noexcept {
-        return address.window.recent_begin / page_size_tokens();
-    }
-
-    // Window page that backs `logical_page`. The sink prefix keeps its absolute page index and the
-    // retained tail slides down by page_shift_pages, which is a whole number of pages because both
-    // window boundaries are page aligned (invariant I2) - so page offsets inside a page never
-    // move and a reselect republishes table entries instead of copying device bytes.
-    [[nodiscard]] static std::uint32_t window_page(const Address& address,
+    // Whether a logical page is part of the window's retained set. Identity retains every mapped
+    // page (dense publication); a hole window retains only pages of selected blocks, and only up to
+    // the selected context, so a page mapped ahead of `total_tokens` stays a hole.
+    [[nodiscard]] static bool window_retains_page(const KVMemWindow& window,
                                                   std::uint32_t logical_page) noexcept {
-        return logical_page < window_sink_pages(address)
-                   ? logical_page
-                   : logical_page - window_recent_page(address) + window_sink_pages(address);
+        if (window.is_identity()) { return true; }
+        if (window.block_tokens == 0 ||
+            logical_page >= pages_for_tokens(window.total_tokens)) {
+            return false;
+        }
+        const std::uint32_t block =
+            (logical_page * page_size_tokens()) / window.block_tokens;
+        return block < window.row_base_by_block.size() &&
+               window.row_base_by_block[block] !=
+                   std::numeric_limits<std::uint32_t>::max();
+    }
+
+    // Window page that backs `logical_page`. The identity keeps its absolute page index. A hole
+    // window packs the retained pages contiguously in ascending true-position order, so the row is
+    // the block's row base plus the page offset inside that block. Block boundaries are whole
+    // pages (invariant I2), so no token inside a page ever moves.
+    [[nodiscard]] static std::uint32_t window_page(const Address& address,
+                                                  std::uint32_t logical_page) {
+        const KVMemWindow& window = address.window;
+        if (window.is_identity()) { return logical_page; }
+        const std::uint32_t page = page_size_tokens();
+        const std::uint32_t block = (logical_page * page) / window.block_tokens;
+        if (block >= window.row_base_by_block.size() ||
+            window.row_base_by_block[block] ==
+                std::numeric_limits<std::uint32_t>::max()) {
+            throw std::logic_error("KV window page is not retained");
+        }
+        const std::uint32_t block_start_page = block * (window.block_tokens / page);
+        return window.row_base_by_block[block] / page +
+               (logical_page - block_start_page);
     }
 
     // Publish exactly the retained pages, contiguously from window page 0. Identity windows
     // publish every mapped page, which is the layout every pre-existing caller assumes.
     // Retained pages must be Device-resident: under a hole window the caller stages them in
     // before set_window, so a miss here is an executor ordering bug, never a silent hole.
-    void publish_window(const Address& address, cudaStream_t stream = nullptr) {
+    void publish_window(Address& address, cudaStream_t stream = nullptr) {
         if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
-        const std::uint32_t sink_pages    = window_sink_pages(address);
-        const std::uint32_t recent_page   = window_recent_page(address);
-        const std::uint32_t retained_tail =
-            address.page_count > recent_page ? address.page_count - recent_page : 0U;
-        if (sink_pages > address.page_count || retained_tail > address.page_count) {
-            throw std::logic_error("KV window reaches past the mapped pages");
-        }
         publish_scratch_.clear();
-        publish_scratch_.reserve(sink_pages + retained_tail);
-        for (std::uint32_t page = 0; page < sink_pages; ++page) {
-            const LogicalKVPageHandle logical = membership(address, page);
-            if (!pages_->device_resident(logical)) {
-                throw std::logic_error("KV window retains a page without a Device replica");
+        if (address.window.is_identity()) {
+            publish_scratch_.reserve(address.page_count);
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (!pages_->device_resident(logical)) {
+                    throw std::logic_error("KV window retains a page without a Device replica");
+                }
+                publish_scratch_.push_back(pages_->physical(logical));
             }
-            publish_scratch_.push_back(pages_->physical(logical));
-        }
-        for (std::uint32_t page = recent_page; page < address.page_count; ++page) {
-            const LogicalKVPageHandle logical = membership(address, page);
-            if (!pages_->device_resident(logical)) {
-                throw std::logic_error("KV window retains a page without a Device replica");
+        } else {
+            publish_scratch_.reserve(address.window.retained_pages);
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                if (!window_retains_page(address.window, page)) { continue; }
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (!pages_->device_resident(logical)) {
+                    throw std::logic_error("KV window retains a page without a Device replica");
+                }
+                publish_scratch_.push_back(pages_->physical(logical));
             }
-            publish_scratch_.push_back(pages_->physical(logical));
+            if (publish_scratch_.size() != address.window.retained_pages) {
+                throw std::logic_error("KV window retained page count disagrees with its map");
+            }
         }
         tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+        address.window_needs_publish = false;
     }
 
-    void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
+    void publish_membership(Address& address, cudaStream_t stream = nullptr) {
         publish_window(address, stream);
     }
 

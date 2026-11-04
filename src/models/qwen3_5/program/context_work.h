@@ -24,9 +24,10 @@ std::int32_t checked_i32(std::uint32_t value, const char* label);
 std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept;
 
 // Device-resident page need of a bounded working set: the pages the retained window covers
-// (sink prefix plus recent tail). Equals kv_pages_for_frontier under the identity window; under
-// --kvmem-budget it is decided by the KVMemWindow each reselect picks and maintained by the
-// reselect stage-in/stage-out executor - it is deliberately no longer a function of frontier.
+// (sink, newest tail and any retrieved interior blocks). Equals kv_pages_for_frontier under the
+// identity window; under --kvmem-budget it is decided by the KVMemWindow each reselect picks and
+// maintained by the reselect stage-in/stage-out executor - it is deliberately no longer a function
+// of frontier.
 std::uint32_t kv_resident_pages_for_window(const KVMemWindow& window,
                                             std::uint32_t mapped_pages) noexcept;
 

@@ -1159,6 +1159,23 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
                 " (budget " + std::to_string(budget) + " + chunk " + std::to_string(chunk) +
                 " + lead " + std::to_string(backend_lead_tokens) + ")");
         }
+        // Recency always keeps one sink block and the newest tail. A prefill chunk or an MTP
+        // verify range has to fit inside that tail; the extra block covers a call that starts
+        // mid-block. Without this check window_for would reject the round only after the request
+        // was admitted, which is the wrong failure point.
+        const std::uint64_t block_tokens = 128;
+        const std::uint64_t decode_span =
+            plan->speculative_backend == SpeculativeBackend::Mtp
+                ? static_cast<std::uint64_t>(plan->draft_window) + plan->verify_window
+                : 0ULL;
+        const std::uint64_t call_span = std::max(chunk, decode_span);
+        if (budget < call_span + 2ULL * block_tokens) {
+            throw std::invalid_argument(
+                "--kvmem-budget is too small for one contiguous call range: budget=" +
+                std::to_string(budget) + " tokens, need at least " +
+                std::to_string(call_span + 2ULL * block_tokens) + " (call span " +
+                std::to_string(call_span) + " + one sink block + one alignment block)");
+        }
         const std::size_t host_stride = plan_host_kv_page_layout(
                                             plan->persistent.decoder.text_kv.pages.spec.geometry)
                                             .page_stride;

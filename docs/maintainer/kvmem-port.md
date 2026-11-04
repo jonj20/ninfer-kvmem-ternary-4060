@@ -285,28 +285,31 @@ KVMem 的 NVMe 第三级不在范围内。
   top-k 预算、diff 只产生增量、升序→前缀可见性推导正确。
 
 **阶段 2 — 把窗口坐标喂进 `cache_positions`（路线 B，见 2.12）**
-- 已完成的一部分：`KVMemWindow`（`sink_end`/`recent_begin`/`rel()`）由
+- 已完成：`KVMemWindow`（`block_tokens`/`total_tokens`/`retained_pages`/
+  `row_base_by_block`/`rel()`/`retains()`）由
   `KVMemBlockStore::window_for(plan, call_min, call_max)` 给出，含 I1/I2/预算三重断言，
   单测覆盖"重编号前缀 ⟺ 绝对保留集"的双向序关系、恒等退化、洞内调用拒绝、
-  frontier 单块预算、以及块起点页对齐。
+  frontier 单块预算、interior top-k、非 128 块宽、以及块起点页对齐。
 - `TextContext` 侧：用选中集算窗口，把 `rel` 写进 `active_cache_positions_`；
   `active_rope_positions_` 保持真位置。
 - 改 `include/ninfer/ops/softmax_attention.h` 的**契约注释**（`positions` 由"绝对位置"
   改为"窗口坐标"，并写明真位置只走 `rope_positions`）；**打分/mask 代码不改**。
-- envelope：`max_visible_keys = sink_end + (max_p + 1 - lo) <= budget + 1`，
+- envelope：`max_visible_keys = rel(max_p) + 1 <= window_tokens + 1 <= budget + 1`，
   `min_visible_keys` 按窗口下界给（`causal_softmax_attention.cpp:178` 要求 `> 0`）；
   topology class 可能翻转 ⇒ `planning/graph_profiles.cpp` 按窗口尺寸覆盖。
-- **验收**：窗口 == 全上下文时与改前**逐位一致**（此时 `lo == sink_end`，`rel ≡ 真位置`）；
+- **验收**：窗口 == 全上下文时与改前**逐位一致**（此时 `is_identity()`，`rel ≡ 真位置`）；
   graph profile 校验通过。
 
-**阶段 3 — 按 `rel_page` 发布执行表 + 三个不变量断言**
-- 改 `kv_store.h:1467` `publish(row, begin, pages)` 的 `begin` 与页序列：由真逻辑页号改为
-  `rel_page`（`sink` 段页号不变，`recent` 段页号平移 `delta/64`）。
-  **不搬任何 GPU 字节** —— 只改 `block_table` 的 4 字节发布（I2 保证页内偏移不变）。
-- 新增 `ensure_mapped_subset`：可释放非前缀页、可重映射、可 republish，
-  替代/并列 `ensure_mapped_to_tokens` 的 append-only 前缀。
-- 加 I1（调用区间 ⊆ 保留并集，已在 `KVMemBlockStore::window_for` 断言）、
-  I4（`rel` 行全部已发布）与"块起点页对齐"（I2，已在 `validate_config` 断言）。
+**阶段 3 — 按块映射发布执行表 + 三个不变量断言**
+- `publish_window` 现在按逻辑页升序遍历，把所有 retained page 连续发布到
+  `block_table[0, retained_pages)`；页的窗口行由 `window_page()` 给出（块行基 +
+  块内页偏移）。**不搬任何 GPU 字节** —— 只改 `block_table` 的 4 字节发布
+  （I2 保证页内偏移不变）。
+- `ensure_mapped_to_tokens` 仍只追加尾部页：identity 用 `begin`，洞窗口用
+  `retained_pages + (begin - pages_for_tokens(total))`，因此重复增长不重发布也不会覆盖行。
+- 加 I1（调用区间内每个块都 retained，已在 `KVMemBlockStore::window_for` 断言）、
+  I4（retained page 数 == 发布页数，`publish_window` 断言）与"块起点页对齐"
+  （I2，已在 `validate_config` 与 `set_window` 断言）。
   违规直接抛，不留静默错误。
 - 打通 decode 期间的降级：`materialization.cpp:1549-1551` 的
   `has_active_reference` 限制要为"本序列自己的页"放行（KVMem 的窗口替换正发生在这）。
@@ -410,15 +413,15 @@ KVMem 的 NVMe 第三级不在范围内。
 reselect 的产物只有两样，形状都已经确定：
 
 1. **`KVMemWindow`** ⇒ `kv_store.set_window(handle, window, stream)` 重发布执行表；
-2. **`cache_position_delta = window.page_shift_tokens()`** ⇒ 让 Op 看到的 `positions` 变成 `rel`。
+2. **`cache_position_delta = rel(call_min) - call_min`** ⇒ 让 Op 看到的 `positions` 变成 `rel`。
 
-`rel` 在每个区段内是**仿射**的（`abs → abs + delta`），所以不需要逐 token 换算：
-- 现有 `ops::offset_i32_positions`（`text.cpp:1248` 已经用它做 `rope_delta`）直接把
-  prefill chunk 的 `positions` 平移；
+`rel` 对**单 token 调用**是仿射的（`abs → abs + delta`），所以 decode 不需要逐 token 换算：
 - decode 的 `cache_positions[row]` 是主机侧写的（`decode.cpp:325-328`），主机加 `delta` 即可；
-- envelope 取 `rel(p_max) + 1 = (p_max + delta) + 1`。
+- envelope 取 `rel(p_max) + 1`。
 
-落在 sink 段内的调用 `rel ≡ abs`，Program 传给执行层的 `delta` 就是 **0**——
+prefill chunk 与 MTP verify 是**连续区间**，而 `rel` 在多个保留块之间不再是单一仿射段，
+因此这两条路径强制 recency：连续区间落在 sink+tail 的单个 run 内，仍然可以用一个 `delta`。
+检索只作用于单 token 的普通 decode。identity 窗口下 `rel ≡ abs`，`delta` 为 **0**——
 分支留在 Program（窗口的拥有者），执行层保持无状态。
 
 **已确认的事实**（决定了这个方案可行）：
@@ -721,17 +724,26 @@ kernel 侧就是 `block_table[tile_k0 >> 6]` + `page_offset = position & 63`
 也没有"写行号"与"读行号"的分离。若照抄 cell 池，就必须给 8 个 kernel 变体各加一个
 `key_positions` 张量 + 一个 `write_rows` 张量 —— 这是重型 Op 契约改动。
 
-**NInfer 的解法：把窗口重编号成稠密前缀。**
+**NInfer 的解法：把任意保留块集重编号成稠密前缀。**
 
-窗口永远是两段连续区间的并：sink 前缀 `[0, sink_end)` 与 recent 尾段 `[lo, total)`，
-中间是洞 `[sink_end, lo)`（4a Recency 无洞时令 `lo = sink_end`）。定义
+窗口是**任意一组升序保留块**（Recency 只是"sink 头 + 最新尾"的特例；top-k 可以选任意
+interior 块）。`KVMemWindow` 记录：
+
+- `block_tokens`：选择块宽（生产值 128，必须是 64 的整数倍）；
+- `total_tokens`：选择时块表覆盖的上下文长度；
+- `window_tokens`：保留块持有的 token 总数；
+- `retained_pages`：保留块覆盖的 64-token 页数，也是执行表要连续发布的行数；
+- `row_base_by_block[id]`：块 `id` 第一 token 的窗口行；被丢弃的块为 `UINT32_MAX`。
+  **空 map 表示 identity**（所有块都保留），走稠密快路径。
+
+定义
 
 ```
-rel(abs) = abs                          , abs <  sink_end        // sink 段原地
-         = abs - lo + sink_end          , abs >= lo              // recent 段整体平移
+rel(abs) = row_base_by_block[abs / block_tokens] + abs % block_tokens   // 保留块
+         = 未定义                                                       // 洞
 ```
 
-则可见集在 `rel` 空间里是**一个稠密前缀 `[0, rel(p)]`**，且 `rel` 在驻留位置上**严格单调**，
+则可见集在 `rel` 空间里是**一个稠密前缀 `[0, rel(p)]`**，且 `rel` 在保留位置上**严格单调**，
 所以
 
 ```
@@ -739,39 +751,33 @@ rel(k) <= rel(p)   ⟺   k <= p
 ```
 
 mask 数学**完全不变**——不需要 per-row mask，不需要改 kernel 的打分逻辑。
+top-k 选中的 interior 块只是 map 里的另一段行基，执行表按真位置升序连续发布即可。
 
-**为什么不用搬字节（不变量 I2）。** `rel` 只是把 recent 段整体平移
-`delta = sink_end - lo`。只要 `delta ≡ 0 (mod 64)`，页内偏移 `rel & 63 = abs & 63` 不变，
-于是同一块的字节停在原地，**只有 `block_table[rel_page]` 这一行 4 字节的发布要改**
-（`KVExecutionTablePool::publish(row, logical_begin, ...)`，`paged_kv_cache.cpp:790-825`，
-`logical_begin` 本来就是任意页号）。
-
-`delta ≡ 0 (mod 64)` 自动成立，因为：
-
-- 块在绝对空间里**总是 128 对齐的**：块从 0 起连续排布，`truncate_to` 只缩短尾块、
-  不改变任何块的 `orig_pos_start`，补齐后下一块仍从 `(k+1)*128` 开始
-  （即 `block_tokens` 是 64 的倍数 ⇒ 块起始页对齐）
-- `sink_end = head * 128`、`lo = (count - tail) * 128`，两者都是 128 的倍数
+**为什么不用搬字节（不变量 I2）。** 块起点总是 64 页对齐：块从 0 连续排布，
+`truncate_to` 只缩短尾块、不改变任何 `orig_pos_start`，补齐后下一块仍从
+`(k+1)*block_tokens` 开始；`block_tokens` 是 64 的倍数。于是同一块内页偏移
+`rel & 63 == abs & 63`，字节停在原地，**只有 `block_table` 的行发布要改**
+（`KVExecutionTablePool::publish(row, logical_begin, ...)`，`logical_begin` 本来就是任意页号）。
 
 所以 **阶段 3 不存在"重排/搬移 GPU 字节"**，只有"改发布到执行表的页号"。
 
 **新增不变量**
 
-先纠正一个先前的误判：**不需要"窗口内每行真位置都小于 query"**。因为 `rel` 在驻留位置上
+先纠正一个先前的误判：**不需要"窗口内每行真位置都小于 query"**。因为 `rel` 在保留位置上
 严格单调，mask 判据是 `rel(k) <= rel(p)`，等价于 `k <= p`；真位置大于 query 的行自然落在
 `rel(p)` 之上、根本不会被读。所以窗口里残留未来的块**不会**造成过度可见。
-真正会静默出错的是**query 自己的位置没被保留**——`rel(p)` 无定义，或 `rel(p)` 覆盖的行没发布。
+真正会静默出错的是**query 自己所在的块没被保留**——`rel(p)` 无定义，或 `rel(p)` 覆盖的行没发布。
 
 | # | 不变量 | 谁保证 | 违反后果 |
 |---|---|---|---|
-| I1 | 下一次 attention 调用的位置区间 ⊆ 保留并集 `[0,sink_end) ∪ [recent_begin,total)` | `window_for()` 断言 | `rel(p)` 无定义 → 静默错结果，不崩 |
-| I2 | `sink_end`、`recent_begin` 都是 64-token 页的倍数 | `validate_config`（块 ≥ 1 页）+ `window_for()` 断言 | 页内偏移错位 ⇒ 读到错的 K/V |
+| I1 | 下一次 attention 调用的位置区间**触及的每个块**都 retained | `window_for()` 遍历 `[first_block,last_block]` 断言 | `rel(p)` 无定义 → 静默错结果，不崩 |
+| I2 | `block_tokens` 是 64-token 页的倍数 | `validate_config` + `set_window()` 断言 | 页内偏移错位 ⇒ 读到错的 K/V |
 | I3 | 包含 frontier 的块必须被选中 | 选择器（`select_recency`/`select_topk` 强制保留尾块） | 前缀预算下无法 decode |
-| I4 | `rel` 行 `[0, rel(query_max)]` 覆盖的每一页都已发布到执行表 | 阶段 3 | 读到未发布/已释放的物理页 |
+| I4 | `retained_pages` 与按 map 数出的页数一致，且全部已发布 | `window_for()` + `set_window()` + `publish_window()` 断言 | 读到未发布/已释放的物理页 |
 
-I2 的前提"块起点总在 128 边界"由块表结构保证：块从 0 连续排布，`truncate_to` 只缩短尾块、
-不移动任何 `orig_pos_start`，补齐后下一块仍落在 `(k+1)*128`。已有单测覆盖
-（`test_block_starts_stay_page_aligned`）。
+I2 的前提"块起点总在 `block_tokens` 边界"由块表结构保证：块从 0 连续排布，`truncate_to`
+只缩短尾块、不移动任何 `orig_pos_start`，补齐后下一块仍落在 `(k+1)*block_tokens`。已有单测覆盖
+（`test_block_starts_stay_page_aligned`、`test_window_supports_blocks_wider_than_one_page_pair`）。
 
 **对阶段 2 / 阶段 3 的影响**
 
@@ -779,16 +785,15 @@ I2 的前提"块起点总在 128 边界"由块表结构保证：块从 0 连续�
   oracle 不改（数学没变）。但必须同步改 `softmax_attention.h` 的**契约注释**：
   现在写的是"absolute position p"，落地后 `positions` 是**窗口坐标**，
   真位置只走 `rope_positions` —— 这是最容易被后人踩中的坑，不写清等于埋雷。
-  还需：`envelope.max_visible_keys = sink_end + (max_p + 1 - lo) <= budget + 1`（有界），
+  还需：`envelope.max_visible_keys = rel(max_p) + 1 <= window_tokens + 1 <= budget + 1`（有界），
   `min_visible_keys` 同步按窗口下界给（`causal_softmax_attention.cpp:178` 要求 `> 0`）；
   topology class 可能翻转 ⇒ `graph_profiles` 要按窗口尺寸覆盖。
-- **阶段 3**：`ensure_mapped_to_tokens` 让"行号 == 真逻辑页号"，要让位给
-  "`rel_page` 页号发布"—— 实际改动点是 `kv_store.h:1467`
-  `tables_->publish(address.row->handle(), begin, ...)` 里的 `begin` 与页序列，
-  外加 I1（调用区间 ⊆ 保留并集，已在 `window_for()`）与 I4（rel 行全部已发布）两个断言，
-  以及 `materialization.cpp:1549-1551` 允许 decode 期本序列自己的页降级。
+- **阶段 3**：`publish_window` 按逻辑页升序把 retained page 连续发布到
+  `[0, retained_pages)`；`ensure_mapped_to_tokens` 在洞窗口下用
+  `retained_pages + (begin - pages_for_tokens(total))` 继续追加尾部页。
   **没有字节搬运原语。**
-- **阶段 4b（检索）带来的变化**：top-k 会让窗口从"两段"变成"多段"，
-  `rel` 需要推广为按选中块顺序的分段平移（每段一个 `delta`，仍要求每段 64 对齐）。
-  这正是参考实现最终用 per-cell mask 才能免掉的复杂度 —— 若 4b 的段数失控，
-  回退方案是给 Op 加 `key_positions`（即参考实现的路线），代价见上。
+- **阶段 4b（检索）**：top-k 的 interior 块直接进入 `row_base_by_block`，不再需要
+  "两段/多段 delta"或 per-cell mask。约束是调用区间必须落在同一个连续保留 run 内：
+  普通 decode 是单 token，自然满足；prefill chunk 与 MTP verify 是连续区间，所以这两条路径
+  强制 recency，由 startup 的 `budget >= call_span + 2*block_tokens` 校验保证区间落在
+  sink+tail 的 tail run 内。

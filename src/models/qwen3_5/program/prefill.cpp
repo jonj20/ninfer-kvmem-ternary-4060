@@ -1094,7 +1094,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                           ? staged.cursor + nominal
                                           : 0U);
             const std::int32_t cache_position_delta =
-                reselect_sequence_window(sequence, staged.cursor, staged.cursor + nominal - 1U);
+                reselect_sequence_window(sequence, staged.cursor, staged.cursor + nominal - 1U,
+                                         /*prefill=*/true);
             while (remaining != 0) {
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);

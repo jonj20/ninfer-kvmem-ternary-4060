@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -14,6 +15,10 @@ namespace {
 
 constexpr std::uint32_t page_tokens() noexcept {
     return static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / page_tokens();
 }
 
 } // namespace
@@ -100,10 +105,8 @@ std::vector<KVMemBlock> KVMemBlockStore::truncate_to(std::uint32_t token_pos) {
     }
 
     total_tokens_  = token_pos;
+    for (KVMemBlock& entry : blocks_) { entry.in_window = false; }
     window_tokens_ = 0;
-    for (const KVMemBlock& entry : blocks_) {
-        if (entry.in_window) { window_tokens_ += entry.n_tokens; }
-    }
     return dropped;
 }
 
@@ -210,58 +213,66 @@ void KVMemBlockStore::apply(const KVMemPlan& plan) {
 
 KVMemWindow KVMemBlockStore::window_for(const KVMemPlan& plan, std::uint32_t call_min_pos,
                                         std::uint32_t call_max_pos) const {
-    const std::uint32_t count    = block_count();
-    const std::uint32_t selected = static_cast<std::uint32_t>(plan.selected.size());
-
-    // `selected` is ascending and duplicate-free (finish_plan enforces both), so the leading and
-    // trailing selected runs are the matching prefix and suffix of that vector.
-    std::uint32_t prefix = 0;
-    while (prefix < selected && plan.selected[prefix] == prefix) { ++prefix; }
-    std::uint32_t suffix = 0;
-    while (suffix < selected &&
-           plan.selected[selected - 1 - suffix] == count - 1 - suffix) {
-        ++suffix;
+    const std::uint32_t count = block_count();
+    if (call_min_pos > call_max_pos || call_max_pos >= total_tokens_) {
+        throw std::logic_error("kvmem window asked about a position past the context");
     }
 
     KVMemWindow window;
+    window.block_tokens = cfg_.block_tokens;
+    window.total_tokens = total_tokens_;
     window.window_tokens = plan.window_tokens;
-    if (prefix + suffix >= count) {
-        // The whole context is selected: rel() must be the identity, and both zero boundaries
-        // give exactly that for every absolute position.
-        window.sink_end     = 0;
-        window.recent_begin = 0;
+
+    // The identity view is the whole selection: leave the map empty so rel()/retains() take the
+    // dense path and the executor publishes every mapped page.
+    bool identity = plan.selected.size() == count;
+    for (std::size_t index = 0; identity && index < plan.selected.size(); ++index) {
+        identity = plan.selected[index] == index;
+    }
+    if (identity) {
+        if (window.window_tokens != total_tokens_) {
+            throw std::logic_error("kvmem identity plan does not cover the whole context");
+        }
+        window.retained_pages = pages_for_tokens(total_tokens_);
     } else {
-        window.sink_end     = prefix > 0 ? blocks_[prefix - 1].orig_pos_end() : 0;
-        window.recent_begin = suffix > 0 ? blocks_[count - suffix].orig_pos_start : total_tokens_;
+        window.row_base_by_block.assign(count, std::numeric_limits<std::uint32_t>::max());
+        std::uint32_t row      = 0;
+        std::uint32_t pages    = 0;
+        std::uint32_t previous = 0;
+        for (std::size_t index = 0; index < plan.selected.size(); ++index) {
+            const std::uint32_t id = plan.selected[index];
+            if (id >= count) {
+                throw std::logic_error("kvmem selection names a block that does not exist");
+            }
+            if (index != 0 && id <= previous) {
+                throw std::logic_error("kvmem selection is not strictly ascending");
+            }
+            previous                       = id;
+            window.row_base_by_block[id]   = row;
+            row += blocks_[id].n_tokens;
+            pages += pages_for_tokens(blocks_[id].n_tokens);
+        }
+        if (row != window.window_tokens) {
+            throw std::logic_error("kvmem plan window_tokens disagrees with its selected blocks");
+        }
+        window.retained_pages = pages;
     }
 
-    if (call_max_pos >= total_tokens_) {
-        throw std::logic_error("kvmem window asked about a position past the context");
-    }
-    const bool in_sink   = call_max_pos < window.sink_end;
-    const bool in_recent = call_min_pos >= window.recent_begin;
-    if (!in_sink && !in_recent) {
-        // I1: the call would need a window row for a hole position, where rel() is undefined.
-        // The observable symptom is a plausible but wrong completion, not a crash.
-        throw std::logic_error("kvmem window does not retain the next call's position range");
-    }
-
-    const std::uint32_t page = page_tokens();
-    // I2 applies to a boundary only while its range is non-empty; an empty recent tail contributes
-    // no rows, so its degenerate `total_tokens_` value is never renumbered or published.
-    if (window.sink_end % page != 0 ||
-        (window.recent_begin < total_tokens_ && window.recent_begin % page != 0)) {
-        // A boundary off the page grid would shift in-page offsets, which would force a reselect
-        // to move bytes instead of republishing four-byte table entries.
-        throw std::logic_error("kvmem window boundaries are not page aligned");
-    }
-
-    const std::uint32_t expected = window.sink_end + (total_tokens_ - window.recent_begin);
-    if (window.window_tokens != expected) {
-        throw std::logic_error("kvmem window token count disagrees with its boundaries");
-    }
     if (window.window_tokens > cfg_.budget_tokens) {
         throw std::logic_error("kvmem window exceeds the configured budget");
+    }
+
+    // Every block the next call touches must be retained. Checking only the endpoints would let a
+    // call span a hole, where one constant row shift cannot describe the whole range.
+    const std::uint32_t first = block_id_containing(call_min_pos);
+    const std::uint32_t last  = block_id_containing(call_max_pos);
+    if (first >= count || last >= count) {
+        throw std::logic_error("kvmem window asked about a position past the context");
+    }
+    for (std::uint32_t id = first; id <= last; ++id) {
+        if (!window.block_retained(id)) {
+            throw std::logic_error("kvmem window does not retain the next call's position range");
+        }
     }
     return window;
 }
@@ -421,6 +432,34 @@ std::vector<KVMemBlockShare> kvmem_block_shares(std::int64_t first_position, std
         const std::int64_t end   = std::min(first_position + tokens, (block + 1) * span);
         shares.push_back(KVMemBlockShare{.block_id = static_cast<std::uint32_t>(block),
                                          .tokens   = static_cast<std::uint32_t>(end - begin)});
+    }
+    return shares;
+}
+
+std::vector<KVMemBlockShare> kvmem_store_block_shares(const KVMemBlockStore& store,
+                                                     std::uint32_t first_position,
+                                                     std::uint32_t tokens) {
+    if (tokens == 0) {
+        throw std::invalid_argument("kvmem captured range is not applicable");
+    }
+    const std::uint64_t range_end = static_cast<std::uint64_t>(first_position) + tokens;
+    if (range_end > store.total_tokens()) {
+        throw std::invalid_argument("kvmem captured range exceeds the store");
+    }
+    std::vector<KVMemBlockShare> shares;
+    shares.reserve(store.block_count());
+    for (std::uint32_t id = 0; id < store.block_count(); ++id) {
+        const KVMemBlock& block = store.block(id);
+        const std::uint32_t begin = std::max(first_position, block.orig_pos_start);
+        const std::uint32_t end   = std::min(static_cast<std::uint32_t>(range_end),
+                                            block.orig_pos_end());
+        if (end > begin) {
+            shares.push_back(KVMemBlockShare{.block_id = id, .tokens = end - begin});
+        }
+        if (block.orig_pos_start >= range_end) { break; }
+    }
+    if (shares.empty()) {
+        throw std::invalid_argument("kvmem captured range touches no block");
     }
     return shares;
 }

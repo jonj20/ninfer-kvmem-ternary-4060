@@ -662,12 +662,16 @@ void test_kv_store_window(ninfer::DeviceContext& device) {
     addresses.ensure_mapped_to_tokens(*address, 384, device.stream);
     addresses.commit_frontier(*address, 384);
     device.synchronize();
-    const store::KVMemWindow identity_view = addresses.window(*address);
-    expect(identity_view.sink_end == 0 && identity_view.recent_begin == 0,
-           "default KV window is the identity");
+    const store::KVMemWindow default_view = addresses.window(*address);
+    expect(default_view.is_identity(), "default KV window is the identity");
     expect(addresses.window_page_of(*address, 0) == 0 && addresses.window_page_of(*address, 3) == 3 &&
                addresses.window_page_of(*address, 5) == 5,
            "identity window pages equal logical pages");
+    store::KVMemWindow identity_view;
+    identity_view.block_tokens    = 128;
+    identity_view.total_tokens    = 384;
+    identity_view.window_tokens   = 384;
+    identity_view.retained_pages  = 6;
     const std::vector<std::int32_t> identity = read_block_table(physical_tables, 0, 6);
     expect(identity == std::vector<std::int32_t>({0, 1, 2, 3, 4, 5}),
            "identity window publishes row equal to logical page");
@@ -679,7 +683,8 @@ void test_kv_store_window(ninfer::DeviceContext& device) {
     const store::KVMemPlan plan = selection.select_recency();
     const store::KVMemWindow hole = selection.window_for(plan, 383, 383);
     selection.apply(plan);
-    expect(hole.sink_end == 128 && hole.recent_begin == 256 && hole.window_tokens == 256,
+    expect(hole.has_hole() && hole.block_retained(0) && !hole.block_retained(1) &&
+               hole.block_retained(2) && hole.window_tokens == 256 && hole.retained_pages == 4,
            "two-block budget over three blocks selects sink and tail around a hole");
     addresses.set_window(*address, hole, device.stream);
     device.synchronize();
@@ -688,8 +693,7 @@ void test_kv_store_window(ninfer::DeviceContext& device) {
                holed[3] == identity[5],
            "hole window keeps sink rows in place and slides the tail into the dense prefix");
     const store::KVMemWindow applied = addresses.window(*address);
-    expect(applied.sink_end == hole.sink_end && applied.recent_begin == hole.recent_begin &&
-               applied.window_tokens == hole.window_tokens,
+    expect(applied.same_layout(hole) && applied.window_tokens == hole.window_tokens,
            "set window is recorded on the address");
     expect(addresses.window_page_of(*address, 1) == 1 && addresses.window_page_of(*address, 4) == 2 &&
                addresses.window_page_of(*address, 5) == 3,
@@ -771,23 +775,26 @@ void test_kv_store_window(ninfer::DeviceContext& device) {
     expect(host_arena.occupied_bytes() == 0, "hole Host extent frees after its replicas");
 
     bool misaligned = false;
+    store::KVMemWindow misaligned_window = hole;
+    misaligned_window.row_base_by_block[2] = 96;
     try {
-        addresses.set_window(*address, {.sink_end = 96, .recent_begin = 256, .window_tokens = 224},
-                             device.stream);
+        addresses.set_window(*address, misaligned_window, device.stream);
     } catch (const std::invalid_argument&) { misaligned = true; }
-    expect(misaligned, "misaligned window boundary is rejected");
-    bool past_frontier = false;
+    expect(misaligned, "a block map that is not a dense page-aligned prefix is rejected");
+    bool past_mapped = false;
+    store::KVMemWindow past_mapped_window = hole;
+    past_mapped_window.total_tokens = 448;
     try {
-        addresses.set_window(*address, {.sink_end = 128, .recent_begin = 448, .window_tokens = 256},
-                             device.stream);
-    } catch (const std::invalid_argument&) { past_frontier = true; }
-    expect(past_frontier, "window past the committed frontier is rejected");
+        addresses.set_window(*address, past_mapped_window, device.stream);
+    } catch (const std::invalid_argument&) { past_mapped = true; }
+    expect(past_mapped, "window past the mapped pages is rejected");
     bool overclaimed = false;
+    store::KVMemWindow overclaimed_window = hole;
+    overclaimed_window.window_tokens = 300;
     try {
-        addresses.set_window(*address, {.sink_end = 128, .recent_begin = 256, .window_tokens = 300},
-                             device.stream);
+        addresses.set_window(*address, overclaimed_window, device.stream);
     } catch (const std::invalid_argument&) { overclaimed = true; }
-    expect(overclaimed, "window claiming more tokens than it maps is rejected");
+    expect(overclaimed, "window claiming more tokens than it retains is rejected");
     expect(read_block_table(physical_tables, 0, 6) == holed,
            "rejected windows leave the publication unchanged");
 
@@ -841,6 +848,33 @@ void test_kv_store_window(ninfer::DeviceContext& device) {
     expect(addresses.release(*truncated) && pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "truncated windowed KV release closes physical ownership");
+
+    // Truncation resets the window to the identity sentinel while the published table still holds
+    // the hole layout. The next identity reselect must therefore republish instead of trusting
+    // same_layout(), or the address would run on a stale renumbering.
+    const auto reset = addresses.create_active(6, 0);
+    expect(reset.has_value(), "reset KV address allocation");
+    addresses.ensure_mapped_to_tokens(*reset, 384, device.stream);
+    addresses.commit_frontier(*reset, 384);
+    addresses.set_window(*reset, hole, device.stream);
+    device.synchronize();
+    expect(read_block_table(physical_tables, 0, 6) == holed,
+           "reset address publishes the hole window");
+    addresses.destructive_truncate(*reset, 256);
+    store::KVMemWindow reset_identity;
+    reset_identity.block_tokens   = 128;
+    reset_identity.total_tokens   = 256;
+    reset_identity.window_tokens  = 256;
+    reset_identity.retained_pages = 4;
+    addresses.set_window(*reset, reset_identity, device.stream);
+    device.synchronize();
+    expect(addresses.demoted_pages(*reset) == 0 &&
+               read_block_table(physical_tables, 0, 4) ==
+                   std::vector<std::int32_t>(identity.begin(), identity.begin() + 4),
+           "identity reselect after a truncation republishes the dense table");
+    addresses.deactivate(*reset);
+    expect(addresses.release(*reset) && physical_pages.allocated_pages() == 0,
+           "reset KV release closes physical ownership");
 }
 
 // A context larger than the Device pool (--kvmem-budget / ring shape): the logical entitlement is
@@ -911,7 +945,8 @@ void test_kv_store_staged_context(ninfer::DeviceContext& device) {
     store::KVMemPlan plan = selection.select_recency();
     store::KVMemWindow window = selection.window_for(plan, 319, 319);
     selection.apply(plan);
-    expect(window.sink_end == 128 && window.recent_begin == 256 && window.window_tokens == 256,
+    expect(window.block_retained(0) && !window.block_retained(1) && window.block_retained(2) &&
+               window.window_tokens == 256 && window.retained_pages == 4,
            "two-block budget over three blocks keeps sink and newest block");
     addresses.set_window(*address, window, device.stream);
     device.synchronize();
@@ -949,8 +984,9 @@ void test_kv_store_staged_context(ninfer::DeviceContext& device) {
     plan                = selection.select_recency();
     const store::KVMemWindow second_window = selection.window_for(plan, 447, 447);
     selection.apply(plan);
-    expect(second_window.sink_end == 128 && second_window.recent_begin == 384 &&
-               second_window.window_tokens == 192,
+    expect(second_window.block_retained(0) && !second_window.block_retained(1) &&
+               !second_window.block_retained(2) && second_window.block_retained(3) &&
+               second_window.window_tokens == 192 && second_window.retained_pages == 3,
            "the window follows the frontier into a partial trailing block");
     addresses.set_window(*address, second_window, device.stream);
     device.synchronize();

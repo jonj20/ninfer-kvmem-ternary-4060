@@ -140,14 +140,15 @@ and tool calls) at the cost of a second set of CUDA graphs.
 | `int8` | Maximum precision; very tight with Qwen3.8 |
 
 **KVMem.** `--kvmem-budget N` (default 32768, `0` disables windowing) bounds the Device KV window to
-a sink prefix plus the newest tail and keeps the rest in the pinned Host KV tier.
-`--kvmem-select recency|retrieval` picks the blocks: `retrieval` scores each historical block by
-mean-key similarity to the newest completed block, which lets a block outside the tail return. It
-needs a nonzero budget and is ignored while `--spec` runs.
+the selected blocks and keeps the rest in the pinned Host KV tier. Recency keeps a sink prefix plus
+the newest tail; `--kvmem-select retrieval` also returns the best-scoring interior blocks, scored by
+mean-key similarity to the newest completed block. Retrieval acts on ordinary decode only; prefill
+and MTP verify force recency because their contiguous call ranges must stay in one retained run.
 
 | Constraint | Why |
 |---|---|
 | `--kv-capacity >= budget + --prefill-chunk` | window plus the chunk in flight must fit |
+| `--kvmem-budget >= 2 * 128 + max(prefill chunk, verify range)` | one contiguous call must fit the recency tail |
 | `--kv-capacity < --max-context` requires `--kv-ring` | otherwise startup rejects the pool |
 | Host KV tier required | a demoted page needs a Host replica; `--host-kv-mib 4096` sufficed at 256K |
 
@@ -168,8 +169,8 @@ display setup.
 - One RTX 4060 Laptop, one process, one resident model. No multi-GPU, no weight offload, no request
   preemption or priorities.
 - Qwen3.8-27B (19.0 GiB) needs KVMem + Host KV; Bonsai (6.4 GiB) is the recommended model here.
-- `--kvmem-budget` keeps a bounded Device window. Retrieval scoring is implemented but inert under
-  `--spec`, and MTP/draft pools are not windowed, so `--spec` keeps the dense path.
+- `--kvmem-budget` keeps a bounded Device window. Retrieval acts on ordinary decode only; prefill and
+  MTP verify stay on recency, and DFlash draft pools are not windowed.
 - Window slides move pages synchronously across the Device/Host boundary, about 30 % of prefill
   throughput in the 256K run.
 - `--host-kv-mib 0` does not auto-size with `--kv-ring` plus `--kvmem-budget`; pass an explicit size.
