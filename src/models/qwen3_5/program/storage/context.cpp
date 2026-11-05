@@ -1808,8 +1808,8 @@ void ProgramImpl::stage_out_window_holes(const KVWindowSpace& space, KVAddressSp
         throw;
     }
     // Host data must land before a Host replica claims currency, and the Device slots must not
-    // be recycled while a copy still reads them. Exits are already gone from the execution
-    // table (set_window published before this runs), so no compute-stream reader is involved.
+    // be recycled while a copy still reads them. Reselect runs after the round's synchronization
+    // and the dropped pages are not in the new window, so no compute-stream reader is involved.
     (void)cudaStreamSynchronize(device.transfer_stream);
     for (PendingBackup& backup : backups) {
         (void)host_kv_extents->publish(std::move(backup.reservation));
@@ -1852,12 +1852,19 @@ void ProgramImpl::apply_window_space_transition(const KVWindowSpace& space, KVAd
             entries.push_back(page);
         }
     }
+    // Return the claims of the pages this window drops before staging its re-entries in. A ring, or
+    // any window that fills its entitlement, leaves the pool with no free page, and reserve_stage_in
+    // grows the address reservation exactly from the capacity stage-out just released. The round is
+    // synchronized before reselect and the new table is not published until the re-entries are
+    // resident, so doing the exit transfer first is safe.
+    addresses.release_window_exits(handle, window);
+    stage_out_window_holes(space, handle, window);
     const bool restored = stage_in_demoted_pages(space, handle, entries);
     // set_window always records the new window (token growth inside a retained page included) but
     // only republishes when the block->row layout moved; the address keeps its window across
-    // deactivate and activation republishes window-aware through commit_activation.
+    // deactivate and activation republishes window-aware through commit_activation. Its exit branch
+    // skips the pages release_window_exits already marked.
     addresses.set_window(handle, window, device.stream);
-    stage_out_window_holes(space, handle, window);
     // Stage-in copies are read by attention through the freshly published table before reselect
     // returns; the stage-out sync above does not order them when no backup ran.
     if (restored) { (void)cudaStreamSynchronize(device.transfer_stream); }

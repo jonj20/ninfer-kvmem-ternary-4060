@@ -465,6 +465,13 @@ prefill chunk 与 MTP verify 是**连续区间**，而 `rel` 在多个保留块�
   `!staging || reuse != Root` 执行；`advance_prefill` 在每次 reselect **之前**
   ensure 到 `cursor + nominal`（顺序保证：窗口只覆盖已映射页，`set_window` 的
   "claims more tokens than it maps" 检查）。dense 配置下是 no-op，行为不变。
+- **窗口切换顺序**（2026-11-05）：`apply_window_space_transition` 现按
+  `release_window_exits` → `stage_out_window_holes` → `stage_in_demoted_pages` →
+  `set_window` 执行。原来的"先入后出"要求切换瞬间同时容纳新旧窗口；`--kv-ring`
+  或窗口填满 entitlement 时 device 池已 640/640，首个 decode 的 retrieval re-entry
+  在 `reserve_stage_in` 就 `bad_alloc`——prompt > `kv_capacity` 必现，35k 因未超池而隐藏，
+  与 MTP 无关（`--spec none` 同样复现）。先出后入把出窗页的 claim 还给池，re-entry 复用
+  同一批物理页；`set_window` 的出窗分支对已标记页幂等。
 - **启动校验**（`startup.cpp:1125-`）：`kv_capacity >= budget`、
   `kv_capacity >= budget + prefill_chunk`（瞬时峰值 = 窗口 + 在飞 chunk 的由来）、
   Host tier 必需 —— `--host-kv-mib 0` 时按 `page_count(capacity) - page_count(budget)`

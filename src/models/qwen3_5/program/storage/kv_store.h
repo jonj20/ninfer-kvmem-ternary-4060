@@ -1570,6 +1570,26 @@ public:
         pages_->physical_pool().resize_reservation(address.reservation, 0);
     }
 
+    // Phase 1 of set_window: give up the active reference of every page the new window drops and
+    // mark it a hole without republishing the table. A transition at pool capacity (a ring, or a
+    // window that fills its entitlement) has to return those Device claims before it can stage the
+    // re-entries in, because reserve_stage_in grows this address's reservation one page at a time
+    // and publish_window still needs the re-entries resident. set_window skips pages this already
+    // marked, so the two calls compose in that order.
+    void release_window_exits(KVAddressSpaceHandle handle, const KVMemWindow& window) {
+        Address& address = require_active(handle);
+        for (std::uint32_t page_index = 0; page_index < address.page_count; ++page_index) {
+            if (window_retains_page(window, page_index)) { continue; }
+            const std::size_t cell = flag_cell(address, page_index);
+            if (demoted_[cell] != 0) { continue; }
+            const LogicalKVPageHandle logical = membership(address, page_index);
+            if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
+            pages_->release_active_reference(logical);
+            demoted_[cell] = 1;
+            ++address.demoted_count;
+        }
+    }
+
     // Republish this address space through a new renumbered window. Survivors keep their Device
     // pages; only the execution table moves. Throws when the block geometry is not a whole number
     // of pages, the window reaches past the mapped pages, or its block map is inconsistent.
@@ -1700,9 +1720,7 @@ public:
         // which is what keeps a windowed request's steady-state claim stable.
         if (address.reservation.pages() < count) {
             const std::uint32_t reachable = physical_tail_target(address);
-            if (reachable < count) {
-                throw std::bad_alloc();
-            }
+            if (reachable < count) { throw std::bad_alloc(); }
             pages_->physical_pool().resize_reservation(address.reservation, reachable);
         }
         // The identity window maps page p to window page p. A hole window appends the new tail
