@@ -157,18 +157,19 @@ KVMemPlan KVMemBlockStore::select_recency() const {
     return finish_plan(std::move(selected));
 }
 
-KVMemPlan KVMemBlockStore::select_topk() const {
+KVMemPlan KVMemBlockStore::select_topk(std::uint32_t recent_floor) const {
     const std::uint32_t count = block_count();
     const std::uint32_t keep  = std::min(count, budget_blocks());
     std::uint32_t head        = std::min(sink_blocks(), keep);
     // Same frontier guarantee as select_recency: the newest block must survive selection.
     if (count > keep && head == keep) { head = keep - 1; }
     const std::uint32_t keep_head = keep - head;
-    // recent_blocks only bites here: under Recency the budget already fills from the tail, so a
-    // recent floor smaller than the remaining budget is indistinguishable from no floor at all.
-    // One trailing block is always reserved because it owns the frontier.
-    const std::uint32_t recent =
-        std::min(keep_head, std::max(cfg_.recent_blocks, count > keep ? 1U : 0U));
+    // The newest blocks are always reserved: at least the frontier block, plus any floor the caller
+    // proves its next call spans (MTP verify/draft reads a contiguous tail). Under Recency the
+    // budget already fills from the tail, so a floor smaller than the remaining budget only matters
+    // here.
+    const std::uint32_t recent = std::min(
+        keep_head, std::max({cfg_.recent_blocks, count > keep ? 1U : 0U, recent_floor}));
     const std::uint32_t mid_budget = keep_head - recent;
     const std::uint32_t mid_begin  = head;
     const std::uint32_t mid_end    = count - recent;
@@ -325,7 +326,10 @@ void KVMemScoreStore::accumulate(std::uint32_t block_id, const float* partial_su
     if (block_id >= block_count()) { blocks_.resize(static_cast<std::size_t>(block_id) + 1U); }
     Block& block = require_block(block_id);
     if (!block.mean.empty() || count > block_tokens_ - block.tokens) {
-        throw std::invalid_argument("kvmem mean-K partial sum does not fit this block");
+        throw std::invalid_argument(
+            "kvmem mean-K partial sum does not fit block " + std::to_string(block_id) +
+            " (requested " + std::to_string(count) + ", already " +
+            std::to_string(block.tokens) + " of " + std::to_string(block_tokens_) + ")");
     }
     if (block.sum.empty()) { block.sum.assign(vector_width_, 0.0F); }
     for (std::uint32_t index = 0; index < vector_width_; ++index) {

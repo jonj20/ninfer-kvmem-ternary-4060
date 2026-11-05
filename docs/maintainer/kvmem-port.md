@@ -420,9 +420,11 @@ reselect 的产物只有两样，形状都已经确定：
 - envelope 取 `rel(p_max) + 1`。
 
 prefill chunk 与 MTP verify 是**连续区间**，而 `rel` 在多个保留块之间不再是单一仿射段，
-因此这两条路径强制 recency：连续区间落在 sink+tail 的单个 run 内，仍然可以用一个 `delta`。
-检索只作用于单 token 的普通 decode。identity 窗口下 `rel ≡ abs`，`delta` 为 **0**——
-分支留在 Program（窗口的拥有者），执行层保持无状态。
+所以调用区间必须落在同一个连续保留 run 内。prefill 强制 recency（它写的连续区间 recency
+天然整段保留）；普通 decode（单 token）与 MTP verify/draft 走检索时，`select_topk` 用
+`recent_floor = block_count - block(call_min)` 强制保留调用区间覆盖的最新尾块，再按分数花
+剩余预算，于是 `[call_min, call_max]` 仍是一个连续 run、`delta` 仍是常量。identity 窗口下
+`rel ≡ abs`，`delta` 为 **0**——分支留在 Program（窗口的拥有者），执行层保持无状态。
 
 **已确认的事实**（决定了这个方案可行）：
 - `causal_softmax_attention.cpp:132`：`capacity = logical_pages * 64 = max_context`
@@ -517,6 +519,10 @@ DFlash/DFlash2 保持恒等窗口，留阶段 6b）：
   `lane × W + j` 分列单 token 求和入 staging（`text.cpp:839` 扩展），`prepare_kvmem_capture`
   容量加 `8 × 16 = 128` 列；decode 后按 `licensed_counts` 只折叠 committed 列（`accumulate_
   kvmem_decode_scores` 改按 `column` 索引 staging，ordinary decode `column = lane`，逐位不变）。
+- **检索范围**：MTP verify/draft 不再强制 recency。`select_window_blocks` 以
+  `recent_floor = block_count - block(call_min)` 让 `select_topk` 保留调用区间覆盖的最新
+  尾块，再按 mean-K 分数花剩余预算；startup 不再把 `--spec mtp` 的
+  `--kvmem-select retrieval` 降级为 Recency。
 - **文档**：`docs/cli.md` / `docs/serving.md` `--kvmem-budget` 行已更新（“ignored while --spec
   enabled” 改为仅 dflash 系忽略，mtp 加入 staging；kv-capacity 下界注明 MTP draft lead）。
 - **验收**：`ninfer_model_runtime` 全量编译通过；`ninfer_mtp_round_test`、`ninfer_speculative_round_test`
@@ -794,6 +800,7 @@ I2 的前提"块起点总在 `block_tokens` 边界"由块表结构保证：块�
   **没有字节搬运原语。**
 - **阶段 4b（检索）**：top-k 的 interior 块直接进入 `row_base_by_block`，不再需要
   "两段/多段 delta"或 per-cell mask。约束是调用区间必须落在同一个连续保留 run 内：
-  普通 decode 是单 token，自然满足；prefill chunk 与 MTP verify 是连续区间，所以这两条路径
-  强制 recency，由 startup 的 `budget >= call_span + 2*block_tokens` 校验保证区间落在
-  sink+tail 的 tail run 内。
+  普通 decode 是单 token，自然满足；prefill chunk 与 MTP verify 是连续区间，所以
+  `select_topk` 用 `recent_floor = block_count - block(call_min)` 强制保留调用区间覆盖的
+  最新尾块（MTP verify/draft 也走检索），prefill 仍强制 recency。startup 的
+  `budget >= call_span + 2*block_tokens` 保证该 floor 落在预算内。

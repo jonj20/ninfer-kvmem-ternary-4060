@@ -183,7 +183,12 @@ public:
     // Selector/scoring hook for a later retrieval round (phase 4b). Overwrites scores and returns
     // a plan over the same budget; identical to select_recency until a scorer exists.
     void set_scores(std::vector<double> scores);
-    [[nodiscard]] KVMemPlan select_topk() const;
+    // `recent_floor` forces the newest `recent_floor` blocks into the window regardless of score, so
+    // a caller whose next call spans a contiguous tail (MTP verify/draft) can guarantee every block
+    // it touches is retained. The remaining interior budget is still ranked by the pending scores.
+    // The floor is capped by the budget after the sink; a call range that cannot fit then fails
+    // window_for's I1 instead of silently reading holes.
+    [[nodiscard]] KVMemPlan select_topk(std::uint32_t recent_floor = 0) const;
 
 private:
     void validate_config(const KVMemConfig& cfg) const;

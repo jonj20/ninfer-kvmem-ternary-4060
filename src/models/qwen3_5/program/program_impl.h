@@ -1302,18 +1302,20 @@ private:
     // recorded segment.
     void accumulate_kvmem_decode_scores(SequenceState& sequence, std::uint32_t column,
                                         std::uint32_t token_position);
-    // One selection round over the sequence's blocks. Recency always; Retrieval scores the blocks
-    // against the newest captured mean and spends the leftover budget on the best matches, falling
-    // back to recency while no block has been captured yet.
+    // One selection round over the sequence's blocks. Prefill stays on recency (it writes a
+    // contiguous range recency keeps whole). A decode or MTP verify/draft call keeps its whole
+    // [call_min, call_max] range retained even under Retrieval, then scores the remaining interior
+    // blocks against the newest captured mean, falling back to recency while no block is captured.
     [[nodiscard]] qwen3_5::detail::KVMemPlan select_window_blocks(
-        SequenceState& sequence, qwen3_5::detail::KVMemBlockStore& store, bool prefill);
+        SequenceState& sequence, qwen3_5::detail::KVMemBlockStore& store, std::uint32_t call_min,
+        std::uint32_t call_max, bool prefill);
     // Sync the sequence's block mirror to cover [call_min, call_max], reselect its window and
-    // republish the text KV execution table when the window moved. `prefill` forces the recency
+    // republish the KV execution tables when the window moved. `prefill` forces the recency
     // selection: a prefill chunk writes a contiguous range that a top-k selection is not required
     // to retain, while recency always keeps the range the call writes into. Returns the row shift
     // every cache position of that call must apply (0 while the window is the identity), or 0
-    // without touching the table when speculative target verification owns the round (phase 6
-    // gives the draft pool its own store; until then it reads this table with absolute positions).
+    // without touching the table for a masked draft backend (DFlash/DFlash2), which reads absolute
+    // positions and keeps the identity window.
     [[nodiscard]] std::int32_t reselect_sequence_window(SequenceState& sequence,
                                                         std::uint32_t call_min,
                                                         std::uint32_t call_max, bool prefill);

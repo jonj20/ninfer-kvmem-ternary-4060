@@ -512,6 +512,49 @@ void test_window_retains_interior_topk_blocks() {
     expect_eq(window.rel(total - 1), 4 * kBlock - 1, "the frontier closes the dense prefix");
 }
 
+// MTP verify/draft reads a contiguous tail. Retrieval must reserve every block that call spans
+// even when the scores would otherwise spend the budget on interior blocks, so window_for's I1
+// holds for a multi-block call range.
+void test_topk_recent_floor_keeps_a_multi_block_call_whole() {
+    constexpr std::uint32_t blocks = 8;
+    store::KVMemConfig cfg;
+    cfg.block_tokens  = kBlock;
+    cfg.budget_tokens = 4 * kBlock;
+    cfg.sink_tokens   = 0;
+    cfg.recent_blocks = 0;
+    store::KVMemBlockStore selection(cfg);
+    selection.register_append(blocks * kBlock);
+
+    std::vector<double> scores(blocks, 0.0);
+    scores[1] = 10.0;
+    scores[3] = 10.0;
+    selection.set_scores(scores);
+
+    // Without a floor the budget goes to the sink, two interior blocks and the frontier block.
+    const store::KVMemPlan scattered = selection.select_topk();
+    expect(ids_of(scattered) == std::vector<std::uint32_t>({0, 1, 3, 7}),
+           "an unconstrained top-k spends the interior budget on the best-scoring blocks");
+
+    // A three-block call tail (blocks 5..7) forces the newest three blocks and leaves no interior
+    // budget, so the whole range sits in one retained run.
+    const store::KVMemPlan tailed = selection.select_topk(3);
+    expect(ids_of(tailed) == std::vector<std::uint32_t>({0, 5, 6, 7}),
+           "the recent floor reserves the newest blocks the call spans");
+
+    const std::uint32_t call_min = 5 * kBlock + 10;
+    const std::uint32_t call_max = blocks * kBlock - 1;
+    expect(throws([&] { (void)selection.window_for(scattered, call_min, call_max); }),
+           "a scattered selection cannot describe a call that spans its holes");
+    const store::KVMemWindow window = selection.window_for(tailed, call_min, call_max);
+    expect_eq(window.rel(call_min), kBlock + 10,
+              "the contiguous call tail keeps a single row shift");
+    expect_eq(window.rel(call_max), 4 * kBlock - 1, "the call tail closes the dense prefix");
+
+    // A one-block floor is the ordinary single-token decode and matches the default selection.
+    expect(ids_of(selection.select_topk(1)) == ids_of(selection.select_topk()),
+           "a one-block recent floor preserves ordinary decode");
+}
+
 // The captured range is partitioned into one share per block it touches, exactly as the reduction
 // wrote one column per block. These are the shares' own invariants: ascending contiguous block
 // ids, every count positive, and the counts summing back to the range length - which together make
@@ -599,6 +642,7 @@ int main() {
     test_scores_survive_partial_capture_and_truncation();
     test_topk_selection_uses_the_scores();
     test_window_retains_interior_topk_blocks();
+    test_topk_recent_floor_keeps_a_multi_block_call_whole();
     test_block_shares_partition_the_captured_range();
 
     if (failures == 0) { std::cout << "ok\n"; }

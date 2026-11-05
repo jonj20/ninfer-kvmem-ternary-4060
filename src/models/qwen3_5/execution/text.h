@@ -146,9 +146,9 @@ public:
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
     // Bind mean-key capture for this traversal. nullptr disables capture, which is the default:
-    // only the ordinary decode batch and the text prefill path bind it, so speculative target
-    // verification, draft bridges and multimodal prefills never contribute partial sums. The
-    // segment counter restarts with every binding because it describes one Program-level call.
+    // only the ordinary decode batch, the MTP verify/draft batch and the text prefill path bind it,
+    // so the standalone draft head never contributes partial sums. The segment counter restarts
+    // with every binding because it describes one Program-level call.
     void set_kvmem_capture(KVMemCaptureTarget* target) noexcept {
         kvmem_capture_      = target;
         kvmem_segment_n_    = 0;

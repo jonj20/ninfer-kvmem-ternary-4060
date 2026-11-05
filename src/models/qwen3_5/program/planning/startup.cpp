@@ -902,11 +902,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->capacity            = inputs.capacity;
     impl->kvmem_budget        = inputs.kvmem_budget;
     // Retrieval only changes anything when the window can be smaller than the context: a zero
-    // budget keeps every block resident, and speculative decoding keeps the identity window.
+    // budget keeps every block resident. Masked draft backends keep the identity window, so
+    // Retrieval is meaningful only for the ordinary and MTP staging paths.
     impl->kvmem_selection = (inputs.kvmem_budget != 0 &&
-                            inputs.speculative_backend == SpeculativeBackend::None)
-                               ? inputs.kvmem_selection
-                               : KVMemSelection::Recency;
+                             kvmem_resident_staging(inputs.speculative_backend))
+                                ? inputs.kvmem_selection
+                                : KVMemSelection::Recency;
     impl->main_page_groups    = main_page_groups;
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),

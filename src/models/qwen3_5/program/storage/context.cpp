@@ -242,6 +242,8 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.prefix_identity.clear();
     sequence.prefix_digests.clear();
     sequence.rope_delta              = 0;
+    sequence.kvmem.reset();
+    sequence.kvmem_scores.reset();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
@@ -1628,21 +1630,29 @@ void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
     // The lane contributed exactly one token, so the mean completes only when this token fills the
     // block; a block already promoted (or not yet mirrored) is skipped.
     if (block_id >= sequence.kvmem->block_count() || scores.has_mean(block_id)) { return; }
-    const std::uint32_t captured = scores.captured_tokens(block_id);
+    // A decode token can open a block the prefill never completed, so the score store may not know
+    // it yet; that is the same as having captured zero tokens.
+    const std::uint32_t captured =
+        block_id < scores.block_count() ? scores.captured_tokens(block_id) : 0U;
     if (captured >= block_tokens) { return; }
     scores.accumulate(block_id, host, 1);
     if (scores.captured_tokens(block_id) == block_tokens) { scores.finalize(block_id); }
 }
 
 KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockStore& store,
+                                            std::uint32_t call_min, std::uint32_t call_max,
                                             bool prefill) {
     (void)sequence;
-    // A prefill chunk writes a contiguous range and MTP verification reads a contiguous verify
-    // range; neither is required to survive a top-k selection, so both stay on recency. Retrieval
-    // only chooses extra interior blocks for the single-token ordinary decode call.
-    if (prefill || speculative_backend == SpeculativeBackend::Mtp) {
-        return store.select_recency();
-    }
+    (void)call_max;
+    // A prefill chunk writes a contiguous range that recency already keeps whole, so it stays on
+    // recency. A decode or MTP verify/draft call may span several blocks: its tail must be retained
+    // even under Retrieval, because one row shift can only describe a contiguous retained run.
+    // call_max is always the store's last token, so covering [call_min, call_max] is exactly
+    // reserving the newest `count - block(call_min)` blocks.
+    if (prefill) { return store.select_recency(); }
+    const std::uint32_t first_block = store.block_id_containing(call_min);
+    const std::uint32_t recent_floor =
+        first_block < store.block_count() ? store.block_count() - first_block : 0U;
     if (!retrieval_selection_active()) { return store.select_recency(); }
     if (sequence.kvmem_scores) {
         const std::optional<AttentionConfig>& attention = parameters.model.config().text.attention;
@@ -1652,7 +1662,7 @@ KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockS
             if (query_block > 0) {
                 const std::vector<float>& query = sequence.kvmem_scores->mean(query_block - 1U);
                 store.set_scores(sequence.kvmem_scores->score(query.data(), static_cast<std::uint32_t>(attention->key_width())));
-                return store.select_topk();
+                return store.select_topk(recent_floor);
             }
         }
     }
@@ -1682,7 +1692,7 @@ std::int32_t ProgramImpl::reselect_sequence_window(SequenceState& sequence, std:
     if (sequence.kvmem_scores && sequence.kvmem_scores->block_count() > store.block_count()) {
         sequence.kvmem_scores->truncate(store.block_count());
     }
-    const KVMemPlan plan     = select_window_blocks(sequence, store, prefill);
+    const KVMemPlan plan = select_window_blocks(sequence, store, call_min, call_max, prefill);
     const KVMemWindow window = store.window_for(plan, call_min, call_max);
     store.apply(plan);
     // Tier publication: restore re-entries, republish (window-aware), demote the dropped pages.
@@ -1985,6 +1995,10 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
+    // A root prompt restarts at absolute position 0, so any block mirror or mean-key capture from
+    // the previous occupant of this slot describes a different token stream.
+    sequence.kvmem.reset();
+    sequence.kvmem_scores.reset();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;

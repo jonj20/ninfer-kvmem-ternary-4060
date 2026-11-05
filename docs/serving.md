@@ -1050,8 +1050,9 @@ requests use it, so a wide window costs no host RAM up front.
 
 `--kvmem-budget` bounds the Device KV working set to a window of that many tokens: a retained sink
 prefix plus the newest tail, reselected every round; `--kvmem-select retrieval` also admits the
-best-scoring interior blocks on ordinary decode, while prefill and MTP verify reselect recency so
-their contiguous call range stays in one retained run. Pages that leave the window move to the
+best-scoring interior blocks on ordinary decode and MTP verify, reserving the contiguous tail each
+of those calls spans, while prefill reselects recency because a chunk writes a contiguous range that
+recency keeps whole. Pages that leave the window move to the
 pinned Host KV tier and return when a later reselect needs them, so one logical sequence still
 spans `--max-context` and a fresh prompt — one that reuses no cached prefix — may reach
 `--max-context` even though `--kv-capacity` holds only the window. A nonzero budget requires
