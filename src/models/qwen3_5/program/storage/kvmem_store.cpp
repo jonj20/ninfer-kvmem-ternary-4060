@@ -363,6 +363,10 @@ bool KVMemScoreStore::has_mean(std::uint32_t block_id) const {
     return block_id < block_count() && !blocks_[block_id].mean.empty();
 }
 
+bool KVMemScoreStore::has_tokens(std::uint32_t block_id) const {
+    return block_id < block_count() && blocks_[block_id].tokens != 0;
+}
+
 std::uint32_t KVMemScoreStore::captured_tokens(std::uint32_t block_id) const {
     return require_block(block_id).tokens;
 }
@@ -371,6 +375,20 @@ const std::vector<float>& KVMemScoreStore::mean(std::uint32_t block_id) const {
     const Block& block = require_block(block_id);
     if (block.mean.empty()) { throw std::logic_error("kvmem mean-K block is not finalized"); }
     return block.mean;
+}
+
+std::vector<float> KVMemScoreStore::mean_for_query(std::uint32_t block_id) const {
+    const Block& block = require_block(block_id);
+    if (!block.mean.empty()) { return block.mean; }
+    if (block.tokens == 0 || block.sum.empty()) {
+        throw std::logic_error("kvmem mean-K query block has no captured keys");
+    }
+    std::vector<float> result(vector_width_);
+    const float scale = 1.0F / static_cast<float>(block.tokens);
+    for (std::uint32_t index = 0; index < vector_width_; ++index) {
+        result[index] = block.sum[index] * scale;
+    }
+    return result;
 }
 
 std::vector<double> KVMemScoreStore::score(const float* query, std::uint32_t width) const {

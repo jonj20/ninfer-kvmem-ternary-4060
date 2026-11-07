@@ -1069,8 +1069,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
+            std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // The final prompt token samples the first generated token, but the recency window that
+            // covers the rest of the prompt hides older retrieved blocks from it. Process that token
+            // as its own chunk so the retrieval selector can rank against the newest captured block
+            // — the prompt's question — and admit those blocks before it runs.
+            if (retrieval_selection_active() &&
+                nominal == staged.prompt_tokens - staged.cursor && nominal > 1U) {
+                nominal -= 1U;
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -1093,9 +1101,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                       backend_kv_cache() && staged.prepare_mtp
                                           ? staged.cursor + nominal
                                           : 0U);
+            // The trailing single-token chunk stays contiguous by construction, so it can use the
+            // retrieval window; every other prefill chunk keeps the recency window it writes whole.
+            const bool retrieval_tail =
+                retrieval_selection_active() && nominal == 1U &&
+                staged.cursor + 1U == staged.prompt_tokens;
             const std::int32_t cache_position_delta =
                 reselect_sequence_window(sequence, staged.cursor, staged.cursor + nominal - 1U,
-                                         /*prefill=*/true);
+                                         /*prefill=*/!retrieval_tail);
             while (remaining != 0) {
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
@@ -1234,7 +1247,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
 
-        copy_round_token();
+        copy_round_token(sequence);
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,

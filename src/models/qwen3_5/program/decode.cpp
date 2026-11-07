@@ -6,6 +6,7 @@
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/rope_remap.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
 
@@ -169,9 +170,62 @@ void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     sequence.tail_hidden_valid = true;
 }
 
-void ProgramImpl::copy_round_token() {
-    CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
-                               device.stream));
+void ProgramImpl::copy_round_token(SequenceState& sequence) {
+    CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId),
+                               cudaMemcpyDeviceToHost, device.stream));
+    // Route A (kvmem-port.md §2.4): after prefill has cached every prompt key with absolute RoPE,
+    // re-rotate the retained keys in place so they share the compact window row with the decode
+    // query. Identity windows (budget == 0) move no page, so this is a no-op there.
+    if (!sequence.kv || !text_kv_addresses || !text_kv_pages) { return; }
+    const auto& text_cfg = parameters.model.config().text;
+    const auto* attention = text_cfg.attention ? &*text_cfg.attention : nullptr;
+    const auto* rope = text_cfg.rope_parameters ? &*text_cfg.rope_parameters : nullptr;
+    if (!attention || !rope || rope->rotary_dim == 0) { return; }
+    KVAddressSpaceStore& addresses = *text_kv_addresses;
+    LogicalKVPageStore& pages = *text_kv_pages;
+    const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t page_count = addresses.mapped_pages(sequence.kv->text);
+    std::vector<int> physical_page_list;
+    std::vector<float> delta_position_tokens;
+    physical_page_list.reserve(page_count);
+    delta_position_tokens.reserve(page_count);
+    for (std::uint32_t page = 0; page < page_count; ++page) {
+        if (!addresses.window_retains(sequence.kv->text, page)) { continue; }
+        const LogicalKVPageHandle logical = addresses.logical_page(sequence.kv->text, page);
+        if (!pages.device_resident(logical)) { continue; }
+        const std::uint32_t window_page = addresses.window_page(sequence.kv->text, page);
+        const float delta =
+            static_cast<float>(static_cast<std::int64_t>(window_page - page) * page_size);
+        if (delta == 0.0f) { continue; }
+        physical_page_list.push_back(addresses.physical_page(sequence.kv->text, page).index());
+        delta_position_tokens.push_back(delta);
+    }
+    const int count = static_cast<int>(physical_page_list.size());
+    if (count == 0) { return; }
+    const std::int32_t k_head_dim   = static_cast<std::int32_t>(attention->head_dim);
+    const std::int32_t k_kv_heads   = static_cast<std::int32_t>(attention->num_key_value_heads);
+    const std::int32_t k_rotary_dim = static_cast<std::int32_t>(rope->rotary_dim);
+    const float k_theta = rope->rope_theta;
+    int* d_pages = nullptr;
+    float* d_deltas = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_pages, count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_deltas, count * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(d_pages, physical_page_list.data(),
+                               count * sizeof(int), cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_deltas, delta_position_tokens.data(),
+                               count * sizeof(float), cudaMemcpyHostToDevice, device.stream));
+    const qwen3_5::PagedKVCacheView view = text_kv_view(sequence);
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t fidx = 0; fidx < layers; ++fidx) {
+        const auto& layer_view = view.layer_view(fidx);
+        void* k_data = layer_view.k_pages.data;
+        const int physical_pages = static_cast<int>(layer_view.k_pages.ne[3]);
+        ops::rope_remap_text_kv(k_data, k_head_dim, k_kv_heads, d_pages, d_deltas, count,
+                                k_rotary_dim, k_theta, physical_pages, device.stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    CUDA_CHECK(cudaFree(d_pages));
+    CUDA_CHECK(cudaFree(d_deltas));
 }
 
 void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -318,14 +372,15 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
             const std::int32_t cache_delta =
                 reselect_sequence_window(sequence, frontier, frontier, /*prefill=*/false);
-            // Cache rows are the current window's rows; rope rows stay absolute token positions.
+            // Cache rows are the current window's rows; rope rows follow the compressed window so
+            // query and re-rotated keys share one frame (route A).
             const auto window_pos = static_cast<std::uint32_t>(
                 static_cast<std::int64_t>(frontier) + static_cast<std::int64_t>(cache_delta));
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(window_pos, "ordinary batch position");
             ordinary_host_ingress->rope_positions[row] =
-                checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
+                checked_i32(window_pos, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             const StateImageSelectors selectors                 = state_selectors(sequence);

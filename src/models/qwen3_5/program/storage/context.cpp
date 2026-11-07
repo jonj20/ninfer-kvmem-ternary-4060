@@ -244,6 +244,7 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.rope_delta              = 0;
     sequence.kvmem.reset();
     sequence.kvmem_scores.reset();
+    sequence.kvmem_query.reset();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
@@ -1642,14 +1643,17 @@ void ProgramImpl::accumulate_kvmem_decode_scores(SequenceState& sequence,
 KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockStore& store,
                                             std::uint32_t call_min, std::uint32_t call_max,
                                             bool prefill) {
-    (void)sequence;
     (void)call_max;
     // A prefill chunk writes a contiguous range that recency already keeps whole, so it stays on
     // recency. A decode or MTP verify/draft call may span several blocks: its tail must be retained
     // even under Retrieval, because one row shift can only describe a contiguous retained run.
     // call_max is always the store's last token, so covering [call_min, call_max] is exactly
     // reserving the newest `count - block(call_min)` blocks.
-    if (prefill) { return store.select_recency(); }
+    if (prefill) {
+        // A new prompt (root or continuation) supplies a new query; the first decode captures it.
+        sequence.kvmem_query.reset();
+        return store.select_recency();
+    }
     const std::uint32_t first_block = store.block_id_containing(call_min);
     const std::uint32_t recent_floor =
         first_block < store.block_count() ? store.block_count() - first_block : 0U;
@@ -1657,12 +1661,25 @@ KVMemPlan ProgramImpl::select_window_blocks(SequenceState& sequence, KVMemBlockS
     if (sequence.kvmem_scores) {
         const std::optional<AttentionConfig>& attention = parameters.model.config().text.attention;
         if (attention) {
-            std::uint32_t query_block = sequence.kvmem_scores->block_count();
-            while (query_block > 0 && !sequence.kvmem_scores->has_mean(query_block - 1U)) { --query_block; }
-            if (query_block > 0) {
-                const std::vector<float>& query = sequence.kvmem_scores->mean(query_block - 1U);
-                store.set_scores(sequence.kvmem_scores->score(query.data(), static_cast<std::uint32_t>(attention->key_width())));
-                return store.select_topk(recent_floor);
+            if (!sequence.kvmem_query) {
+                // The query lives in the newest captured block, including a frontier block that is
+                // still filling: at the first decode that block holds the prompt's question.
+                std::uint32_t query_block = sequence.kvmem_scores->block_count();
+                while (query_block > 0 && !sequence.kvmem_scores->has_tokens(query_block - 1U)) {
+                    --query_block;
+                }
+                if (query_block > 0) {
+                    sequence.kvmem_query =
+                        sequence.kvmem_scores->mean_for_query(query_block - 1U);
+                }
+            }
+            if (sequence.kvmem_query) {
+                const std::vector<double> scores = sequence.kvmem_scores->score(
+                    sequence.kvmem_query->data(),
+                    static_cast<std::uint32_t>(attention->key_width()));
+                store.set_scores(scores);
+                const KVMemPlan plan = store.select_topk(recent_floor);
+                return plan;
             }
         }
     }
@@ -1735,6 +1752,8 @@ bool ProgramImpl::stage_in_demoted_pages(const KVWindowSpace& space, KVAddressSp
             throw;
         }
         enqueued = true;
+        kvmem_main_kv_h2d_pages += 1;
+        kvmem_main_kv_h2d_bytes += 0;
     }
     return enqueued;
 }
@@ -1770,6 +1789,17 @@ void ProgramImpl::stage_out_window_holes(const KVWindowSpace& space, KVAddressSp
         }
     }
     if (ready.empty() && backup_runs.empty()) { return; }
+
+    // Count Device->Host page migrations for KVMem observability: every page in backup_runs is
+    // copied to the Host KV tier; ready pages already have a current Host replica and only drop
+    // their Device replica (no transfer). Page byte size depends on the KV codec/geometry, so
+    // bytes are reported as 0 until a codec-aware sizing hook is added.
+    std::uint64_t d2h_pages = 0;
+    for (const std::vector<std::uint32_t>& run : backup_runs) {
+        d2h_pages += static_cast<std::uint64_t>(run.size());
+    }
+    kvmem_main_kv_d2h_pages += d2h_pages;
+    kvmem_main_kv_d2h_bytes += d2h_pages * 0;
 
     struct PendingBackup {
         HostKVExtentReservation reservation;
@@ -1813,7 +1843,7 @@ void ProgramImpl::stage_out_window_holes(const KVWindowSpace& space, KVAddressSp
     (void)cudaStreamSynchronize(device.transfer_stream);
     for (PendingBackup& backup : backups) {
         (void)host_kv_extents->publish(std::move(backup.reservation));
-    }
+}
     const auto drop = [&](std::uint32_t page) {
         // can_drop gates the shared/pinned cases; a skip keeps the page Device-resident, which
         // is a bounded budget overshoot, never a correctness problem.
@@ -2006,6 +2036,7 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
     // the previous occupant of this slot describes a different token stream.
     sequence.kvmem.reset();
     sequence.kvmem_scores.reset();
+    sequence.kvmem_query.reset();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;

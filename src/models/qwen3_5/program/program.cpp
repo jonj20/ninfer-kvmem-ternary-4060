@@ -493,6 +493,13 @@ SessionSnapshotTraffic Program::session_snapshot_traffic() const noexcept {
     return impl_->session_snapshot_traffic();
 }
 
+std::uint64_t Program::kvmem_d2h_pages() const noexcept { return impl_->kvmem_d2h_pages(); }
+std::uint64_t Program::kvmem_h2d_pages() const noexcept { return impl_->kvmem_h2d_pages(); }
+std::uint64_t Program::kvmem_d2d_pages() const noexcept { return impl_->kvmem_d2d_pages(); }
+std::uint64_t Program::kvmem_d2h_bytes() const noexcept { return impl_->kvmem_d2h_bytes(); }
+std::uint64_t Program::kvmem_h2d_bytes() const noexcept { return impl_->kvmem_h2d_bytes(); }
+std::uint64_t Program::kvmem_d2d_bytes() const noexcept { return impl_->kvmem_d2d_bytes(); }
+
 runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
     return impl_->resource_revision();
 }

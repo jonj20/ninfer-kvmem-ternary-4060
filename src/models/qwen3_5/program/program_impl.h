@@ -357,6 +357,10 @@ struct SequenceState {
     // against the newest block. Only allocated when Retrieval selection is active; a sequence that
     // is truncated or forked must truncate it in step with `kvmem`.
     std::optional<qwen3_5::detail::KVMemScoreStore> kvmem_scores;
+    // Frozen retrieval query: the mean key of the newest captured block at the first decode after a
+    // prefill. Keeping it fixed stops the generated tail from drifting the ranking away from the
+    // blocks the prompt asked about; prefill clears it so the next turn captures a new query.
+    std::optional<std::vector<float>> kvmem_query;
     ActiveStateBinding state;
     std::optional<StateImageHandle> rewrite_state;
     std::optional<StateImageHandle> reserved_state;
@@ -717,6 +721,21 @@ public:
     }
 
     qwen3_5::SessionSnapshotTraffic snapshot_traffic_;
+
+    // KVMem page-migration counters (Device/Host tier transfers), cumulative since construction.
+    std::uint64_t kvmem_main_kv_d2h_pages = 0;
+    std::uint64_t kvmem_main_kv_h2d_pages = 0;
+    std::uint64_t kvmem_main_kv_d2d_pages = 0;
+    std::uint64_t kvmem_main_kv_d2h_bytes = 0;
+    std::uint64_t kvmem_main_kv_h2d_bytes = 0;
+    std::uint64_t kvmem_main_kv_d2d_bytes = 0;
+
+    [[nodiscard]] std::uint64_t kvmem_d2h_pages() const noexcept { return kvmem_main_kv_d2h_pages; }
+    [[nodiscard]] std::uint64_t kvmem_h2d_pages() const noexcept { return kvmem_main_kv_h2d_pages; }
+    [[nodiscard]] std::uint64_t kvmem_d2d_pages() const noexcept { return kvmem_main_kv_d2d_pages; }
+    [[nodiscard]] std::uint64_t kvmem_d2h_bytes() const noexcept { return kvmem_main_kv_d2h_bytes; }
+    [[nodiscard]] std::uint64_t kvmem_h2d_bytes() const noexcept { return kvmem_main_kv_h2d_bytes; }
+    [[nodiscard]] std::uint64_t kvmem_d2d_bytes() const noexcept { return kvmem_main_kv_d2d_bytes; }
 
 private:
     void advance_resource_revision() noexcept {
@@ -1236,7 +1255,10 @@ private:
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
-    void copy_round_token();
+    // Called once after prefill has cached every prompt key and sampled the first token, before the
+    // first decode attention. Re-RoPEs the cached keys from their absolute positions to their compact
+    // window rows (route A) so query and key share the compressed retrieval frame.
+    void copy_round_token(SequenceState& sequence);
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,

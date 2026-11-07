@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <stdexcept>
+#include <cuda_bf16.h>
+#include <cmath>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -497,3 +499,70 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+namespace {
+
+// Re-RoPE a set of device KV pages in place: each cached key was rotated by its absolute position;
+// this applies an extra per-page rotation by `delta_position_tokens` so the key ends up rotated by
+// its compact window row. Delta is constant within a page because repacking preserves token order
+// inside a page. Layout: k_data[head_dim][64][kv_heads][physical_pages], contiguous, so element
+// (page p, head h, token t, leading l) is at
+// head_dim*(64*h + 64*kv_heads*p + t) + l. RoPE pairs are (leading i, leading i + rotary_dim/2).
+__global__ void rope_remap_text_kv_kernel(
+    __nv_bfloat16* __restrict__ k_data, int head_dim, int kv_heads,
+    const int* __restrict__ physical_page_list, const float* __restrict__ delta_position_tokens,
+    int count, int rotary_dim, float theta, int physical_pages) {
+    const int half = rotary_dim / 2;
+    extern __shared__ float smem[];
+    float* cos_cache = smem;
+    float* sin_cache = smem + half;
+    const int page_idx = blockIdx.x;
+    const int pp = physical_page_list[page_idx];
+    const float delta = delta_position_tokens[page_idx];
+    if (threadIdx.x < half) {
+        const int pair = threadIdx.x;
+        const float exponent = -2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+        const float frequency = powf(theta, exponent);
+        const float angle = delta * frequency;
+        sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+    }
+    __syncthreads();
+    const int vectors = kv_heads * 64;
+    for (int v = threadIdx.x; v < vectors; v += blockDim.x) {
+        const int h = v / 64;
+        const int t = v % 64;
+        // PageMajor layout: k_pages shape {head_dim, 64, kv_heads, physical_pages}.
+        // Element (l=0, t, h, p) offset = t*(kv_heads*physical_pages) + h*physical_pages + p.
+        __nv_bfloat16* base = k_data + static_cast<std::int64_t>(t) *
+                                    (static_cast<std::int64_t>(kv_heads) * physical_pages)
+                                + static_cast<std::int64_t>(h) * physical_pages + pp;
+        for (int pair = 0; pair < half; ++pair) {
+            const float x = __bfloat162float(base[pair]);
+            const float y = __bfloat162float(base[pair + half]);
+            const float c = cos_cache[pair];
+            const float s = sin_cache[pair];
+            base[pair] = __float2bfloat16_rn(x * c - y * s);
+            base[pair + half] = __float2bfloat16_rn(x * s + y * c);
+        }
+    }
+}
+
+} // namespace
+
+void rope_remap_text_kv(void* k_data, int head_dim, int kv_heads,
+                        const int* physical_page_list, const float* delta_position_tokens,
+                        int count, int rotary_dim, float theta, int physical_pages,
+                        cudaStream_t stream) {
+    if (count <= 0) { return; }
+    dim3 block(256);
+    dim3 grid(count);
+    const size_t smem = 2u * static_cast<size_t>(rotary_dim / 2) * sizeof(float);
+    rope_remap_text_kv_kernel<<<grid, block, smem, stream>>>(
+        static_cast<__nv_bfloat16*>(k_data), head_dim, kv_heads,
+        physical_page_list, delta_position_tokens, count, rotary_dim, theta, physical_pages);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace ninfer::ops

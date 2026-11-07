@@ -1003,6 +1003,16 @@ public:
     // it into the transfer stats the context-cache transactions cannot observe.
     [[nodiscard]] SessionSnapshotTraffic session_snapshot_traffic() const noexcept;
 
+    // KVMem page-migration traffic between the Device working set and the Host KV tier, cumulative
+    // since construction. Reported on GET /metrics so operators can verify the bounded window is
+    // actually paging pages in and out instead of pinning the whole context Device-resident.
+    [[nodiscard]] std::uint64_t kvmem_d2h_pages() const noexcept;
+    [[nodiscard]] std::uint64_t kvmem_h2d_pages() const noexcept;
+    [[nodiscard]] std::uint64_t kvmem_d2d_pages() const noexcept;
+    [[nodiscard]] std::uint64_t kvmem_d2h_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t kvmem_h2d_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t kvmem_d2d_bytes() const noexcept;
+
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;

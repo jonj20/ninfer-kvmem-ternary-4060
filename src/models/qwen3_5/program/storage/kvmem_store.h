@@ -236,8 +236,13 @@ public:
     void truncate(std::uint32_t count);
 
     [[nodiscard]] bool has_mean(std::uint32_t block_id) const;
+    [[nodiscard]] bool has_tokens(std::uint32_t block_id) const;
     [[nodiscard]] std::uint32_t captured_tokens(std::uint32_t block_id) const;
     [[nodiscard]] const std::vector<float>& mean(std::uint32_t block_id) const;
+    // Mean of the captured keys of a block that may still be filling. The retrieval query lives in
+    // the frontier block, which holds the prompt's tail until the next tokens arrive, so the first
+    // decode cannot wait for it to finalize.
+    [[nodiscard]] std::vector<float> mean_for_query(std::uint32_t block_id) const;
 
     // Softmaxed similarity of every block mean against `query`. Blocks without a mean score 0,
     // which places them after every scored block while still letting them be selected when the

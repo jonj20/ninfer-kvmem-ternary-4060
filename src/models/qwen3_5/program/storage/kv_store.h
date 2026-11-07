@@ -1999,6 +1999,19 @@ public:
         return addresses_[handle.index_].row->row_index();
     }
 
+    // Public per-page window accessors used by ProgramImpl::copy_round_token (route A re-RoPE)
+    // without exposing the private Address type.
+    [[nodiscard]] std::uint32_t window_page(KVAddressSpaceHandle handle,
+                                            std::uint32_t logical_page) const {
+        return window_page(require(handle), logical_page);
+    }
+
+    [[nodiscard]] bool window_retains(KVAddressSpaceHandle handle,
+                                      std::uint32_t logical_page) const {
+        const Address& address = require(handle);
+        return address.window.retains(logical_page * static_cast<std::uint32_t>(kPagedKVPageSize));
+    }
+
     [[nodiscard]] bool active(KVAddressSpaceHandle handle) const noexcept {
         return valid(handle) && addresses_[handle.index_].active;
     }

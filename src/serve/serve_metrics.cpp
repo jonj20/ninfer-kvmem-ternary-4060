@@ -169,6 +169,17 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);
     append_counter(out, "ninfer:ngram_draft_tokens_total", ngram_draft_tokens_total_);
     append_counter(out, "ninfer:ngram_draft_accepted_tokens_total", ngram_accepted_tokens_total_);
+    // KVMem bounded-window gauges: device-resident page count and host KV tier bytes.
+    append_counter(out, "ninfer:kvmem_device_main_kv_occupied_pages",
+                   static_cast<std::uint64_t>(live.device_main_kv_occupied_pages));
+    append_counter(out, "ninfer:kvmem_host_kv_occupied_bytes", live.host_kv_occupied_bytes);
+    // KVMem page-transfer counters (delta between snapshots = pages moved this interval).
+    append_counter(out, "ninfer:kvmem_main_kv_d2h_pages", live.main_kv_d2h_pages);
+    append_counter(out, "ninfer:kvmem_main_kv_h2d_pages", live.main_kv_h2d_pages);
+    append_counter(out, "ninfer:kvmem_main_kv_d2d_pages", live.main_kv_d2d_pages);
+    append_counter(out, "ninfer:kvmem_main_kv_d2h_bytes", live.main_kv_d2h_bytes);
+    append_counter(out, "ninfer:kvmem_main_kv_h2d_bytes", live.main_kv_h2d_bytes);
+    append_counter(out, "ninfer:kvmem_main_kv_d2d_bytes", live.main_kv_d2d_bytes);
     return out;
 }
 

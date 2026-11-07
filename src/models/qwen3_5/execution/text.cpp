@@ -1322,7 +1322,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
+            // RoPE always works on a dedicated tensor holding true absolute token positions. The
+            // compressed window row must never become the rotary phase: keys are rotary-transformed
+            // at append time, so blocks written in different rounds have to share one absolute frame.
+            const std::int32_t rope_axes = multimodal != nullptr ? 3 : 1;
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
                 static_cast<std::int32_t>(local_scatter_indices.size()));
@@ -1336,10 +1339,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             ops::fill_i32_positions(positions, cache_start, s);
 
-            Tensor rope_positions = positions;
+            // RoPE phase is the absolute token position and is independent of the window row. Keys
+            // are rotary-transformed before the cache append, so every retained block has to share
+            // one absolute frame; the compressed row only indexes the cache and masks causality.
+            Tensor rope_positions = roots.rope_positions;
             std::vector<std::int32_t> rope_positions_host;
             if (multimodal != nullptr) {
-                rope_positions = roots.rope_positions;
                 rope_positions_host.resize(static_cast<std::size_t>(3) * len);
                 const std::size_t prompt_tokens = multimodal->token_ids.size();
                 for (int axis = 0; axis < 3; ++axis) {
@@ -1349,16 +1354,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
                 }
                 copy_i32(rope_positions_host.data(), rope_positions, s);
-            } else if (rope_delta_ != 0) {
-                rope_positions = roots.rope_positions;
-                // RoPE keeps true absolute positions, so the window shift must not leak in. The
-                // shifted positions tensor already holds abs+delta, so rebuild abs when both apply.
-                if (cache_position_delta_ == 0) {
-                    ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
-                } else {
-                    ops::fill_i32_positions(rope_positions, base_i + t0, s);
-                    ops::offset_i32_positions(rope_positions, io_.rope_delta, rope_positions, s);
-                }
+            } else {
+                ops::fill_i32_positions(rope_positions, base_i + t0, s);
             }
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);

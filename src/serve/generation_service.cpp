@@ -284,6 +284,14 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         resolve_automatic_private_anchors(options_, engine_->options().context_cache);
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    if (logger_) {
+        const char* sel_name =
+            options_.kvmem_selection == KVMemSelection::Retrieval ? "retrieval" : "recency";
+        logger_->info("kvmem budget={} tokens selection={} kv_capacity={} tokens kv_ring={}",
+                      options_.kvmem_budget, sel_name,
+                      options_.kv_capacity.explicit_tokens,
+                      options_.kv_ring ? 1 : 0);
+    }
 }
 
 std::shared_ptr<RequestLifetime>

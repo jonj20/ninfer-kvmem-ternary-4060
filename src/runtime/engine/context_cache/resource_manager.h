@@ -1081,6 +1081,13 @@ public:
         out.main_kv_d2h_seconds                = context_stats_.main_kv_d2h_seconds;
         out.main_kv_h2d_seconds                = context_stats_.main_kv_h2d_seconds;
         out.main_kv_d2d_seconds                = context_stats_.main_kv_d2d_seconds;
+        // KVMem page migrations observed on the bounded Device window (Host KV tier transfers).
+        out.main_kv_d2h_pages                  = program.kvmem_d2h_pages();
+        out.main_kv_h2d_pages                  = program.kvmem_h2d_pages();
+        out.main_kv_d2d_pages                  = program.kvmem_d2d_pages();
+        out.main_kv_d2h_bytes                  = program.kvmem_d2h_bytes();
+        out.main_kv_h2d_bytes                  = program.kvmem_h2d_bytes();
+        out.main_kv_d2d_bytes                  = program.kvmem_d2d_bytes();
         out.backend_kv_d2h_pages               = context_stats_.backend_kv_d2h_pages;
         out.backend_kv_h2d_pages               = context_stats_.backend_kv_h2d_pages;
         out.backend_kv_d2d_pages               = context_stats_.backend_kv_d2d_pages;

@@ -75,6 +75,10 @@ if defined CLEAN (
 )
 
 call "%VCVARS%" || exit /b 1
+rem Keep /showIncludes in English so Ninja records header dependencies. A localized
+rem MSVC emits a translated prefix that Ninja drops, leaving depfiles empty and
+rem letting objects with a stale struct layout survive header edits.
+set "VSLANG=1033"
 set "PATH=%CUDA%\bin;%VCPKG%\installed\x64-windows\bin;%PATH%"
 
 set "NEED_CFG="

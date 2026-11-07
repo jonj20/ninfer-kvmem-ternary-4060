@@ -115,6 +115,8 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
+    [[nodiscard]] std::int32_t index() const noexcept { return index_; }
+
 private:
     friend class DeviceKVPagePool;
     friend class DeviceKVPageLease;
