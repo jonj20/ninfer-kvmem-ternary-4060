@@ -97,6 +97,22 @@ else()
       OUTPUT_STRIP_TRAILING_WHITESPACE
       ERROR_QUIET)
   endif()
+  # A source bundle or a fresh checkout may carry no release tag. Fall back to the
+  # enclosing KVMem VERSION file so local builds still report a meaningful release
+  # version instead of "untagged".
+  if(NOT _version)
+    foreach(_version_file "${SRC_DIR}/VERSION" "${SRC_DIR}/../../VERSION")
+      if(EXISTS "${_version_file}")
+        file(STRINGS "${_version_file}" _version_lines LIMIT_COUNT 1)
+        if(_version_lines)
+          string(STRIP "${_version_lines}" _version)
+          if(_version)
+            break()
+          endif()
+        endif()
+      endif()
+    endforeach()
+  endif()
   if(NOT _version)
     set(_version "untagged")
   endif()
