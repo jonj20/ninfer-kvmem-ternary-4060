@@ -34,8 +34,7 @@ ninfer::EngineOptions options(std::uint32_t max_context, bool yarn = false, floa
 
 // Every family with the same options gives the same plan, apart from what it refuses.
 const ninfer::runtime::RopeScalingSupport* const kFamilies[] = {
-    &ninfer::runtime::kQwen35RopeScaling, &ninfer::runtime::kQwen4ExpRopeScaling,
-    &ninfer::runtime::kGemma4RopeScaling};
+    &ninfer::runtime::kQwen35RopeScaling, &ninfer::runtime::kQwen4ExpRopeScaling};
 
 void unscaled() {
     for (const auto* family : kFamilies) {
@@ -115,8 +114,7 @@ void interpolation() {
                at_given.summary.native_context == 32768,
            "Qwen3.5: --rope-scaling-original-context sets the threshold");
     // The other families refuse it, naming the flags that work.
-    for (const auto* family : {&ninfer::runtime::kQwen4ExpRopeScaling,
-                               &ninfer::runtime::kGemma4RopeScaling}) {
+    for (const auto* family : {&ninfer::runtime::kQwen4ExpRopeScaling}) {
         bool refused = false;
         try {
             (void)ninfer::runtime::resolve_rope_scaling(options(524288, false, 1.0F, 2.0F),
@@ -135,7 +133,7 @@ void unknown_window() {
     bool refused = false;
     try {
         (void)ninfer::runtime::resolve_rope_scaling(options(4096), 0,
-                                                    ninfer::runtime::kGemma4RopeScaling);
+                                                    ninfer::runtime::kQwen35RopeScaling);
     } catch (const std::invalid_argument&) { refused = true; }
     expect(refused, "a model without a native window is refused");
 }

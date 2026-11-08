@@ -132,9 +132,9 @@ struct BoundaryEncodedText {
 
 class OrdinaryRunCache;
 
-// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's or DeepSeek's three
-// (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's).
-enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek };
+// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or DeepSeek's three
+// (digits in groups of up to three, CJK runs, then its own words).
+enum class ByteLevelSplit : std::uint8_t { Qwen, DeepSeek };
 
 class Tokenizer {
 public:
@@ -161,7 +161,7 @@ public:
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
-    // SentencePiece-style BPE (Gemma 4): spaces become U+2581, the whole text between added tokens
+    // SentencePiece-style BPE: spaces become U+2581, the whole text between added tokens
     // is one BPE word over code points, and a code point outside the vocabulary falls back to its
     // <0xXX> byte tokens. False for the byte-level Qwen tokenizer.
     [[nodiscard]] bool sentencepiece() const noexcept { return sentencepiece_; }

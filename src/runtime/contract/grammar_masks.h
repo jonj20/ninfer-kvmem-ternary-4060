@@ -29,8 +29,7 @@ namespace ninfer::runtime {
 // One mask over this budget fails its request: the grammar is too costly to serve.
 inline constexpr double kGrammarMaskBudgetSeconds = 5.0;
 
-// Retained for the upstream Flint core, which is outside the Qwen integration scope.
-// The adapted Qwen cores do not use this cost-based draft gate.
+// (no longer used by adapted cores)
 inline constexpr double kSpeculativeMaskSeconds = 0.004;
 class GrammarMaskCost final {
 public:

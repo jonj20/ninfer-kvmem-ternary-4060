@@ -20,14 +20,12 @@ circle.
 | Qwen3.8-27B | [MXFP8](https://huggingface.co/WaveCut/Qwen3.8-27B-MXFP8-CRACK-NInfer-v3) (17 GiB) | text, MTP | |
 | Qwen3.6-35B-A3B | official (22 GiB) | | text, MTP, DFlash, vision |
 | Qwen3.8-Flash-Next | [GSQ-RCO Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) with its n-gram table | experts in pinned host memory or on disk | experts on the GPUs: text, MTP, vision |
-| Gemma 4 26B-A4B | [QAT Q4_0 with MTP](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) (15 GiB) | text, chat history, MTP, vision on the GPU and on the CPU, video | |
 
 The 35B-A3B weights do not fit one 24 GB card beside the runtime.
 
 ## Engine rates
 
-`ninfer_bench` on one TITAN RTX and on an RTX 3090 with the same artifacts, `rk8v4` KV (F16 for
-Gemma 4), the mean of three runs after one warm-up. Prompt and decode in tokens per second:
+`ninfer_bench` on one TITAN RTX and on an RTX 3090 with the same artifacts, `rk8v4` KV, the mean of three runs after one warm-up. Prompt and decode in tokens per second:
 
 | model | pp512 TITAN | RTX 3090 | ratio | pp2048 TITAN | RTX 3090 | ratio | tg128 TITAN | RTX 3090 | ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -35,7 +33,6 @@ Gemma 4), the mean of three runs after one warm-up. Prompt and decode in tokens 
 | Qwen3.8-27B IQ3_S | 757 | 1,826 | 0.41 | 772 | 1,877 | 0.41 | 34.8 | 59.2 | 0.59 |
 | Qwen3.8-27B official | 775 | 1,807 | 0.43 | 793 | 1,771 | 0.45 | 29.8 | 48.8 | 0.61 |
 | Qwen3.8-27B MXFP8 | 810 | | | 832 | | | 30.9 | | |
-| Gemma 4 26B-A4B | 2,532 | 5,068 | 0.50 | 3,571 | 6,976 | 0.51 | 158.8 | 222.9 | 0.71 |
 
 The TITAN RTX reads memory at 672 GB/s against the RTX 3090's 936 GB/s (0.72), and one request's
 decode runs at 0.59 to 0.71 of the RTX 3090. Prompts run at 0.41 to 0.51: the card draws its 280 W
@@ -55,10 +52,9 @@ second, with the drafts accepted and the tokens per verify round in brackets:
 | Qwen3.8-27B IQ3_S | MTP, 3 drafts | 41.6 (0.29, 1.87) | 79.1 (0.29, 1.87) | 0.53 |
 | Qwen3.8-27B IQ3_S | DFlash2, 3 drafts | 32.5 (0.18, 1.52) | | |
 | Qwen3.8-27B official | MTP, 3 drafts | 35.3 (0.34, 2.02) | 78.6 (0.32, 1.95) | 0.45 |
-| Gemma 4 26B-A4B | MTP, 2 drafts | 290.7 (0.95, 2.91) | 435.2 (0.95, 2.91) | 0.67 |
 
 A verify round multiplies several columns per weight byte. Where those contractions run on FP16
-tensor cores (the T2, Q8 and Gemma paths) a round keeps the decode ratio; the official artifact's
+tensor cores (the T2 and Q8 paths) a round keeps the decode ratio; the official artifact's
 Q4 and Q5 verify kernels do not ([Where the time goes](#where-the-time-goes)).
 
 ### KV formats
@@ -92,16 +88,13 @@ A 65,536-token prompt, then 64 decoded tokens, one run each:
 | Ternary Bonsai 2 27B | `bf16` | 607 | 62.4 | |
 | Qwen3.8-27B IQ3_S | `rk8v4` | 598 | 33.4 | |
 
-At 16,384 tokens IQ3_S prompts at 701 tok/s and decodes at 33.1, Gemma 4 (F16 KV) at 2,660 and
-158.5. That Gemma run predates the vendored combine-loop barrier: its full-attention blocks then
-took llama.cpp's 8-column tile, and they now take the 32-column one
-([Turing tier](../maintainer/build-system.md#turing-tier-75)).
+At 16,384 tokens IQ3_S prompts at 701 tok/s and decodes at 33.1.
 
 ### Prompt attention tiles
 
 Median time of one complete prompt-attention launch at each tile, five interleaved rounds:
 
-| Gemma 4 width-512 attention, query / KV tokens | RTX 2080 Ti, 8 / 32 columns, ms | Quadro RTX 6000, 8 / 32 columns, ms |
+| width-512 attention, query / KV tokens | RTX 2080 Ti, 8 / 32 columns, ms | Quadro RTX 6000, 8 / 32 columns, ms |
 |---|---:|---:|
 | 512 / 512 | 0.650 / 0.418 | 0.599 / 0.411 |
 | 2,048 / 2,048 | 10.18 / 5.54 | 9.55 / 5.19 |
@@ -114,13 +107,10 @@ at their default power limits (250 W, 260 W); both tiles passed the FP64 oracles
 memcheck.
 
 Whole model on the Quadro RTX 6000, `ninfer_bench -r 3`, the previous tiles and these run one after
-the other: resident Gemma 4 26B-A4B with an F16 KV cache prefilled 512, 2,048 and 16,384 tokens at
-2,580, 3,802 and 3,251 tok/s instead of 2,465, 3,503 and 2,624 (4.7%, 8.5% and 23.9% faster) and
-decoded at 154.1 instead of 151.7. Resident Qwen3.6-35B-A3B with an FP8 KV cache prefilled 512,
+the other: resident Qwen3.6-35B-A3B with an FP8 KV cache prefilled 512,
 4,096 and 16,384 tokens at 570, 717 and 602 tok/s instead of 566, 708 and 582 (0.7%, 1.3% and 3.4%)
-and decoded at 131.3 instead of 131.0. In Nsight Systems the width-512 attention of a 2,048- and a
-16,384-token Gemma prompt took 1.89 s instead of 3.70 s, and the FP8 prompt attention of a
-16,384-token Qwen prompt 10.5 s instead of 12.2 s.
+and decoded at 131.3 instead of 131.0. In Nsight Systems the FP8 prompt attention of a
+16,384-token Qwen prompt took 10.5 s instead of 12.2 s.
 
 ### Several requests at once
 
@@ -230,10 +220,10 @@ A `bf16` cache on Turing multiplies Q, K and V as their FP16 roundings
   One card ran every single-card row (`CUDA_VISIBLE_DEVICES=0`); the pipeline-stage rows used both.
   The comparison card is an RTX 3090 at a 380 W limit, PCIe 4.0 x16, AMD EPYC 7702, driver 595.84.
 - **Builds.** `-DCMAKE_CUDA_ARCHITECTURES=75` and `86`, CUDA 12.8.93, GCC 13.3, Release, from the
-  same source. Each card used its built-in device route profile. The official, MXFP8 and Gemma 4
+  same source. Each card used its built-in device route profile. The official and MXFP8
   rows, the official prompt profile and the serving rows ran on the final source; the other rows
   on the source before the A8 GEMM padding and the width-512 tile change, which touch only those
-  GEMMs and Gemma 4's prompt attention.
+  GEMMs and those prompt attention kernels.
 - **Engine rates.** `ninfer_bench -r 3 --warmup 1 --max-ctx 4096` (`-r 1` and `--max-ctx 17408`
   or `66560` for the long prompts); speculative rows with `--ngram-draft-tokens 0`.
 - **Serving.** `ninfer-serve <artifact> --max-concurrency 8 --max-context 8192 --kv-capacity 65536

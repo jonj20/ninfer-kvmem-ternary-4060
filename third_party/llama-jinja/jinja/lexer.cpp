@@ -70,8 +70,7 @@ lexer_result lexer::tokenize(const std::string& source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
-                // NInfer: Python's \xHH and \uHHHH, a code point written as UTF-8 (Flint's
-                // template strips "\x00" from message text).
+                // NInfer: Python's \xHH and \uHHHH, a code point written as UTF-8.
                 if (escaped_char == 'x' || escaped_char == 'u') {
                     const size_t digits = escaped_char == 'x' ? 2 : 4;
                     if (pos + digits > src.size()) {

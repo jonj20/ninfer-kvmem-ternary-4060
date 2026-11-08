@@ -1,6 +1,5 @@
 // llama.cpp's flash_attn_ext_f16 (fattn-mma-f16.cuh) launched without ggml's backend context: the
-// host side of launch_fattn and ggml_cuda_flash_attn_ext_mma_f16_case, for Gemma 4's two shapes and
-// Flint's.
+// host side of launch_fattn and ggml_cuda_flash_attn_ext_mma_f16_case.
 
 #include "ggml_fattn.h"
 #include "ggml_bridge_internal.cuh"
@@ -90,8 +89,8 @@ constexpr int fitting_ncols1(int widest) {
     return 0;
 }
 
-// The configurations instantiated per tier: width 128 with eight query heads per key/value head
-// (Flint), width 256 with two and width 512 with eight (Gemma 4), each with the most query rows per
+// The configurations instantiated per tier: width 128 with eight query heads per key/value head,
+// width 256 with two and width 512 with eight, each with the most query rows per
 // tile that fit (fitting_ncols1).
 template <int D, DeviceTier Tier>
 struct Shape;
@@ -100,21 +99,21 @@ template <DeviceTier Tier>
 struct Shape<128, Tier> {
     static constexpr int ncols2 = 8;
     static constexpr int ncols1 = fitting_ncols1<128, ncols2, Tier>(8);
-    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Flint's width 128");
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits width 128");
 };
 
 template <DeviceTier Tier>
 struct Shape<256, Tier> {
     static constexpr int ncols2 = 2;
     static constexpr int ncols1 = fitting_ncols1<256, ncols2, Tier>(32);
-    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Gemma 4's width 256");
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits width 256");
 };
 
 template <DeviceTier Tier>
 struct Shape<512, Tier> {
     static constexpr int ncols2 = 8;
     static constexpr int ncols1 = fitting_ncols1<512, ncols2, Tier>(8);
-    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Gemma 4's width 512");
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits width 512");
 };
 
 static_assert(Shape<128, DeviceTier::Turing>::ncols1 == 4 &&

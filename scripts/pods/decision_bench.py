@@ -278,7 +278,7 @@ def branch_oracle(record: dict, failures: list[str]) -> None:
     asked = questions(16)
     together = call("/v1/systemone", {"state": state, "questions": asked})
     # A shared pass's kernels round otherwise than a pass of one question's, which moves a near tie
-    # (on Gemma 4 up to 0.15 between two levels a BF16 logit step apart); an answer the model is
+    # by up to 0.15 between two levels a BF16 logit step apart; an answer the model is
     # sure of moves only if a branch sees what it should not.
     worst, sure_worst, flips, sure_flips = 0.0, 0.0, 0, 0
     for name, body in asked.items():

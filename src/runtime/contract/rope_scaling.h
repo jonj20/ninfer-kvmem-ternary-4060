@@ -18,8 +18,7 @@
 
 namespace ninfer::runtime {
 
-// What a family's rotations take past the native window. YaRN is taken by every family whose
-// full-attention blocks rotate (Flint's do not, and it takes no scaling).
+// What a family's rotations take past the native window.
 struct RopeScalingSupport {
     std::string_view family; // named in a refusal
     bool interpolation = false; // linear position interpolation (--rope-scaling-factor)
@@ -27,7 +26,6 @@ struct RopeScalingSupport {
 
 inline constexpr RopeScalingSupport kQwen35RopeScaling{"Qwen3.5", true};
 inline constexpr RopeScalingSupport kQwen4ExpRopeScaling{"Qwen3.8-Flash-Next", false};
-inline constexpr RopeScalingSupport kGemma4RopeScaling{"Gemma 4", false};
 
 struct RopeScalingPlan {
     ops::RopeYarn yarn;         // what the family's rotations apply

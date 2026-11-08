@@ -65,7 +65,7 @@ struct ToolCallOutputContract {
     // Function whose call opener the rendered prompt already carries, empty when the model chooses
     // freely. It lives here because the prompt that carries the opener is the only thing that knows
     // it: a second, independently supplied copy could name a different tool and the continuation
-    // would be attributed to that one. The Qwen decoder and, for a Gemma 4 request, the Gemma
+    // would be attributed to that one. The Qwen decoder and the DeepSeek
     // decoder both start inside that call; the syntax of the opener is the model's own.
     std::string forced_tool_name;
     std::string continuation;
@@ -105,8 +105,7 @@ struct ParsedToolCallOutput {
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
                                 std::string_view forced_tool_name = {});
 
-// A call whose arguments came as untyped text, (name, value) pairs in order (Qwen's syntax and
-// Flint's), with each value read by its declared parameter's types; a mismatch or an undeclared
+// A call whose arguments came as untyped text, (name, value) pairs in order (Qwen's syntax), with each value read by its declared parameter's types; a mismatch or an undeclared
 // parameter is counted in `diagnostics` and kept.
 [[nodiscard]] GeneratedToolCall normalize_untyped_tool_call(
     std::string_view name, std::span<const std::pair<std::string_view, std::string_view>> arguments,

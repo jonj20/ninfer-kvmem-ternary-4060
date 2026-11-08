@@ -1,4 +1,4 @@
-# Performance
+﻿# Performance
 
 Every measured result in one place, card by card: what fits, decode and prompt rates by model, KV
 format, context depth and drafter, several requests at once, Qwen3.8-Flash-Next's expert
@@ -25,13 +25,13 @@ drafts with the tokens committed per verify round in brackets.
 | Card | Memory | Build | Power limit | Measured on |
 |---|---:|---|---|---|
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
+| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
 | RTX 5060 Ti, two and four | 16 GB each | `120a` | | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards) |
-| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
+| RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
+| A40 | 48 GB | `86` | 300 W |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
 | RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
 | RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |
@@ -58,11 +58,9 @@ a drafter / with MTP 3 / with DFlash2 5:
 | Qwen3.8-27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 872,448 / 794,624 / 716,800 | 405,504 / 356,352 / 245,760 | 417,792 / 364,544 / 258,048 | | | | |
 | Qwen3.8-27B | `rk4v4-e8` | 1,048,576 | 872,448 | 405,504 | 417,792 | | | | |
 | Qwen3.8-27B IQ3_S | `rk4v4` | | | | | 241,664 / 176,128 / 32,768 | 8,192 / does not fit | | |
-| Gemma 4 26B-A4B Q4_0 | `bf16` | | | | | 61,440 / 28,672 (MTP 2) | | | |
 
-Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b). An RTX
-5070 Ti that also drives a desktop started IQ3_S with `rk4v4-e8` at 122,880 tokens without a
-drafter and 98,304 with MTP 3 ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)).
+
+
 
 Filled to that window without a drafter (one request: a document with three codes at 33, 66 and
 90%, asked back in order):
@@ -785,117 +783,6 @@ five 65,536-token windows of PG-19 on two RTX 5090s: 8.0834 against llama.cpp's 
 disk experts give the same perplexity on every card checked (2.6057 on the V100 over the first
 40 KB, 2.53655 on the TITAN RTX over the first 40,000 bytes of `wikitext/00.txt`, INT8 KV).
 
-## Gemma 4 26B-A4B
-
-Google's [QAT Q4_0 release](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3)
-with its MTP assistant, F16 KV (`bf16`) unless a row names another.
-
-### Engine rates
-
-Prompt and decode in tok/s; llama.cpp on the same GGUF with flash attention:
-
-| Card | Engine | Prompt 2,048 | Prompt 10,000 | Prompt 40,000 | Decode | after 10,000 | after 40,000 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| RTX 3090 (350 W) | NInfer | 6,566 | 6,045 | 4,698 | 215.4 | 190.4 | 162.2 |
-| RTX 3090 (350 W) | llama.cpp | 4,925 | 4,697 | 3,767 | 168.6 | 151.7 | 135.7 |
-
-| Card | Engine | Prompt 512 | Prompt 2,048 | Prompt 16,384 | Decode 128 | after 16,384 |
-|---|---|---:|---:|---:|---:|---:|
-| RTX 3090 | NInfer | 5,068 | 6,976 | | 222.9 | |
-| TITAN RTX | NInfer | 2,532 | 3,571 | 2,660 | 158.8 | 158.5 |
-| Tesla V100 | NInfer | 2,631 | 3,005 | 2,572 | 167.7 | 145.3 |
-| Tesla V100 | llama.cpp | 1,608 | 1,514 | | 120.0 | 108.7 |
-
-The MTP assistant with 2 drafts decodes 435.2 tok/s on the RTX 3090 and 290.7 on the TITAN RTX
-(engine, 512-token prompt; 0.95, 2.91 on both).
-
-### KV formats on Gemma 4
-
-Decode tok/s of 128 tokens on an RTX 3090 held at 300 W, the HauhauCS Balanced artifact, one
-request, no drafts; prompts stay within 1.5% of F16 in every format:
-
-| `--kv-dtype` | empty context | after 10,000 | after 40,000 |
-|---|---:|---:|---:|
-| `bf16` | 199.8 | 176.3 | 150.4 |
-| `int8` | 195.0 | 175.2 | 149.2 |
-| `rk8v4` | 194.6 | 175.9 | 149.7 |
-| `rk4v4` | 193.8 | 175.5 | 150.5 |
-| `rk4v4-e8` | 192.6 | 174.8 | 149.7 |
-| `rk2v4-e8` | 185.6 | 167.7 | 144.7 |
-| `fp8` | 177.9 | 154.7 | 130.5 |
-| `k8v4` | 177.0 | 152.6 | 129.1 |
-| `nvfp4` | 176.8 | 149.7 | 125.5 |
-
-The FP8 and NVFP4 formats lose 11 to 17% already on an empty context: the RTX 3090 has no E4M3 or
-E2M1 conversion instruction (sm_89 adds them), and those decodes run in software.
-
-The longest `--max-context` that `ninfer-serve --max-concurrency 8` starts with on the RTX 3090,
-HauhauCS artifact, context cache on, no vision tower:
-
-| `--kv-dtype` | 8 sequences, MTP 2 | 8 sequences, no drafts |
-|---|---:|---:|
-| `bf16` | 24,576 | 36,864 |
-| `int8` | 82,944 | 96,256 |
-| `fp8` | 84,992 | 98,304 |
-| `rk8v4` | 92,160 | 103,424 |
-| `k8v4` | 94,208 | 105,472 |
-| `nvfp4` | 163,840 | 179,200 |
-| `rk4v4`, `rk4v4-e8` | 164,864 | 180,224 |
-| `rk2v4-e8` | 173,056 | 186,368 |
-
-Perplexity by format is in [Gemma 4](gemma4.md#quality-and-speed).
-
-### Server
-
-Ten chat requests one at a time to `ninfer-serve` on the RTX 3090, 384 generated tokens each; every
-configuration generates the same tokens:
-
-| Decode tok/s | greedy | after a 13,600-token prompt | sampled (T 1, top-k 64, top-p 0.95) |
-|---|---:|---:|---:|
-| no drafter | 209.1 | 186.0 | 207.9 |
-| MTP 1 (acceptance 0.81) | 280.1 | 240.2 | |
-| MTP 2 (0.70; 0.63 sampled) | 290.7 | 241.9 | 270.6 |
-| MTP 3 (0.62; 0.55 sampled) | 293.7 | 229.2 | 268.0 |
-
-llama.cpp's server with the same GGUF and drafter decodes the greedy requests at 131.4 tok/s, 186.4
-with one draft, 201.6 with two and 195.2 with three. Parallel streams, total tok/s:
-
-| Streams | no drafter | with the assistant |
-|---:|---:|---|
-| 1 | 208.4 | 295.5 with three drafts, 291.8 with two |
-| 2 | 310.1 | 370.0 with one draft each |
-| 3 | 354.7 | 365.7 with one draft each |
-| 4 | 397.2 | 387.6 with one draft each, so four or more decode plainly |
-
-On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without a drafter and
-226.3 with MTP 2 (0.70, 2.40); after 1,024 and 8,192 tokens 155.6 and 149.5, with MTP 2 187.7 and
-167.0. Prompt time is 0.36 s at 1,024 tokens and 2.9 s at 8,192.
-
-## Flint
-
-Recursive's Flint from Unsloth's
-[UD-Q4_K_XL GGUF](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3), F16 KV, one sequence.
-
-### Engine rates
-
-Prompt and decode in tok/s; llama.cpp b11804 on the same GGUF with flash attention. The 23.4 GiB of
-weights fit only the RTX 5090, where both engines keep every expert on the GPU. On the 24 GB cards
-NInfer keeps the experts in pinned host memory with the device cache it sizes itself (19 GiB), and
-llama.cpp keeps the experts of its first four blocks on the CPU (`-ncmoe 4`, the fewest that run a
-10,000-token prompt):
-
-| Card | Engine | Prompt 2,048 | Prompt 10,000 | Decode | after 10,000 |
-|---|---|---:|---:|---:|---:|
-| RTX 5090 (575 W) | NInfer | 15,670 | 14,656 | 347.7 | 314.6 |
-| RTX 5090 (575 W) | llama.cpp | 8,702 | 8,679 | 222.7 | 209.2 |
-| RTX 4090 (500 W) | NInfer, host experts | 12,423 | 11,466 | 210.2 | 188.0 |
-| RTX 4090 (500 W) | llama.cpp, `-ncmoe 4` | 4,868 | 4,725 | 165.7 | 149.4 |
-| RTX 3090 (370 W) | NInfer, host experts | 6,225 | 5,755 | 161.4 | 140.2 |
-| RTX 3090 (370 W) | llama.cpp, `-ncmoe 4` | 2,633 | 2,553 | 79.9 | 77.1 |
-
-[Flint's measurements](flint.md#measurements) name the hosts and add disk experts and context
-lookup.
-
 ## DeepSeek-V4.1-Flash
 
 ISTA-DASLab's GSQ-RCO IQ1_M GGUF with its Engram table
@@ -965,13 +852,13 @@ cache each card holds, context lookup, startup and what limits each engine.
 | Page | What it measures | Hardware |
 |---|---|---|
 | [Reference measurements, September 2026](performance/reference-2026-09.md) | Ternary Bonsai 2 27B and Qwen3.8-27B at full context: decode and prompt time by depth, drafters, largest context per card, needles, several requests at once, what the device profiles change, and the October re-check | RTX 3090, 4090, 5090, PRO 6000 |
-| [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
+| [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
 | [TITAN RTX, October 2026](performance/titan-rtx-2026-10.md) | a `75` build on one and two 24 GB cards: every model's prompt and decode rates against an RTX 3090, drafters, KV formats, depth, Flash-Next and the 35B-A3B over two stages, the device profile, where the time goes, perplexity | TITAN RTX, RTX 3090 |
 | [8, 11 and 12 GB cards, October 2026](performance/small-cards-2026-10.md) | the published image on small cards: which models load, CLI rates, the largest context, Flash-Next with host and disk experts | RTX 3060 Ti, RTX 2080 Ti, RTX 3060 |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
-| [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
-| [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
+
+
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
@@ -990,3 +877,4 @@ evaluates several requests together, and the different reduction orders can flip
 argmax. MTP and DFlash2 outputs differ from each other and from plain greedy decoding, and DFlash2's
 output varies with the draft count, without a measurable perplexity cost
 ([batch composition](device-profiles.md#batch-composition)).
+

@@ -59,10 +59,20 @@ import numpy as np
 from tools.convert.deepseek_v41 import GGUFShards
 from tools.convert.sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 
-from .gemma4 import rms, target_nll
-
 P = "deepseek41."
 DIRECT_TYPES = (TYPE_F32, TYPE_F16, TYPE_BF16)
+
+
+def rms(x: np.ndarray, eps: float, w: np.ndarray | None = None) -> np.ndarray:
+    y = x / np.sqrt((x * x).mean(-1, keepdims=True) + eps)
+    return y * w if w is not None else y
+
+
+def target_nll(logits: np.ndarray, ids: list[int]) -> np.ndarray:
+    top = logits.max(-1, keepdims=True)
+    lse = top[:, 0] + np.log(np.exp(logits - top).sum(-1))
+    n = len(ids)
+    return lse[: n - 1] - logits[np.arange(n - 1), ids[1:]]
 
 
 def dequantize(file: GGUFFile, name: str, row_begin: int = 0,

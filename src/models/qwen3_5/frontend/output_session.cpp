@@ -2,8 +2,6 @@
 #include "text/structured_output.h"
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/deepseek_output.h"
-#include "models/qwen3_5/frontend/flint_output.h"
-#include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/reasoning_loop.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
@@ -191,9 +189,6 @@ struct HeldLogprob {
 struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
-    // Gemma: inside a channel's header (`thought\n` after <|channel>), and its bytes so far.
-    bool gemma_header = false;
-    std::string gemma_header_text;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
     // A grammar constrains the output: the first close marker ends the reasoning.
@@ -493,20 +488,15 @@ public:
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
-         std::shared_ptr<const fi::GemmaMarkers> gemma_,
-         std::shared_ptr<const fi::FlintMarkers> flint_,
          std::shared_ptr<const fi::DeepSeekMarkers> deepseek_)
-        : gemma(output.raw ? nullptr : std::move(gemma_)),
-          flint(output.raw ? nullptr : std::move(flint_)),
-          deepseek(output.raw ? nullptr : std::move(deepseek_)), tokenizer(std::move(tokenizer_)),
+        : deepseek(output.raw ? nullptr : std::move(deepseek_)), tokenizer(std::move(tokenizer_)),
           policy(std::move(policy_)), thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens ||
                            (tool_call_output_ && tool_call_output_->constrained)),
           split_reasoning(starts_in_reasoning && !output.raw),
-          // Copied, not moved: the body still asks whether the request declared tools. Gemma's,
-          // Flint's and DeepSeek's calls go through their own decoders; the Qwen decoder would
+          // Copied, not moved: the body still asks whether the request declared tools. DeepSeek's calls go through their own decoder; the Qwen decoder would
           // seed its own opener for a forced call.
-          tool_call_output(output.raw || gemma || flint || deepseek ? nullptr : tool_call_output_,
+          tool_call_output(output.raw || deepseek ? nullptr : tool_call_output_,
                            output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
@@ -525,34 +515,16 @@ public:
         // must run without a budget too (upstream Neroued/ninfer#373). The budget caps it and the
         // loop guard reads it. Cost: one close-marker scan per generated thinking token.
         semantic.in_reasoning = starts_in_reasoning;
-        collect_open_reasoning = split_reasoning && gemma == nullptr && flint == nullptr &&
-                                 !deepseek && tool_call_output_ != nullptr;
-        if (gemma && tool_call_output_ != nullptr) {
-            // A forced call's opener, `<|tool_call>call:NAME{`, is already in the prompt.
-            gemma_tools.emplace(tool_call_output_->forced_tool_name);
-        }
-        if (flint && tool_call_output_ != nullptr) { flint_tools.emplace(tool_call_output_); }
+        collect_open_reasoning = split_reasoning && !deepseek && tool_call_output_ != nullptr;
         if (deepseek && tool_call_output_ != nullptr) { deepseek_tools.emplace(tool_call_output_); }
     }
 
-    // Gemma's dialect: channel markers open and close reasoning, tool-call markup stays in the
-    // content for gemma_tools (present when the request declared tools).
-    std::shared_ptr<const fi::GemmaMarkers> gemma;
-    std::optional<fi::GemmaToolCallDecoder> gemma_tools;
-    // Flint's dialect: the model's own <think> and </think> tokens open and close reasoning,
-    // tool-call markup stays in the content for flint_tools (present when the request declared
-    // tools).
-    std::shared_ptr<const fi::FlintMarkers> flint;
-    std::optional<fi::FlintToolCallDecoder> flint_tools;
-    // DeepSeek's dialect: the prompt opens reasoning as Qwen's does and the model's </think>
-    // token closes it, DSML tool calls stay in the content for deepseek_tools (present when the
-    // request declared tools).
     std::shared_ptr<const fi::DeepSeekMarkers> deepseek;
     std::optional<fi::DeepSeekToolCallDecoder> deepseek_tools;
 
-    // Whether the model opens its reasoning itself (Gemma's thought channel, Flint's <think>), so
-    // the decoder's channel, not the prompt-opened semantic state, says when it reasons.
-    [[nodiscard]] bool model_opens_reasoning() const noexcept { return gemma || flint; }
+    // Whether the model opens its reasoning itself (the prompt-opened semantic state says when it
+    // reasons).
+    [[nodiscard]] bool model_opens_reasoning() const noexcept { return false; }
 
     // The repeated-passage coverage of the committed thinking plus the previewed round's words.
     [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
@@ -566,7 +538,7 @@ public:
     }
 
     // Whether the loop guard reads this point of the output: Qwen's thinking, opened by the prompt
-    // and tracked by the semantic state, or the reasoning a Gemma or Flint model opened itself.
+    // and tracked by the semantic state, or the reasoning a model opened itself.
     [[nodiscard]] bool loop_reasoning(const DecoderState& decoder,
                                       const SemanticThinkingState& thinking) const noexcept {
         return model_opens_reasoning() ? decoder.in_reasoning : thinking.in_reasoning;
@@ -695,14 +667,12 @@ OutputSession::OutputSession(
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
     std::shared_ptr<text::GrammarState> grammar,
-    std::shared_ptr<const frontend::GemmaMarkers> gemma,
-    std::shared_ptr<const frontend::FlintMarkers> flint,
     std::shared_ptr<const frontend::DeepSeekMarkers> deepseek,
     std::optional<TokenId> suppressed_tool_open)
     : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
                                    starts_in_reasoning, thinking,
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
-                                   std::move(gemma), std::move(flint), std::move(deepseek))) {
+                                   std::move(deepseek))) {
     impl_->grammar              = std::move(grammar);
     impl_->state.exact_close    = impl_->grammar != nullptr;
     impl_->semantic.exact_close = impl_->grammar != nullptr;
@@ -805,7 +775,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             recover_open_calls = probe.finish(FinishReason::StopToken, reasoning)
                                      .diagnostics.recovered_from_reasoning;
         }
-        if (!impl_->gemma && stop_token && impl_->preview_state.in_reasoning &&
+        if (stop_token && impl_->preview_state.in_reasoning &&
             !holds_presentation_close(impl_->preview_state) && !recover_open_calls) {
             DecoderState& state = impl_->preview_state;
             // This token itself closes thinking; unlike a token confirming an already held
@@ -905,53 +875,8 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         StopMatch match;
         std::string_view bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
-        if (impl_->gemma) {
-            const fi::GemmaMarkers& markers = *impl_->gemma;
-            DecoderState& decoder           = impl_->preview_state;
-            if (token == markers.channel_open) {
-                decoder.gemma_header = true;
-                decoder.gemma_header_text.clear();
-                bytes = {};
-            } else if (decoder.gemma_header) {
-                // The channel's name and its newline; whatever follows in the token is reasoning.
-                decoder.gemma_header_text.append(decoded.bytes);
-                const std::size_t newline = decoder.gemma_header_text.find('\n');
-                bytes                     = {};
-                if (newline != std::string::npos) {
-                    decoder.gemma_header = false;
-                    decoder.in_reasoning = true;
-                    const std::size_t rest =
-                        decoder.gemma_header_text.size() - newline - 1;
-                    bytes = decoded.bytes.substr(decoded.bytes.size() - rest);
-                }
-            } else if (token == markers.channel_close) {
-                bytes = decoder.in_reasoning ? std::string_view("</think>\n") : std::string_view{};
-            } else if (markers.markup(token)) {
-                bytes = decoded.bytes;
-            }
-            if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
-                decoder.in_reasoning && token != markers.channel_close) {
-                append_words(bytes, thinking.loop_partial, thinking.loop_round);
-                append_tail(bytes, thinking.loop_tail);
-            }
-        } else if (deepseek_close && impl_->preview_state.in_reasoning) {
+        if (deepseek_close && impl_->preview_state.in_reasoning) {
             bytes = thinking_bytes;
-        } else if (impl_->flint) {
-            const fi::FlintMarkers& markers = *impl_->flint;
-            DecoderState& decoder           = impl_->preview_state;
-            if (token == markers.think_open && !decoder.in_reasoning) {
-                // The model decided to reason: what follows is reasoning, the marker is neither.
-                decoder.in_reasoning = true;
-                bytes                = {};
-            } else if (token == markers.think_close && decoder.in_reasoning) {
-                // The close marker followed by a line break closes the channel at once.
-                bytes = std::string_view("</think>\n");
-            }
-            if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
-                decoder.in_reasoning && token != markers.think_close) {
-                append_words(bytes, thinking.loop_partial, thinking.loop_round);
-                append_tail(bytes, thinking.loop_tail);
-            }
         }
         const std::uint64_t fed_before = impl_->preview_state.content_fed;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
@@ -1002,9 +927,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         impl_->preview_semantic.control_pending = true;
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
-    // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round. Gemma
-    // and Flint count the tokens of the reasoning they opened; they have no early-close control,
-    // so they stop. A held close marker defers the check to the next round, which resolves it.
+    // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round. Models that count the tokens of the reasoning they opened may have no early-close control, so they stop. A held close marker defers the check to the next round, which resolves it.
     SemanticThinkingState& semantic     = impl_->preview_semantic;
     const std::uint32_t thinking_tokens = impl_->model_opens_reasoning()
                                               ? impl_->preview_state.reasoning_tokens
@@ -1182,10 +1105,8 @@ PublishedOutput OutputSession::commit_preview() {
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
-            delta.text = impl_->gemma_tools      ? impl_->gemma_tools->feed(delta.text)
-                         : impl_->flint_tools    ? impl_->flint_tools->feed(delta.text)
-                         : impl_->deepseek_tools ? impl_->deepseek_tools->feed(delta.text)
-                                                 : impl_->tool_call_output.feed(delta.text);
+            delta.text = impl_->deepseek_tools ? impl_->deepseek_tools->feed(delta.text)
+                                               : impl_->tool_call_output.feed(delta.text);
         } else if (delta.channel == OutputChannel::Reasoning && impl_->collect_open_reasoning) {
             impl_->open_reasoning.append(delta.text);
         }
@@ -1196,17 +1117,7 @@ PublishedOutput OutputSession::commit_preview() {
     }
     if (impl_->state.terminal) {
         fi::ToolCallOutputDecoder::Terminal terminal;
-        if (impl_->gemma_tools) {
-            auto gemma          = impl_->gemma_tools->finish();
-            terminal.content    = std::move(gemma.content);
-            terminal.tool_calls = std::move(gemma.tool_calls);
-            terminal.diagnostics = gemma.diagnostics;
-        } else if (impl_->flint_tools) {
-            auto flint           = impl_->flint_tools->finish();
-            terminal.content     = std::move(flint.content);
-            terminal.tool_calls  = std::move(flint.tool_calls);
-            terminal.diagnostics = flint.diagnostics;
-        } else if (impl_->deepseek_tools) {
+        if (impl_->deepseek_tools) {
             auto deepseek        = impl_->deepseek_tools->finish();
             terminal.content     = std::move(deepseek.content);
             terminal.tool_calls  = std::move(deepseek.tool_calls);

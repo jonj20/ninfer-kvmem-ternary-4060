@@ -35,8 +35,8 @@ Coexistence rules:
   anchors and policies, the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a
   `--graft`. With `--use-alt-prefix-caching` named, those options are rejected instead; Hybrid-only
   options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
-  it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
-  and their Engine reports the Legacy mode.
+  it sizes the Host slab pool). Qwen3.8-Flash-Next runs a context cache of its own,
+  and its Engine reports the Legacy mode.
 - Hybrid mode reuses the active-execution machinery unchanged: `LogicalKVPageStore`,
   `KVAddressSpaceStore`, execution rows, the active `StateStore` images, prefill/decode/speculative
   paths. It replaces only admission-source selection, retention, capture and pressure. Tree nodes

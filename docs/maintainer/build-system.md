@@ -63,7 +63,7 @@ unbounded). The Turing shape set differs from the standard one where a kernel do
   `small_t_bf16_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
   materialization uses 64-key blocks, the rowsplit A8 GEMM runs one stage and the BF16 GEMM rings
   at most two, and the BF16 `n256_k5120` GEMV splits K eight ways at narrow widths.
-- The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes, per tier, the most
+- The GGUF flash attention (`ops/linear/gguf/ggml_fattn.cu`) takes, per tier, the most
   query rows per tile that the tier's device code has, computes without a race and its shared
   memory fits. llama.cpp's Turing kernel has no tile wider than 32 columns, so width 256 takes 16
   rows instead of 32 and width 512 takes 4 rows (32 columns) instead of 8. The 512-wide tiles keep

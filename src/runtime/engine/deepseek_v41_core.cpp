@@ -1988,9 +1988,7 @@ struct DeepSeekV41Core::Impl {
     }
 
     // The drafts a round takes while `decoding` requests decode at once. Each verified row routes to
-    // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
-    // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
-    // one) sets the same bounds here.
+    // its own experts, so the rows a round adds cost more as requests join.
     // The drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
         if (dspark_block != 0) { return decoding == 1 ? drafts : 0U; }

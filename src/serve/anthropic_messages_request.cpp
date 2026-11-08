@@ -853,7 +853,7 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     }
     const std::string type = thinking.at("type").get<std::string>();
     // `between_tools`, the lowest setting of models that refuse `disabled`, turns off up-front
-    // thinking and leaves only optional progress notes between tool calls, which a Qwen or Gemma
+    // thinking and leaves only optional progress notes between tool calls, which a Qwen
     // template does not write: it runs as `disabled`.
     const bool no_thinking = type == "disabled" || type == "between_tools";
     if (no_thinking) {

@@ -6,7 +6,7 @@ native window), with plain RoPE and with `--rope-yarn`, and in disjoint windows 
 width as the reference. Each run's report.json is kept beside this script's summary.
 
 usage: rope_perplexity.py --build DIR --models DIR --corpus DIR --out DIR [--long N]
-       [--models-run qwen38-27b,gemma4,flash-next] [--runs native,plain,yarn]
+       [--models-run qwen38-27b,flash-next] [--runs native,plain,yarn]
        [--expert-residency host|disk] [--text-bytes N]
 """
 from __future__ import annotations
@@ -21,10 +21,6 @@ import time
 MODELS = {
     "qwen38-27b": {
         "artifact": "qwen38-27b/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer",
-        "options": [],
-    },
-    "gemma4": {
-        "artifact": "gemma4/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer",
         "options": [],
     },
     "flash-next": {

@@ -194,7 +194,7 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 }
 
 // K = 1536 and K = 2560, Qwen3.8-Flash-Next's hidden width, whose 80 slices leave the vector
-// products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
+// products' last pass over a row with half of a warp's lanes idle; and widths 2816, 2112
 // and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
 // 704 not even of its 256-value weight steps).
 int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,

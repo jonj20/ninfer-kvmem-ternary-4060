@@ -44,28 +44,10 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
-Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with all expert
+Native Qwen MoE also supports host/disk expert placements, with all expert
 arithmetic on the GPU and whole-layer device banks beside the optional persistent cache.
-Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
-`src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
-Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
-It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
-markup), runs one to eight sequences in prompt chunks of 2048 tokens (narrower where memory is
-short) with an F16 KV cache or any
-`--kv-dtype` format, drafts with the release's multi-token-prediction assistant (the artifact's
-`mtp` component, `--spec mtp`),
-encodes images and video with the release's vision tower (the artifact's `vision` component, from
-its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
-pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
-Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a fourth explicit
-family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
-blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the
-role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to eight
-sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
-(`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
-pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
 DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
-`runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
+`runtime/engine/deepseek_v41_core`) is a third explicit family converted from ISTA-DASLab's
 GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
 Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
 its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in

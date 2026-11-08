@@ -3,7 +3,7 @@
 // llama.cpp's tensor-core flash attention (third_party/ggml-quants, fattn-mma-f16.cuh) behind plain
 // pointers: one sequence's queries against a masked F16 key/value cache, for head widths 128 (query
 // heads per key/value head a multiple of eight), 256 (two) and 512 (eight), optionally with a
-// learned sink logit per query head. Gemma 4 and Flint run their prompt attention through it.
+// learned sink logit per query head. The prompt attention runs through it.
 
 #include <cuda_runtime.h>
 

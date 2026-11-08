@@ -276,24 +276,18 @@ int run_general_bf16_linear() {
     // below 64 tokens and cuBLAS's tensor-core GEMM from 64 on. Cover the minimal tile,
     // non-tile-aligned extents (the row/column boundary guards), multi-tile grids, the QAT
     // full-precision vocab head's real shape, Qwen3.8-Flash-Next's BF16 projections (the Gated
-    // DeltaNet a/b rows and the sparse-attention indexer) and the Gemma 4 vision tower's (the
-    // patch projection, a block's Q/K/V, [gate; up] and down, the projection into the text model),
-    // with BF16 results and, through every form of the GEMM, FP32 ones.
-    int failures = 0;
-    const std::vector<std::pair<int, int>> shapes = {
-        {32, 32},   // exactly one 32x32 tile
-        {50, 70},   // not a multiple of 32 in either extent; K not a multiple of 8 (no GEMV)
-        {63, 33},   // odd extents
-        {128, 256}, // multiple tiles
-        {32, 2560},     // Flash-Next GDN a / b
-        {640, 2560},    // Flash-Next indexer q/k
-        {248320, 5120},  // QAT bf16 lm_head [vocab, hidden]
-        {1152, 768},     // Gemma 4 vision patch projection
-        {3456, 1152},    // Gemma 4 vision Q/K/V
-        {8608, 1152},    // Gemma 4 vision [gate; up]
-        {1152, 4304},    // Gemma 4 vision down
-        {2816, 1152},    // Gemma 4 vision projection into the text model
-    };
+        // DeltaNet a/b rows and the sparse-attention indexer) and vision tower projections,
+        // with BF16 results and, through every form of the GEMM, FP32 ones.
+        int failures = 0;
+        const std::vector<std::pair<int, int>> shapes = {
+            {32, 32},   // exactly one 32x32 tile
+            {50, 70},   // not a multiple of 32 in either extent; K not a multiple of 8 (no GEMV)
+            {63, 33},   // odd extents
+            {128, 256}, // multiple tiles
+            {32, 2560},     // Flash-Next GDN a / b
+            {640, 2560},    // Flash-Next indexer q/k
+            {248320, 5120},  // QAT bf16 lm_head [vocab, hidden]
+        };
     for (const auto& [n, k] : shapes) {
         DeviceWeight weight(make_patterned(n, k, 421U));
         // The vocab head's host reference is costly, so it covers decode widths only; the vision

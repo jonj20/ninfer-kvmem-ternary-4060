@@ -4,7 +4,7 @@ NInfer runs DeepSeek's [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepsee
 (`DeepseekV41ForCausalLM`) from IST Austria's
 [GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M),
 its Engram table GGUF (IQ4_NL) and its vision tower (the repository's BF16 mmproj). It is its own
-model family next to Qwen3.5, Flash-Next, Gemma 4 and Flint: its own executor
+model family next to Qwen3.5 and Flash-Next: its own executor
 (`src/models/deepseek_v41`) and Engine core
 (`src/runtime/engine/deepseek_v41_core`), sharing the Qwen3.5 frontend for tokenization, chat
 templates, output parsing and the serving protocols in a DeepSeek dialect.
@@ -197,8 +197,8 @@ of transfer buffers and the experts' pages sit in the OS page cache.
 
 The routed experts are 106.7 GiB of the artifact, more than any one card holds, so the model runs
 with `--expert-residency host` or `disk`; `device` needs a card with room for every expert. The GPU
-runs the experts it caches or receives with the resident kernels, through the transport Gemma 4 and
-Flint use ([Gemma 4's expert residency](gemma4.md#expert-residency) describes the layer banks, the
+  runs the experts it caches or receives with the resident kernels, through the transport
+cache and its rounds):
 cache and its rounds):
 
 - **Host.** The experts are read from the artifact once at startup into pinned host memory, and a

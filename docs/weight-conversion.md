@@ -76,8 +76,7 @@ The built-in recipes are ordinary Python functions in
 | `bonsai2_27b_ternary_gguf_mtp` | T2 text and byte-preserving dense GGUF MTP blocks | `ternary`, `gguf` (MTP GGUF), `mtp` (geometry companion) |
 | `qwen3_5_dense_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
-| `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
-| `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
+
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
@@ -317,27 +316,7 @@ reference rounding, which halves the largest share of a decoded token's weight r
 runtime options and measurements:
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
 
-### Gemma 4 GGUF releases
 
-`gemma4_gguf` ([`gemma4.py`](../tools/convert/gemma4.py)) imports the text model of
-`google/gemma-4-26B-A4B-it-qat-q4_0-gguf` with `--model` holding the Hugging Face release's
-`config.json`, tokenizer, `chat_template.jinja` and `generation_config.json` and `--source
-gguf=...` the GGUF. The expert banks stay expert-major, the router's input scale and the per-expert
-output scales stay vectors the runtime applies, and the norm weights are stored as Gemma applies
-them (`w`, not `1 + w`). `--components text,mtp --source mtp=...` adds the multi-token-prediction
-assistant from a llama.cpp `gemma4-assistant` GGUF as the `mtp` component, checked against the
-target's head geometry and width. Commands, runtime defaults and measurements: [Gemma 4](gemma4.md).
-
-### Flint GGUF releases
-
-`flint_gguf` ([`flint.py`](../tools/convert/flint.py)) imports Flint from a llama.cpp GGUF of
-`RecursiveSI/flint` with `--model` holding the Hugging Face release's `config.json`, tokenizer,
-`chat_template.jinja` and `generation_config.json` and `--source gguf=...` the GGUF. It checks the
-GGUF's metadata against the config (the block geometry, the sliding-window and rotation patterns,
-the RoPE base, sigmoid gating with normalized weights, the expert widths) and imports every row as
-stored: llama.cpp keeps the experts' gate and up projections as two banks, which the artifact
-interleaves per expert ([gate rows; up rows] of expert 0, then expert 1), moving whole rows only.
-Commands, runtime defaults and measurements: [Flint](flint.md).
 
 ### DeepSeek-V4.1-Flash GGUF releases
 

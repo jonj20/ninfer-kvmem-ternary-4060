@@ -13,8 +13,7 @@ headers that code includes. Products of up to eight tokens use NInfer's own kern
 (`ggml_bridge_vec.cuh`), which reads the grids and block structs from `ggml-common.h`.
 
 The flash-attention kernel (`ggml-cuda/fattn-mma-f16.cuh` with `fattn-common.cuh` and
-`cp-async.cuh`, same base commit) runs Gemma 4's prompt attention (head widths 256 and 512)
-through `src/ops/linear/gguf/ggml_fattn.cu`, which launches it without ggml's backend context.
+`cp-async.cuh`, same base commit) runs prompt attention through `src/ops/linear/gguf/ggml_fattn.cu`, which launches it without ggml's backend context.
 The combine-loop barrier in `fattn-mma-f16.cuh` includes the exact condition from upstream
 [`1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3`](https://github.com/ggml-org/llama.cpp/commit/1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3)
 (PR #30103). It synchronizes before reusing the shared combine tile when

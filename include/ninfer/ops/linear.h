@@ -147,8 +147,7 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
- * `[5120,6144]`, and `[256,5120]` at every positive T; any other BF16 `[N,K]` (the Gemma 4 vision
- * tower's projections, for instance), and every BF16 problem with an FP32 `out`, runs a
+ * `[5120,6144]`, and `[256,5120]` at every positive T; other BF16 `[N,K]` shapes, and every BF16 problem with an FP32 `out`, run a
  * runtime-shape GEMM, cuBLAS's tensor-core BF16 GEMM with an FP32 accumulator from T=64 on. Text and MTP packed-weight problems accept every positive
  * column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently

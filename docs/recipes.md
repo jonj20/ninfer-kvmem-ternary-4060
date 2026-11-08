@@ -31,12 +31,12 @@ on 0.0.0.0:8080.
 | `--kv-dtype` | KV-cache storage: nine formats from `bf16` to `rk2v4-e8`; `rk8v4` is the all-round choice, `rk4v4` the longest windows ([context and memory](cli.md#context-and-memory)) |
 | `--gdn-state-fp16` | keep the Gated DeltaNet recurrent state in FP16 |
 | `--rope-yarn` | past the native window, YaRN instead of plain RoPE |
-| `--spec`, `--draft-tokens` | the speculative backend (`mtp`, `dflash`, `dflash2`) and the drafts of a round (1 to 15; 1 to 7 for Gemma 4) |
+| `--spec`, `--draft-tokens` | the speculative backend (`mtp`, `dflash`, `dflash2`) and the drafts of a round (1 to 15; 1 to 7 for DeepSeek-V4.1) |
 | `--adaptive-mtp` | MTP only: pick each round's width from the drafts' measured survival |
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |
-| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4, Qwen3.8-Flash-Next, Flint and DeepSeek-V4.1-Flash: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
+| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
 | `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash: the n-gram (Engram) table's file and where its rows live |
 | `--disk-kv-path`, `--disk-kv-gib`, `--disk-kv-restore` | the disk tier of the context cache |
 
@@ -164,48 +164,7 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   carry.
 - **Images and video.** `--vision` adds the Vision tower (0.9 GB on the GPU).
 
-## Gemma 4 26B-A4B
 
-Converted from Google's QAT GGUF release.
-
-```bash
-# The release's GGUF and its Hugging Face text files; one conversion writes the artifact.
-mkdir -p models/gemma4/hf
-for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json \
-         processor_config.json; do
-  curl -fsSL -o models/gemma4/hf/$f https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/$f
-done
-hf download google/gemma-4-26B-A4B-it-qat-q4_0-gguf gemma-4-26B_q4_0-it.gguf gemma-4-26B-it-mmproj.gguf \
-  --local-dir models/gemma4
-# With the release's QAT assistant (multi-token prediction) as the artifact's `mtp` component and
-# its vision tower (the mmproj) as the `vision` component.
-hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF mtp-gemma-4-26B-A4B-it.gguf --local-dir models/gemma4
-python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --components text,mtp,vision \
-  --source gguf=models/gemma4/gemma-4-26B_q4_0-it.gguf \
-  --source mtp=models/gemma4/mtp-gemma-4-26B-A4B-it.gguf \
-  --source vision=models/gemma4/gemma-4-26B-it-mmproj.gguf --name Gemma-4-26B-A4B-it-QAT-Q4_0-MTP \
-  --out models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --device cpu
-
-# Four concurrent requests over 40K-token contexts, two drafts a round, images and video; thinking
-# stays off unless a request asks.
-ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
-  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
-```
-
-## Flint
-
-Unsloth's UD-Q4_K_XL GGUF as one artifact ([Flint](flint.md)); 23.4 GiB of weights fit a 32 GB card.
-
-```bash
-hf download WaveCut/Flint-UD-Q4_K_XL-NInfer-v3 flint-UD-Q4_K_XL-ninfer-v3.ninfer --local-dir models
-
-# Every expert on a 32 GB GPU: about 25.5 GiB for one 32K-token sequence.
-ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint --max-context 32768
-
-# A 16 or 24 GB GPU: the experts in pinned host memory (21.5 GiB), the most used cached on the GPU.
-ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint \
-  --max-context 65536 --expert-residency host
-```
 
 ## DeepSeek-V4.1-Flash
 
@@ -271,7 +230,7 @@ ninfer-serve models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer --model-id qwen3.
 - **Qwen3.8-Flash-Next** runs on 8 and 12 GB with `--expert-residency host` or `disk` and the
   recipe above (32,768 tokens of context, no other change). It keeps 2.83 GiB of dense weights on
   the GPU and fills the rest of the card with an expert cache.
-- **Gemma 4** needs 16 GB: its 13.4 GiB of weights do not fit 12 GB.
+
 - **Output heads.** `--lm-head-q4` and `--embedding-q4` do not apply to Ternary Bonsai 2, whose
   head is not stored as row-split Q8_G32.
 

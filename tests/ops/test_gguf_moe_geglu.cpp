@@ -1,4 +1,4 @@
-// Gemma 4's routed experts over Q4_0 banks through the GGUF bridge, driven as its executor drives
+// GeGLU MoE experts over Q4_0 banks through the GGUF bridge, driven as their executor drives
 // them: a [gate; up] parent of 2 x 704 rows over 2816 inputs with a GeLU-tanh gate, and a down
 // projection of 2816 rows over 704 inputs, a K that is no whole number of the matrix kernel's
 // 256-value steps (its last step reads the next row, then the zero tail after the bank). Up to
@@ -437,7 +437,7 @@ int main() {
         RankContext rank = device.rank(0);
         rank.stream = nullptr; // the oracle harness deliberately uses the legacy stream
         const auto path = std::filesystem::temp_directory_path() /
-            ("ninfer-gemma-adapter-" + std::to_string(
+            ("ninfer-geglu-adapter-" + std::to_string(
                 std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(path);
         struct Cleanup { std::filesystem::path p; ~Cleanup() { std::filesystem::remove_all(p); } } cleanup{path};
@@ -473,7 +473,7 @@ int main() {
             options.pair_capacity = 9 * kTopK;
             options.cache_bytes = 8ULL << 20;
             ExpertDelivery delivery(rank, files, {std::move(layer)}, options);
-            std::cout << (disk ? "disk" : "host") << " delivered Gemma FP64 oracle\n";
+            std::cout << (disk ? "disk" : "host") << " delivered GeGLU FP64 oracle\n";
             for (int tokens : {1, 8, 9}) { failures += run(tokens, gate_up, down, rng, &delivery); }
             delivery.drain();
         }

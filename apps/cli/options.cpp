@@ -193,7 +193,7 @@ std::string usage_text(const char* argv0) {
            "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
            "                                mapped pinned host memory, read in place\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
-           "                                Gemma and Flint allow 0 (layer banks only).\n"
+           "                                and DeepSeek-V4.1 allow 0 (layer banks only).\n"
            "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
@@ -216,7 +216,7 @@ std::string usage_text(const char* argv0) {
            "SPECULATIVE DECODING\n"
            "  --spec none|mtp|dflash|dflash2|dspark\n"
            "                                speculative decoding backend (default: mtp with 3\n"
-           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
+            "                                drafts for Flash-Next host or disk\n"
            "                                experts whose artifact has the drafter, else none;\n"
            "                                dspark: DeepSeek-V4.1's DSpark drafter)\n"
            "  --draft-tokens N              drafts per round, 1..15 (dspark: up to its block\n"
@@ -240,11 +240,10 @@ std::string usage_text(const char* argv0) {
            "                                --spec is set, 0 disables it\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
-           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint,\n"
-           "                                which has no drafter, and DeepSeek-V4.1 without\n"
-           "                                it): the last N tokens are matched against the\n"
-           "                                sequence so far and what followed is proposed\n"
-           "                                (default 0: off)\n"
+            "  --lookup-ngram N              context-lookup drafting alongside --spec (DeepSeek-V4.1\n"
+            "                                without a drafter): the last N tokens are matched\n"
+            "                                against the sequence so far and what followed is\n"
+            "                                proposed (default 0: off)\n"
            "\n"
            "PRECISION & KERNELS (off by default)\n"
            "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"

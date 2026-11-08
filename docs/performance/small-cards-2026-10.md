@@ -3,7 +3,7 @@
 What runs on an RTX 3060 Ti (8 GB), an RTX 2080 Ti (11 GB) and an RTX 3060 (12 GB) from the
 published Docker image: which models load, their prompt and decode rates from the CLI, the largest
 context the server starts with, and the MoE models whose routed experts stay in host memory or on
-disk: Qwen3.8-Flash-Next, Gemma 4 26B-A4B and Qwen3.6-35B-A3B. The setup is at the
+disk: Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. The setup is at the
 [end](#how-these-were-measured).
 
 ## Models
@@ -12,14 +12,12 @@ disk: Qwen3.8-Flash-Next, Gemma 4 26B-A4B and Qwen3.6-35B-A3B. The setup is at t
 |---|---|---|---|
 | Ternary Bonsai 2 27B (6.70 GiB of weights; 7.28 GiB with the MTP head) | text | text, MTP | text, MTP |
 | Qwen3.8-27B GSQ-RCO IQ3_S (10.9 GiB) | | | text; MTP does not fit |
-| Gemma 4 26B-A4B QAT Q4_0 (13.4 GiB; 1.7 GiB on the GPU with streamed experts) | | | experts in host memory or on disk |
 | Qwen3.6-35B-A3B groupwise (19.6 GiB of weights; 2.3 GiB on the GPU with streamed experts) | | | experts in host memory or on disk |
 | Qwen3.8-Flash-Next GSQ-RCO Q2_0 (2.83 GiB on the GPU) | experts in host memory or on disk | not run | experts in host memory or on disk |
 
 On the RTX 3060 Ti, Bonsai's MTP head leaves the runtime 241 MiB where it needs 693 MiB. Bonsai's
 output head is not stored as row-split Q8_G32, so `--lm-head-q4` and `--embedding-q4` do not apply
-to it. IQ3_S with MTP stops at the first device allocation of its weights; Gemma 4 with resident
-experts does too.
+to it. IQ3_S with MTP stops at the first device allocation of its weights.
 
 ## Ternary Bonsai 2 27B
 
@@ -60,21 +58,7 @@ second:
 | RTX 3060, 12 GB | on disk | 5.32 GiB | 37.9 / 23.5 | 215 / 22.9 | 10.2 GiB | 1.2 GiB |
 | RTX 3060, 12 GB | pinned host memory | 4.91 GiB | 58.9 / 39.9 | 569 / 38.2 | 11.0 GiB | 32.7 GiB |
 
-## Gemma 4 26B-A4B
 
-The QAT Q4_0 release with its routed experts in pinned host memory or in the artifact's files
-(`--expert-residency host|disk`), the automatic device cache (7.5 GiB, 2,413 of the 3,840 experts),
-prompt chunks of 2,048 tokens. `ninfer_bench -p 1024,8192 -n 128 -r 3 --warmup 1 --max-ctx 9000`,
-mean tokens per second:
-
-| card | experts | 1,024-token prompt | 8,192-token prompt | decode |
-|---|---|---:|---:|---:|
-| RTX 3060, 12 GB | pinned host memory | 1,948 | 2,347 | 93.7 |
-| RTX 3060, 12 GB | artifact files | 489 | 1,027 | 94.6 |
-
-Over each whole run, 97% of the token-expert pairs found their expert in the device cache. Each
-prompt chunk still needs most of each layer's experts, so with experts on disk a prompt waits for
-the file reads.
 
 ## Qwen3.6-35B-A3B
 
@@ -107,7 +91,7 @@ costs more was not measured.
 - **Largest context.** `ninfer-serve <artifact> --max-context W --kv-capacity W --max-concurrency 1
   --gdn-state-fp16 --kv-dtype KV`, bisected in 4,096-token steps; a step passes when the server
   starts and answers one 16-token chat request.
-- **Gemma 4 and Qwen3.6 rows.** A second RTX 3060 at 170 W (Xeon Gold 6154, PCIe 3.0 x16, 60 GiB of container
+- **Qwen3.6 rows.** A second RTX 3060 at 170 W (Xeon Gold 6154, PCIe 3.0 x16, 60 GiB of container
   memory, driver 595.71), an `sm_86` build from source of the streaming branch, its routes
   calibrated at first start, nothing else running. The disk rows read files that earlier runs had
   read; how much of them the page cache held was not controlled.

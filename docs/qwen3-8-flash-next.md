@@ -311,8 +311,8 @@ values, `8c - 7` or `8c - 9`, and its factors `d (2s + 1) / 8` carry the eighth)
 `d * (factor0 * dot0 + factor1 * dot1)`, Q4_K's and Q5_K's `(factor * d) * dot` less the
 block's minimum times the slice's activation sum (q8_1's `s`), and IQ1_S's
 `factor * fma(d, dot, (delta - 1) * s)` over its codes 0 to 2. Slice `s` joins lane `s mod 32` in
-slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU (and
-Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
+slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apart). SiLU
+is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
 and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
 these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
 build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
@@ -502,8 +502,8 @@ With `--disk-kv-restore` a
 prompt also resumes from an image on
 disk, which a later run finds there too.
 
-Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
-as for Gemma 4 ([Structured output](gemma4.md#structured-output)): the grammar's token mask applies
+Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works:
+the grammar's token mask applies
 to every sampled token, it is computed on a thread of its own while the step runs, a row whose mask
 is late samples once it is ready without holding the others during ordinary decoding. Draft
 eligibility does not depend on mask duration; a speculative round waits for all required masks

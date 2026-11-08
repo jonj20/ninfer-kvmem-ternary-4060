@@ -50,11 +50,6 @@ constexpr std::string_view kVideoPad              = "<|video_pad|>";
 constexpr std::string_view kVisionStart           = "<|vision_start|>";
 constexpr std::string_view kVisionEnd             = "<|vision_end|>";
 
-// Gemma 4: an image's soft tokens between <|image> and <image|>; a video frame's after its
-// mm:ss time, between the same two.
-constexpr std::string_view kGemmaBoi = "<|image>";
-constexpr std::string_view kGemmaEoi = "<image|>";
-
 struct Size {
     int h = 0;
     int w = 0;
@@ -496,40 +491,6 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     return out;
 }
 
-// ---- Gemma 4 -----------------------------------------------------------------------------------
-
-// transformers' get_aspect_ratio_preserving_size: the largest size, aspect kept, whose sides are
-// multiples of pooling * patch and whose patches fit max_patches (a small image grows to it).
-Size gemma_size(int height, int width, std::uint64_t max_patches, int patch, int pooling) {
-    if (height <= 0 || width <= 0 || max_patches == 0) {
-        throw std::invalid_argument("invalid Gemma media resize configuration");
-    }
-    const double target_px = static_cast<double>(max_patches) * patch * patch;
-    const double factor    = std::sqrt(target_px / (static_cast<double>(height) * width));
-    const int side         = pooling * patch;
-    int h = static_cast<int>(std::floor(factor * height / side)) * side;
-    int w = static_cast<int>(std::floor(factor * width / side)) * side;
-    if (h == 0 && w == 0) {
-        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
-                             "Gemma media resizes to a 0 x 0 picture");
-    }
-    const int max_side = static_cast<int>(max_patches / std::uint64_t(pooling * pooling)) * side;
-    if (h == 0) {
-        h = side;
-        w = std::min(static_cast<int>(std::floor(static_cast<double>(width) / height)) * side,
-                     max_side);
-    } else if (w == 0) {
-        w = side;
-        h = std::min(static_cast<int>(std::floor(static_cast<double>(height) / width)) * side,
-                     max_side);
-    }
-    if (static_cast<double>(h) * w > target_px) {
-        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
-                             "Gemma media resize exceeds its patch budget");
-    }
-    return {h, w};
-}
-
 // A DeepSeek-V4.1 image's span budget: the bound, a quarter of it at low detail.
 std::uint32_t deepseek_part_budget(const ChatPart& part, const DeepSeekMediaOptions& d) {
     return part.media.image_detail == ImageDetail::Low ? std::max(d.max_tokens / 4, 5U)
@@ -538,20 +499,18 @@ std::uint32_t deepseek_part_budget(const ChatPart& part, const DeepSeekMediaOpti
 
 int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-// The prompt positions of one media run: Gemma's pooled tokens, DeepSeek's span, Qwen's merged
-// tokens.
+// The prompt positions of one media run: DeepSeek's span, Qwen's merged tokens.
 std::size_t media_run_tokens(const VisionItem& item, const ProcessorOptions& options) {
     if (options.deepseek) {
         const int m = options.deepseek->merge;
         return DeepSeekImagePlan{0, 0, ceil_div(item.grid.h, m), ceil_div(item.grid.w, m)}
             .span_tokens();
     }
-    const int pooling = options.gemma ? options.gemma->pooling : kMerge;
-    return static_cast<std::size_t>(item.grid.h / pooling) * (item.grid.w / pooling);
+    return static_cast<std::size_t>(item.grid.h / kMerge) * (item.grid.w / kMerge);
 }
 
 MediaPads media_pads(const ProcessorOptions& options) {
-    return options.deepseek ? kDeepSeekMediaPads : options.gemma ? kGemmaMediaPads : kQwenMediaPads;
+    return options.deepseek ? kDeepSeekMediaPads : kQwenMediaPads;
 }
 
 void refuse_deepseek_video(std::span<ChatPart* const> parts, const ProcessorOptions& options) {
@@ -613,153 +572,6 @@ VisionItem inspect_deepseek_item(const ChatPart& part, const ProcessorOptions& o
     item.modality = Modality::Image;
     item.grid     = {1, plan.height / d.patch, plan.width / d.patch};
     return item;
-}
-
-// The soft-token budget of one media part: a video frame's, or an image's by its detail (low the
-// smallest, high the server's bound, auto the release's default), never above the bound.
-std::uint32_t gemma_part_budget(const ChatPart& part, const GemmaMediaOptions& g) {
-    std::uint64_t wanted = g.image_tokens;
-    if (part.kind == ChatPartKind::Video) {
-        wanted = g.video_tokens;
-    } else if (part.media.image_detail == ImageDetail::Low) {
-        wanted = kGemmaSoftTokenBudgets.front();
-    } else if (part.media.image_detail == ImageDetail::High) {
-        wanted = g.max_tokens;
-    }
-    return gemma_budget_at_most(std::min<std::uint64_t>(wanted, g.max_tokens));
-}
-
-std::uint64_t gemma_max_patches(std::uint32_t budget, const GemmaMediaOptions& g) {
-    return std::uint64_t(budget) * std::uint64_t(g.pooling) * std::uint64_t(g.pooling);
-}
-
-// One patch (channel, y, x) of `frame` at patch (grid_y, grid_x), as 2 p / 255 - 1 in BF16.
-void append_gemma_patch(const media::decode::Image& frame, int patch, int grid_y, int grid_x,
-                        std::span<std::uint16_t> out, std::size_t& cursor) {
-    const std::size_t features = std::size_t(3) * patch * patch;
-    if (cursor > out.size() || out.size() - cursor < features) {
-        throw std::logic_error("Vision patch writer exceeded its allocation");
-    }
-    const auto& lut            = normalization_lut();
-    std::uint16_t* destination = out.data() + cursor;
-    std::size_t local          = 0;
-    for (int channel = 0; channel < 3; ++channel) {
-        for (int y = 0; y < patch; ++y) {
-            const std::uint8_t* source =
-                frame.rgb.data() +
-                (static_cast<std::size_t>(grid_y * patch + y) * frame.width + grid_x * patch) * 3 +
-                channel;
-            for (int x = 0; x < patch; ++x) {
-                destination[local++] = lut[source[static_cast<std::size_t>(x) * 3]];
-            }
-        }
-    }
-    cursor += local;
-}
-
-// One frame's patches, row by row of the patch grid.
-void append_gemma_frame(const media::decode::Image& frame, int patch, int gh, int gw,
-                        std::span<std::uint16_t> out, std::size_t& cursor,
-                        const PreparationControl& control) {
-    for (int y = 0; y < gh; ++y) {
-        check_preparation_control(control);
-        for (int x = 0; x < gw; ++x) { append_gemma_patch(frame, patch, y, x, out, cursor); }
-    }
-}
-
-Prepared prepare_gemma_image(std::span<const std::uint8_t> bytes, std::uint32_t budget,
-                             const ProcessorOptions& options, const media::decode::Policy& policy,
-                             MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
-                             const PreparationControl& control) {
-    const GemmaMediaOptions& g = *options.gemma;
-    media::decode::Image image = media::decode::decode_image(bytes, policy);
-    const Size size =
-        gemma_size(image.height, image.width, gemma_max_patches(budget, g), g.patch, g.pooling);
-    const int gh = size.h / g.patch;
-    const int gw = size.w / g.patch;
-    Prepared out;
-    out.item.modality = Modality::Image;
-    out.item.grid     = {1, gh, gw};
-    PreprocessStats item_stats;
-    add_budget(item_stats, out.item, options);
-    enforce_media_item_resource_limits(item_stats);
-    request_budget.claim(out.item);
-    const std::size_t elements = static_cast<std::size_t>(gh) * gw * 3 * g.patch * g.patch;
-    out.payload                = cache.allocate_payload(elements, control);
-    resize_bicubic(image, size, control);
-    std::size_t cursor = 0;
-    append_gemma_frame(image, g.patch, gh, gw, out.payload->mutable_span(), cursor, control);
-    if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
-    return out;
-}
-
-std::vector<double> gemma_timestamps(std::span<const int> indices, double fps) {
-    std::vector<double> out;
-    out.reserve(indices.size());
-    for (const int index : indices) { out.push_back(static_cast<double>(index) / fps); }
-    return out;
-}
-
-Prepared prepare_gemma_video(std::span<const std::uint8_t> bytes, std::uint32_t budget,
-                             const ProcessorOptions& options, const media::decode::Policy& policy,
-                             MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
-                             const PreparationControl& control) {
-    const GemmaMediaOptions& g = *options.gemma;
-    media::decode::Video video = media::decode::decode_video(
-        bytes, policy, 1.0, 1, g.frames, media::decode::FrameSpacing::Floor);
-    const Size size =
-        gemma_size(video.height, video.width, gemma_max_patches(budget, g), g.patch, g.pooling);
-    const int gt = static_cast<int>(video.frames.size());
-    const int gh = size.h / g.patch;
-    const int gw = size.w / g.patch;
-    Prepared out;
-    out.item.modality = Modality::Video;
-    out.item.grid     = {gt, gh, gw};
-    PreprocessStats item_stats;
-    add_budget(item_stats, out.item, options);
-    enforce_media_item_resource_limits(item_stats);
-    request_budget.claim(out.item);
-    const std::size_t elements =
-        static_cast<std::size_t>(gt) * gh * gw * 3 * g.patch * g.patch;
-    out.payload = cache.allocate_payload(elements, control);
-    std::size_t cursor = 0;
-    for (media::decode::Image& frame : video.frames) {
-        resize_bicubic(frame, size, control);
-        append_gemma_frame(frame, g.patch, gh, gw, out.payload->mutable_span(), cursor, control);
-    }
-    if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
-    out.item.timestamps = gemma_timestamps(video.indices, video.fps);
-    return out;
-}
-
-VisionItem inspect_gemma_item(const ChatPart& part, const ProcessorOptions& options,
-                              const media::decode::Policy& policy) {
-    const GemmaMediaOptions& g  = *options.gemma;
-    const std::uint32_t budget  = gemma_part_budget(part, g);
-    const std::uint64_t patches = gemma_max_patches(budget, g);
-    VisionItem item;
-    if (part.kind == ChatPartKind::Image) {
-        const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
-        const Size size = gemma_size(image.height, image.width, patches, g.patch, g.pooling);
-        item.modality   = Modality::Image;
-        item.grid       = {1, size.h / g.patch, size.w / g.patch};
-        return item;
-    }
-    const media::decode::VideoInfo video = media::decode::inspect_video(
-        part.media.bytes, policy, 1.0, 1, g.frames, media::decode::FrameSpacing::Floor);
-    const Size size = gemma_size(video.height, video.width, patches, g.patch, g.pooling);
-    item.modality   = Modality::Video;
-    item.grid       = {video.sampled_frames, size.h / g.patch, size.w / g.patch};
-    item.timestamps = gemma_timestamps(video.indices, video.fps);
-    return item;
-}
-
-// mm:ss, as the release's processor prints a frame's time.
-std::string gemma_time(double seconds) {
-    const auto whole = static_cast<long long>(std::floor(seconds));
-    char text[32];
-    std::snprintf(text, sizeof(text), "%02lld:%02lld", whole / 60, whole % 60);
-    return text;
 }
 
 std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
@@ -836,13 +648,6 @@ Sha256Digest part_digest(const ChatPart& part, const Sha256Digest& bytes_digest,
         keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
         return sha256(std::string_view(keyed));
     }
-    if (options.gemma) {
-        // Gemma 4's soft tokens depend on the budget the part is seen at.
-        std::string keyed =
-            "ninfer gemma budget " + std::to_string(gemma_part_budget(part, *options.gemma)) + "\n";
-        keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
-        return sha256(std::string_view(keyed));
-    }
     if (part.kind != ChatPartKind::Image || part.media.image_detail != ImageDetail::Low) {
         return bytes_digest;
     }
@@ -864,17 +669,6 @@ void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& o
         if (deepseek_image_plan(image.width, image.height, d,
                                 std::numeric_limits<std::uint32_t>::max())
                 .span_tokens() > budget) {
-            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
-                                 "image exceeds its Vision budget and oversized_image is set to "
-                                 "'error'");
-        }
-        return;
-    }
-    if (options.gemma) {
-        const GemmaMediaOptions& g = *options.gemma;
-        const double budget_px     = static_cast<double>(gemma_max_patches(
-                                     gemma_part_budget(part, g), g)) * g.patch * g.patch;
-        if (static_cast<double>(image.height) * image.width > budget_px) {
             throw ProcessorError(ProcessorErrorKind::InvalidMedia,
                                  "image exceeds its Vision budget and oversized_image is set to "
                                  "'error'");
@@ -948,31 +742,6 @@ void append_placeholder(std::string& out, const VisionItem& item, std::size_t it
     }
 }
 
-void append_gemma_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
-                              int pooling, std::vector<MediaTokenRunByteSpec>& runs) {
-    const std::uint64_t frame_tokens =
-        static_cast<std::uint64_t>(item.grid.h / pooling) * (item.grid.w / pooling);
-    if (item.modality == Modality::Image) {
-        out += kGemmaBoi;
-        append_media_token_run(out, kGemmaMediaPads.image, frame_tokens, Modality::Image,
-                               item_index, 0, runs);
-        out += kGemmaEoi;
-        return;
-    }
-    if (item.timestamps.size() != static_cast<std::size_t>(item.grid.t)) {
-        throw std::logic_error("video timestamp count does not match grid");
-    }
-    for (std::size_t frame = 0; frame < item.timestamps.size(); ++frame) {
-        if (frame != 0) { out += ' '; }
-        out += gemma_time(item.timestamps[frame]);
-        out += ' ';
-        out += kGemmaBoi;
-        append_media_token_run(out, kGemmaMediaPads.video, frame_tokens, Modality::Video,
-                               item_index, frame, runs);
-        out += kGemmaEoi;
-    }
-}
-
 void append_deepseek_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
                                  const ProcessorOptions& options,
                                  std::vector<MediaTokenRunByteSpec>& runs) {
@@ -1035,9 +804,6 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
         if (options.deepseek) {
             append_deepseek_placeholder(expanded, item, index, options, rendered.media_token_runs);
-        } else if (options.gemma) {
-            append_gemma_placeholder(expanded, item, index, options.gemma->pooling,
-                                     rendered.media_token_runs);
         } else {
             append_placeholder(expanded, item, index, rendered.media_token_runs);
         }
@@ -1083,9 +849,7 @@ void add_budget(PreprocessStats& stats, const VisionItem& item, const ProcessorO
         checked_mul(static_cast<std::uint64_t>(item.grid.h), item.grid.w, "vision spatial grid");
     const std::uint64_t patches =
         checked_mul(static_cast<std::uint64_t>(item.grid.t), spatial, "vision raw patches");
-    const std::uint64_t per_token =
-        options.gemma ? std::uint64_t(options.gemma->pooling) * options.gemma->pooling
-                      : std::uint64_t(kMerge * kMerge);
+    const std::uint64_t per_token = std::uint64_t(kMerge * kMerge);
     stats.raw_patches += patches;
     stats.vision_tokens += options.deepseek ? media_run_tokens(item, options) : patches / per_token;
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
@@ -1190,9 +954,9 @@ void assign_positions(ProcessedInput& output,
     output.rope_delta = maximum + 1 - static_cast<std::int32_t>(length);
 }
 
-// Gemma 4's positions are the token indices on every axis; media runs set the token types and the
-// items' spans.
-void assign_gemma_positions(ProcessedInput& output,
+// DeepSeek-V4.1's positions are the token indices on every axis; media runs set the token types
+// and the items' spans.
+void assign_media_positions(ProcessedInput& output,
                             std::span<const EncodedChat::MediaTokenRun> media_runs,
                             const ProcessorOptions& options) {
     const std::size_t length = output.input_ids.size();
@@ -1357,19 +1121,6 @@ std::vector<std::uint8_t> deepseek_pad(std::span<const std::uint8_t> rgb, int wi
     return out;
 }
 
-std::uint32_t gemma_budget_at_most(std::uint64_t bound) {
-    std::uint32_t out = 0;
-    for (const std::uint32_t budget : kGemmaSoftTokenBudgets) {
-        if (budget <= bound) { out = budget; }
-    }
-    if (out == 0) {
-        throw std::invalid_argument("a Gemma 4 media budget is at least " +
-                                    std::to_string(kGemmaSoftTokenBudgets.front()) +
-                                    " soft tokens");
-    }
-    return out;
-}
-
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
                                  std::size_t maximum_tokens, MediaPads pads) {
     if (!rendered.media_placeholders.empty()) {
@@ -1513,13 +1264,6 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         (void)media_token_id(tokenizer_, kDeepSeekMediaPads.image);
         return;
     }
-    if (options_.gemma) {
-        for (const std::string_view token :
-             {kGemmaMediaPads.image, kGemmaMediaPads.video, kGemmaBoi, kGemmaEoi}) {
-            (void)media_token_id(tokenizer_, token);
-        }
-        return;
-    }
     (void)media_token_id(tokenizer_, kImagePad);
     (void)media_token_id(tokenizer_, kVideoPad);
 }
@@ -1550,7 +1294,6 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
             const ProcessorOptions options = part_options(*part, options_);
             enforce_image_resize_policy(*part, options, policy);
             VisionItem item = options_.deepseek ? inspect_deepseek_item(*part, options_, policy)
-                              : options_.gemma  ? inspect_gemma_item(*part, options_, policy)
                               : part->kind == ChatPartKind::Image
                                   ? inspect_image_item(part->media.bytes, options, policy)
                                   : inspect_video_item(part->media.bytes, options, policy);
@@ -1671,15 +1414,6 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                         built = prepare_deepseek_image(
                             part->media.bytes, deepseek_part_budget(*part, *options.deepseek),
                             options, policy, *media_cache_, request_budget, worker_control);
-                    } else if (options.gemma) {
-                        const std::uint32_t budget = gemma_part_budget(*part, *options.gemma);
-                        built = kind == ChatPartKind::Image
-                                    ? prepare_gemma_image(part->media.bytes, budget, options,
-                                                          policy, *media_cache_, request_budget,
-                                                          worker_control)
-                                    : prepare_gemma_video(part->media.bytes, budget, options,
-                                                          policy, *media_cache_, request_budget,
-                                                          worker_control);
                     } else {
                         built = kind == ChatPartKind::Image
                                     ? prepare_image(part->media.bytes, options, policy,
@@ -1701,7 +1435,6 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     std::size_t patch_cursor = 0;
     const std::size_t patch_features =
         options_.deepseek ? std::size_t(3) * options_.deepseek->patch * options_.deepseek->patch
-        : options_.gemma  ? std::size_t(3) * options_.gemma->patch * options_.gemma->patch
                           : std::size_t(kPatchFeatures);
     for (PendingMedia& pending : pending_items) {
         PreparedMedia media;
@@ -1789,8 +1522,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_seconds      = media_preprocess_seconds;
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
-    if (options_.gemma || options_.deepseek) {
-        assign_gemma_positions(output, encoded.media_token_runs, options_);
+    if (options_.deepseek) {
+        assign_media_positions(output, encoded.media_token_runs, options_);
     } else {
         assign_positions(output, encoded.media_token_runs);
     }

@@ -1,6 +1,6 @@
 // GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS,
 // IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) against FP64 from independently decoded stored blocks, at the
-// Flash-Next, Gemma 4 and DeepSeek-V4.1 expert shapes, for every backend this host supports.
+// Flash-Next and DeepSeek-V4.1 expert shapes, for every backend this host supports.
 // Blocks are decoded by ggml's reference dequantizers. Two oracles: the exact product bounds the
 // int8 activation's error, and the q8_1 product (the activation quantized per 32 values as the GPU
 // does, d = amax / 127 rounded to binary16, codes round(v / d); a K-quant's minimum and IQ1_S's
@@ -699,7 +699,7 @@ int main() {
                 check(down, tokens, rng);
             }
         }
-        // Gemma 4 26B-A4B: [gate; up] 1408 x 2816 and down 2816 x 704 (22 slices, so no K-quant).
+        // [gate; up] 1408 x 2816 and down 2816 x 704 (22 slices, so no K-quant).
         for (const QType format : {QType::GGUF_Q4_0, QType::GGUF_Q5_0, QType::GGUF_Q8_0}) {
             const Matrix gate_up = make(format, 1408, 2816, rng);
             const Matrix down    = make(format, 2816, 704, rng);

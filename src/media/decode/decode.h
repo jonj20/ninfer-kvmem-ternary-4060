@@ -71,7 +71,7 @@ struct VideoInfo {
 // Which source frames a video samples. Span: the count the target fps gives over the video's
 // duration, clamped to [min_frames, max_frames], spread from the first frame to the last (Qwen's
 // processor). Floor: min(max_frames, frames) frames at i * frames / count rounded down, whatever
-// the fps (transformers' default sampler, which Gemma 4's video processor uses).
+// the fps (transformers' default sampler).
 enum class FrameSpacing {
     Span,
     Floor,

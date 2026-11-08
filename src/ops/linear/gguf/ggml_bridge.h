@@ -69,7 +69,7 @@ enum class Epilogue : int {
 };
 
 // The activation a gated product applies to its gate: SiLU (SwiGLU) or tanh-approximated GELU
-// (GeGLU, Gemma 4).
+// (GeGLU).
 enum class GateActivation : int {
     Silu     = 0,
     GeluTanh = 1,

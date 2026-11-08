@@ -53,10 +53,9 @@ inactive cache 的保留而丢失完成能力。
 `Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。Qwen3.8-Flash-Next
 （`Qwen4ExpForCausalLM`，`models/qwen4_exp`）是第二个显式模型族：它有自己的 load、executor 和
 Engine core（`runtime/engine/qwen4_exp_core`），共享 Qwen3.5 的 Frontend 与 Vision tower，并通过同一个
-公共 `ninfer::Engine` 服务请求。Gemma 4 26B-A4B（`Gemma4ForCausalLM`，`models/gemma4`）、Flint
-（`FlintForCausalLM`，`models/flint`）与 DeepSeek-V4.1-Flash（`DeepseekV41ForCausalLM`，
-`models/deepseek_v41`）是另外三个显式模型族：各自拥有 load、executor 与 Engine core
-（`runtime/engine/gemma4_core`、`flint_core`、`deepseek_v41_core`），以各自的方言共享 Qwen3.5 的
+公共 `ninfer::Engine` 服务请求。DeepSeek-V4.1-Flash（`DeepseekV41ForCausalLM`，
+`models/deepseek_v41`）是第三个显式模型族：拥有 load、executor 与 Engine core
+（`runtime/engine/deepseek_v41_core`），以其方言共享 Qwen3.5 的
 Frontend，只在一个 GPU 上运行。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
@@ -657,7 +656,7 @@ checkpoint catalog。
 | Program 规划、存储与事务 | `src/models/qwen3_5/program/` |
 | Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
 | Qwen3.8-Flash-Next 模型族与其 Engine core | `src/models/qwen4_exp/`, `src/runtime/engine/qwen4_exp_core.*` |
-| Gemma 4、Flint、DeepSeek-V4.1-Flash 模型族与其 Engine core | `src/models/gemma4/`, `src/models/flint/`, `src/models/deepseek_v41/`, `src/runtime/engine/{gemma4,flint,deepseek_v41}_core.*` |
+| DeepSeek-V4.1-Flash 模型族与其 Engine core | `src/models/deepseek_v41/`, `src/runtime/engine/deepseek_v41_core.*` |
 | 每卡 route profile 与 calibration | `src/runtime/engine/device_profile.*`, `src/calibration/`, `src/ops/common/device_route.*` |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |

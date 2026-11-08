@@ -47,8 +47,7 @@ inline constexpr std::string_view kDeepSeekParameterClose = "</｜DSML｜ parame
 
 // Pulls DSML tool calls out of the content stream: text outside calls blocks is published as it
 // arrives (a possible opener's prefix is held back), each complete block becomes its structured
-// calls, whose arguments the request's declared parameter types read (as Flint's text values are
-// read). An unterminated or unreadable block returns to content at the end.
+// calls, whose arguments the request's declared parameter types read.
 //
 // A forced call is one the prompt already opened: it ends with the block's opener and
 // `<｜DSML｜ invoke name="NAME">\n`, so generation resumes in that call's parameters and the

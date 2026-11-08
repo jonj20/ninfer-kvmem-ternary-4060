@@ -1,7 +1,6 @@
 // DeepSeek-V4.1 in the shared frontend.
 //
-// Pre-tokenizer: the word ends of DeepSeek's three splits (Flint's digits and CJK runs, then its
-// own words) against Hugging Face tokenizers' pre-tokenization of the same texts
+// Pre-tokenizer: the word ends of DeepSeek's three splits (digits and CJK runs, then its own words) against Hugging Face tokenizers' pre-tokenization of the same texts
 // (tests/fixtures/deepseek_v41/pretokenizer_cases.json, generated from the release's
 // tokenizer.json, whose pre_tokenizer is tests/fixtures/deepseek_v41/pre_tokenizer.json). A byte
 // vocabulary without merges makes a token of every byte, so the stable frontier of a boundary at

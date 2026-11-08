@@ -334,9 +334,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
                 return a.layout == layout && a.columns == w.input_columns;
             });
-            // Rows that are not whole 256-value steps (Gemma 4's 2112- and 704-wide inputs) read
-            // past their end into the next row and the zeros the loader places after the last
-            // one, against an activation that is zero there.
+            // Rows that are not whole 256-value steps read past their end into the next row and the
+            // zeros the loader places after the last one, against an activation that is zero there.
             const bool padded = k % 512 != 0;
             if (found == activations.end()) {
                 void* data = workspace.alloc_bytes(

@@ -9,9 +9,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/processor.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/media_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_call_parser.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/frontend/flint_output.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/deepseek_output.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/frontend/gemma_output.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_contract.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_grammar.cpp"
 )

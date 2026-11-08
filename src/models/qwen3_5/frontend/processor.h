@@ -79,24 +79,6 @@ struct PreprocessStats {
     [[nodiscard]] std::string summary() const;
 };
 
-// Gemma 4's media geometry (the release's processor_config.json): patches of `patch` pixels, an
-// average over pooling x pooling patches per soft token, and a soft-token budget per image and per
-// video frame out of kGemmaSoftTokenBudgets. A medium is resized, aspect kept, to the largest size
-// whose sides are multiples of pooling * patch within budget * pooling^2 patches.
-inline constexpr std::array<std::uint32_t, 5> kGemmaSoftTokenBudgets{70, 140, 280, 560, 1120};
-
-struct GemmaMediaOptions {
-    int patch                  = 16;
-    int pooling                = 3;
-    std::uint32_t image_tokens = 280;  // an image's budget at auto detail
-    std::uint32_t video_tokens = 70;   // a video frame's budget
-    std::uint32_t max_tokens   = 1120; // the server's bound on any budget (--vision-max-merged)
-    int frames                 = 32;   // video frames sampled, i * frames_in_video / 32
-};
-
-// The largest budget of kGemmaSoftTokenBudgets at most `bound`; throws when every one exceeds it.
-[[nodiscard]] std::uint32_t gemma_budget_at_most(std::uint64_t bound);
-
 // DeepSeek-V4.1's image preprocessing (the release's image_processor.py; processor_config.json
 // of the artifact's vision component): patches of `patch` pixels, `merge` x `merge` patches per
 // aligner row, an image upscaled to min_pixels before planning and shrunk until its span takes at
@@ -135,9 +117,7 @@ struct DeepSeekImagePlan {
                                                      int height, int out_width, int out_height);
 
 struct ProcessorOptions {
-    // Present for Gemma 4, whose media take its own geometry and placeholders.
-    std::optional<GemmaMediaOptions> gemma;
-    // Present for DeepSeek-V4.1, likewise.
+    // Present for DeepSeek-V4.1, whose media take its own geometry and placeholders.
     std::optional<DeepSeekMediaOptions> deepseek;
     std::uint64_t image_min_pixels = 32ULL * 32ULL;
     std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
@@ -205,7 +185,6 @@ struct MediaPads {
     std::string_view video;
 };
 inline constexpr MediaPads kQwenMediaPads{"<|image_pad|>", "<|video_pad|>"};
-inline constexpr MediaPads kGemmaMediaPads{"<|image|>", "<|video|>"};
 // DeepSeek-V4.1 takes no video.
 inline constexpr MediaPads kDeepSeekMediaPads{"<｜deepseek_image｜>", "<｜deepseek_image｜>"};
 

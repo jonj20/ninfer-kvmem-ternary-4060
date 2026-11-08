@@ -8,8 +8,6 @@ include(cmake/ProductTests.cmake)
 include(cmake/BenchSupportTests.cmake)
 include(models/qwen3_5/tests.cmake)
 include(models/qwen4_exp/tests.cmake)
-include(models/gemma4/tests.cmake)
-include(models/flint/tests.cmake)
 include(models/deepseek_v41/tests.cmake)
 ninfer_add_test(ninfer_tool_constraints_test STANDALONE
   SOURCES models/qwen3_5/test_tool_constraints.cpp LIBRARIES ninfer_serve ninfer_model_runtime ninfer_text)

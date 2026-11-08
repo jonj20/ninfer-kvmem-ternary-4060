@@ -396,15 +396,8 @@ GenerationService::GenerationService(
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
-    // A request that says nothing about thinking gets its template's default. Qwen's templates
-    // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking
-    // asks for it, so without --no-thinking or a request flag a Gemma 4 server answers directly.
-    // Flint's template has no switch: thinking on, the default, leaves reasoning to the model, and
-    // thinking off closes an empty reasoning block, after which it answers at once. DeepSeek-V4.1's
-    // template thinks unless told not to, as Qwen's do.
-    if (!options_.enable_thinking && engine_->load_summary().architecture == "Gemma4ForCausalLM") {
-        options_.enable_thinking = false;
-    }
+    // A request that says nothing about thinking gets its template's default. Qwen's and
+    // DeepSeek-V4.1's templates think unless told not to.
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(

@@ -80,8 +80,8 @@ double yarn_attention_factor(const Geometry& geometry) {
 }
 
 // rope_yarn_frequencies over a schedule theta^(-2i/dim) of `pairs` rotated pairs against the
-// oracle above with that dim: Qwen's quarter-head rotation (64 dims, 32 pairs), Gemma 4's
-// proportional RoPE (the 512-wide head, its first 64 pairs) and the unscaled factor of one.
+// oracle above with that dim: Qwen's quarter-head rotation (64 dims, 32 pairs) and a proportional
+// RoPE (a 512-wide head, its first 64 pairs) and the unscaled factor of one.
 int run_frequency_case(const char* label, int dim, int pairs, float theta, float factor,
                        int native) {
     const Geometry geometry{label, dim, dim, 1, 1, theta, factor, native};
@@ -616,16 +616,16 @@ int main() {
     failures += run_vision_packed_case();
 
     // The frequency schedules the in-kernel rotations take: Flash-Next's indexer at Qwen's quarter
-    // head, Gemma 4's full-attention blocks at their proportional schedule, and factor one.
+    // head and a proportional schedule, and factor one.
     failures += run_frequency_case("qwen indexer yarn frequencies", 64, 32, kTextTheta, 2.25F,
                                    262'144);
     failures += run_frequency_case("qwen yarn frequencies factor 4", 64, 32, kTextTheta, 4.0F,
                                    262'144);
-    failures += run_frequency_case("gemma 4 proportional yarn frequencies", 512, 64, 1.0e6F,
+    failures += run_frequency_case("proportional yarn frequencies", 512, 64, 1.0e6F,
                                    2.0F, 262'144);
-    failures += run_frequency_case("gemma 4 proportional yarn frequencies factor 4", 512, 64,
+    failures += run_frequency_case("proportional yarn frequencies factor 4", 512, 64,
                                    1.0e6F, 4.0F, 262'144);
-    failures += run_frequency_case("gemma 4 proportional unscaled", 512, 64, 1.0e6F, 1.0F,
+    failures += run_frequency_case("proportional unscaled", 512, 64, 1.0e6F, 1.0F,
                                    262'144);
     failures += run_frequency_refusals();
 

@@ -22,12 +22,6 @@ from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
 from .gguf_blocks import RECIPES as GGUF_RECIPES
-from .gemma4 import ARCHITECTURES as GEMMA4_ARCHITECTURES
-from .gemma4 import RECIPES as GEMMA4_RECIPES
-from .gemma4 import build_model as build_gemma4
-from .flint import ARCHITECTURES as FLINT_ARCHITECTURES
-from .flint import RECIPES as FLINT_RECIPES
-from .flint import build_model as build_flint
 from .deepseek_v41 import ARCHITECTURES as DEEPSEEK_V41_ARCHITECTURES
 from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
 from .deepseek_v41 import GGUFShards
@@ -115,7 +109,7 @@ def _layers(value: str):
 
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
-               **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES}
+               **DEEPSEEK_V41_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -209,8 +203,6 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
-        gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
-        flint = architectures[0] in FLINT_ARCHITECTURES
         if architectures[0] in DEEPSEEK_V41_ARCHITECTURES:
             components = tuple((args.components or "text,engram").split(","))
             if args.layers or "engram" not in paths or (
@@ -252,70 +244,6 @@ def main(argv=None):
             source_paths = {"base": {"path": str(args.model)},
                             "engram": {"path": str(paths["engram"])}}
             for name in ("gguf", "dspark", "vision", "bias_vl"):
-                if name in paths:
-                    source_paths[name] = {"path": str(paths[name])}
-            report = convert(
-                model, recipe, args.out, name=args.name,
-                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
-                            "sources": source_paths},
-                device=args.device, rows_per_chunk=args.rows_per_chunk,
-                max_file_bytes=args.max_file_bytes,
-                progress=lambda index, total, job: print(
-                    f"[{index+1}/{total}] {job.parameters[0]}"
-                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
-                    + f": {job.spec.format} {job.spec.shape}", flush=True))
-            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
-                  f"{report['seconds']:.1f}s", flush=True)
-            return
-        if flint:
-            if "gguf" not in paths or args.layers or (args.components or "text") != "text":
-                raise ValueError("Flint converts its text component from --source gguf=FILE")
-            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
-            model = build_flint(base, gguf, resource_overrides=overrides)
-            recipe = Recipe(model)
-            flint_sources = {"base": base, "gguf": gguf}
-            _function(args.recipe)(model, recipe, flint_sources)
-            if args.override:
-                _function(args.override)(model, recipe, flint_sources)
-            report = convert(
-                model, recipe, args.out, name=args.name,
-                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
-                            "sources": {"base": {"path": str(args.model)},
-                                        "gguf": {"path": str(paths["gguf"])}}},
-                device=args.device, rows_per_chunk=args.rows_per_chunk,
-                max_file_bytes=args.max_file_bytes,
-                progress=lambda index, total, job: print(
-                    f"[{index+1}/{total}] {job.parameters[0]}"
-                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
-                    + f": {job.spec.format} {job.spec.shape}", flush=True))
-            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
-                  f"{report['seconds']:.1f}s", flush=True)
-            return
-        if gemma4:
-            wanted = (args.components or "text").split(",")
-            if ("gguf" not in paths or args.layers or wanted[0] != "text"
-                    or not set(wanted) <= {"text", "mtp", "vision"}
-                    or len(set(wanted)) != len(wanted)
-                    or ("mtp" in wanted) != ("mtp" in paths)
-                    or ("vision" in wanted) != ("vision" in paths)):
-                raise ValueError("Gemma 4 converts its text component from --source gguf=FILE; "
-                                 "--components text,mtp adds its assistant from --source "
-                                 "mtp=FILE and text,vision its vision tower from --source "
-                                 "vision=MMPROJ.gguf")
-            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
-            mtp = stack.enter_context(GGUFFile(paths["mtp"])) if "mtp" in paths else None
-            vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
-            model = build_gemma4(base, gguf, mtp=mtp, vision=vision,
-                                 resource_overrides=overrides)
-            recipe = Recipe(model)
-            gemma_sources = ({"base": base, "gguf": gguf} | ({"mtp": mtp} if mtp else {})
-                             | ({"vision": vision} if vision else {}))
-            _function(args.recipe)(model, recipe, gemma_sources)
-            if args.override:
-                _function(args.override)(model, recipe, gemma_sources)
-            source_paths = {"base": {"path": str(args.model)},
-                            "gguf": {"path": str(paths["gguf"])}}
-            for name in ("mtp", "vision"):
                 if name in paths:
                     source_paths[name] = {"path": str(paths[name])}
             report = convert(

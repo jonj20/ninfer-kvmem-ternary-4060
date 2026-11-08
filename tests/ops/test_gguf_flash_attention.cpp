@@ -1,8 +1,6 @@
 // llama.cpp's tensor-core flash attention behind the GGUF bridge (ops/linear/gguf/ggml_fattn.h),
-// the prompt attention of Gemma 4's sliding-window (width 256) and full-attention (width 512)
-// blocks and of Flint's blocks (width 128 with a learned sink per query head): FP32 queries against
-// an F16 key/value cache under an F16 additive mask, at their head groups (16 query heads over 8
-// key/value heads at width 256, over 2 at widths 128 and 512). Each width
+// prompt attention for head width 256 (sliding-window style) and 512 (full-attention style), and
+// width 128 with a learned sink per query head: FP32 queries against an F16 key/value cache under an F16 additive mask, at their head groups (16 query heads over 8 key/value heads at width 256, over 2 at widths 128 and 512). Each width
 // launches the tile that the build's device code has and its shared memory holds, so this also
 // checks that both tiles run at all on the build's target. Each row is held against an FP64 softmax
 // of the unrounded inputs, at query counts inside one tile, across tile boundaries and past one

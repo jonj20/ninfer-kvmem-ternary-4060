@@ -107,7 +107,7 @@ void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_b
 // out[i] = BF16(silu(gate[i]) * up[i]) for i < count, as the GPU's up kernels store the middle.
 void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                           GgufCpuBackend backend);
-// out[i] = BF16(gelu_tanh(gate[i]) * up[i]), Gemma 4's middle.
+// out[i] = BF16(gelu_tanh(gate[i]) * up[i]) (GeGLU middle).
 void gguf_cpu_geglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                          GgufCpuBackend backend);
 // out[i] = BF16(silu(min(g, limit)) * min(max(u, -limit), limit)) with g = BF16(gate[i] * scale)

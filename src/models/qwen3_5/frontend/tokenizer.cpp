@@ -34,18 +34,16 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-// Flint's three splits, applied in turn to the pieces of the one before: digits in groups of up to
-// three, runs of CJK ideographs and kana, then o200k's words.
-constexpr std::string_view kFlintSplitPatterns[] = {
-    R"flint(\p{N}{1,3})flint",
+// Shared digit and CJK runs, used as the first two splits of DeepSeek's pre-tokenizer.
+constexpr std::string_view kDigitCjkPatterns[] = {
+    R"digits(\p{N}{1,3})digits",
     "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
-    R"flint([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)flint",
 };
 
 // DeepSeek's three: the same digits and CJK runs, then its own words.
 constexpr std::string_view kDeepSeekSplitPatterns[] = {
-    kFlintSplitPatterns[0],
-    kFlintSplitPatterns[1],
+    kDigitCjkPatterns[0],
+    kDigitCjkPatterns[1],
     // Its tokenizer.json writes the line breaks of the classes as the characters themselves.
     "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+"
     "|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
@@ -95,7 +93,7 @@ ByteLevelPipeline validate_pipeline(const Json& root, const Json& model) {
         if (splits.size() == 2) {
             require(isolates(splits[0], kQwenSplitPattern), "pre_tokenizer.Split");
         } else {
-            require(splits.size() == std::size(kFlintSplitPatterns) + 1, "pre_tokenizer");
+            require(splits.size() == std::size(kDigitCjkPatterns) + 1, "pre_tokenizer");
             const auto all = [&](std::span<const std::string_view> patterns) {
                 for (std::size_t i = 0; i < patterns.size(); ++i) {
                     if (!isolates(splits[i], patterns[i])) { return false; }
@@ -103,8 +101,8 @@ ByteLevelPipeline validate_pipeline(const Json& root, const Json& model) {
                 return true;
             };
             const bool deepseek = all(kDeepSeekSplitPatterns);
-            require(deepseek || all(kFlintSplitPatterns), "pre_tokenizer.Split");
-            pipeline.split = deepseek ? ByteLevelSplit::DeepSeek : ByteLevelSplit::Flint;
+            require(deepseek, "pre_tokenizer.Split");
+            pipeline.split = ByteLevelSplit::DeepSeek;
         }
         require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
                     bytes.value("use_regex", Json(true)) == false,
@@ -613,25 +611,13 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
     return after_first;
 }
 
-// Flint's o200k word pattern over the letters: the "upper" class (Lu, Lt, Lm, Lo, M), which a word
-// may start with, and the "lower" class (Ll, Lm, Lo, M), which a word that does not end in capitals
-// ends with.
-bool is_flint_upper(std::int32_t cp) noexcept {
-    return uni::is_upper_or_title_letter(cp) || uni::is_modifier_or_other_letter(cp) ||
-           uni::is_mark(cp);
-}
-
-bool is_flint_lower(std::int32_t cp) noexcept {
-    return uni::is_lower_letter(cp) || uni::is_modifier_or_other_letter(cp) || uni::is_mark(cp);
-}
-
-bool is_flint_cjk(std::int32_t cp) noexcept {
+bool is_cjk(std::int32_t cp) noexcept {
     return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF);
 }
 
-// The piece of Flint's first two splits that holds `begin`, which starts a word: up to three
+// The piece of DeepSeek's first two splits that holds `begin`, which starts a word: up to three
 // numbers, a run of CJK ideographs and kana, or a run of anything else.
-std::size_t flint_piece_end(std::string_view text, std::size_t begin) {
+std::size_t piece_end_at(std::string_view text, std::size_t begin) {
     const std::int32_t first = qwen_codepoint_at(text, begin).value;
     std::size_t end          = begin;
     if (uni::is_number(first)) {
@@ -642,119 +628,11 @@ std::size_t flint_piece_end(std::string_view text, std::size_t begin) {
         }
         return end;
     }
-    const bool cjk = is_flint_cjk(first);
+    const bool cjk = is_cjk(first);
     while (end < text.size()) {
         const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-        if (uni::is_number(value.value) || is_flint_cjk(value.value) != cjk) { break; }
+        if (uni::is_number(value.value) || is_cjk(value.value) != cjk) { break; }
         end += value.length;
-    }
-    return end;
-}
-
-// The end of the o200k word pattern's match at `at` within a piece ending at `end`, as a
-// backtracking engine takes its alternatives in order; npos where none matches.
-std::size_t flint_match(std::string_view text, std::size_t at, std::size_t end) {
-    constexpr std::size_t none = std::string_view::npos;
-    const auto cp = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
-    // An English contraction after a word, ASCII case-insensitive.
-    const auto contraction = [&](std::size_t word_end) {
-        if (word_end >= end || text[word_end] != '\'') { return word_end; }
-        constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
-        for (const std::string_view suffix : suffixes) {
-            if (word_end + 1 + suffix.size() <= end &&
-                ascii_ci_matches(text, word_end + 1, suffix)) {
-                return word_end + 1 + suffix.size();
-            }
-        }
-        return word_end;
-    };
-    // [upper]*[lower]+: the longest run of upper letters that lower ones can follow.
-    const auto mixed_word = [&](std::size_t from) {
-        std::size_t upper_end = from, last_lower_end = none;
-        while (upper_end < end) {
-            const uni::CodepointSpan value = cp(upper_end);
-            if (!is_flint_upper(value.value)) { break; }
-            upper_end += value.length;
-            if (is_flint_lower(value.value)) { last_lower_end = upper_end; }
-        }
-        if (upper_end < end && is_flint_lower(cp(upper_end).value)) {
-            std::size_t word_end = upper_end;
-            while (word_end < end) {
-                const uni::CodepointSpan value = cp(word_end);
-                if (!is_flint_lower(value.value)) { break; }
-                word_end += value.length;
-            }
-            return contraction(word_end);
-        }
-        return last_lower_end == none ? none : contraction(last_lower_end);
-    };
-    // [upper]+[lower]*
-    const auto upper_word = [&](std::size_t from) {
-        std::size_t word_end = from;
-        while (word_end < end) {
-            const uni::CodepointSpan value = cp(word_end);
-            if (!is_flint_upper(value.value)) { break; }
-            word_end += value.length;
-        }
-        if (word_end == from) { return none; }
-        while (word_end < end) {
-            const uni::CodepointSpan value = cp(word_end);
-            if (!is_flint_lower(value.value)) { break; }
-            word_end += value.length;
-        }
-        return contraction(word_end);
-    };
-    const uni::CodepointSpan first = cp(at);
-    const std::int32_t c           = first.value;
-    // [^\r\n\p{L}\p{N}]? before either word form, tried with the prefix first.
-    const std::size_t after = at + first.length;
-    const bool prefix = !is_newline(c) && !uni::is_letter(c) && !uni::is_number(c) && after < end;
-    std::size_t matched = prefix ? mixed_word(after) : none;
-    if (matched == none) { matched = mixed_word(at); }
-    if (matched == none && prefix) { matched = upper_word(after); }
-    if (matched == none) { matched = upper_word(at); }
-    if (matched != none) { return matched; }
-    //  ?[\p{P}\p{S}]+[\r\n]*
-    const auto punctuation = [](std::int32_t value) {
-        return uni::is_punctuation(value) || uni::is_symbol(value);
-    };
-    std::size_t marks = c == ' ' && at + 1 < end && punctuation(cp(at + 1).value) ? at + 1 : at;
-    if (punctuation(cp(marks).value)) {
-        while (marks < end && punctuation(cp(marks).value)) { marks += cp(marks).length; }
-        while (marks < end && is_newline(cp(marks).value)) { marks += cp(marks).length; }
-        return marks;
-    }
-    // \s*[\r\n]+ | \s+(?!\S) | \s+, the piece's end ending the text.
-    if (uni::is_whitespace(c)) {
-        std::size_t run_end = at, last_begin = at, last_newline_end = none, count = 0;
-        while (run_end < end) {
-            const uni::CodepointSpan value = cp(run_end);
-            if (!uni::is_whitespace(value.value)) { break; }
-            last_begin = run_end;
-            run_end += value.length;
-            ++count;
-            if (is_newline(value.value)) { last_newline_end = run_end; }
-        }
-        if (last_newline_end != none) { return last_newline_end; }
-        if (run_end == end) { return run_end; }
-        return count >= 2 ? last_begin : run_end;
-    }
-    return none;
-}
-
-// `piece_end` carries the end of the current piece of the first two splits from one word to the
-// next.
-std::size_t flint_word_end(std::string_view text, std::size_t begin, std::size_t& piece_end) {
-    if (begin >= piece_end) { piece_end = flint_piece_end(text, begin); }
-    if (uni::is_number(qwen_codepoint_at(text, begin).value)) { return piece_end; }
-    if (const std::size_t matched = flint_match(text, begin, piece_end);
-        matched != std::string_view::npos) {
-        return matched;
-    }
-    // Code points no alternative matches at stay together until one does.
-    std::size_t end = begin + qwen_codepoint_at(text, begin).length;
-    while (end < piece_end && flint_match(text, end, piece_end) == std::string_view::npos) {
-        end += qwen_codepoint_at(text, end).length;
     }
     return end;
 }
@@ -824,12 +702,11 @@ std::size_t deepseek_match(std::string_view text, std::size_t at, std::size_t en
     return none;
 }
 
-// Flint's or DeepSeek's word at `begin`; `piece_end` carries the end of the current piece of the
+// DeepSeek's word at `begin`; `piece_end` carries the end of the current piece of the
 // first two splits from one word to the next.
 std::size_t split_word_end(ByteLevelSplit split, std::string_view text, std::size_t begin,
                            std::size_t& piece_end) {
-    if (split == ByteLevelSplit::Flint) { return flint_word_end(text, begin, piece_end); }
-    if (begin >= piece_end) { piece_end = flint_piece_end(text, begin); }
+    if (begin >= piece_end) { piece_end = piece_end_at(text, begin); }
     if (uni::is_number(qwen_codepoint_at(text, begin).value)) { return piece_end; }
     if (const std::size_t matched = deepseek_match(text, begin, piece_end);
         matched != std::string_view::npos) {
@@ -983,7 +860,7 @@ struct IndexedByteBoundary {
     std::size_t index  = 0;
 };
 
-// ---- SentencePiece-style BPE (Gemma 4) ----------------------------------------------------------
+// ---- SentencePiece-style BPE (U+2581 space form) ----------------------------------------------------------
 
 constexpr std::string_view kSentencePieceSpace = "\xe2\x96\x81"; // U+2581
 
@@ -1173,12 +1050,12 @@ constexpr std::size_t kKeptRuns     = 8;
 constexpr std::size_t kWordLookaheadBytes = 4;
 
 // Whether a word that ends before `next` ends there whatever follows `next`. Qwen's words end
-// before anything but whitespace that way. A Flint word can end inside a run of letters by a
+// before anything but whitespace that way. A DeepSeek word can end inside a run of letters by a
 // capital that a lower-case letter further on would have joined to it, so only a number, a CJK
-// ideograph or kana, punctuation or a symbol decide it alone; the same decide a DeepSeek word.
+// ideograph or kana, punctuation or a symbol decide it alone.
 bool reusable_word_end(ByteLevelSplit split, std::int32_t next) noexcept {
     if (split == ByteLevelSplit::Qwen) { return !uni::is_whitespace(next); }
-    return uni::is_number(next) || is_flint_cjk(next) || uni::is_punctuation(next) ||
+    return uni::is_number(next) || is_cjk(next) || uni::is_punctuation(next) ||
            uni::is_symbol(next);
 }
 

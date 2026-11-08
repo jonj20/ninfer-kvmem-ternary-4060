@@ -50,15 +50,6 @@ ninfer_add_test(ninfer_qwen3_5_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
-ninfer_add_test(ninfer_gemma4_output_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma_output.cpp"
-  LIBRARIES ninfer_engine ninfer_core ninfer::json)
-
-ninfer_add_test(ninfer_flint_frontend_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flint_frontend.cpp"
-  NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer_core ninfer::json)
-
 ninfer_add_test(ninfer_deepseek_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_deepseek_frontend.cpp"
   NEEDS_SOURCE_DIR

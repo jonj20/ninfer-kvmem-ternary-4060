@@ -751,7 +751,7 @@ def test_the_vision_tower_needs_its_sources(tmp_path):
         with pytest.raises(ValueError, match="lacks layers.2"):
             deepseek_v41.build_model(base, gguf, components=("text", "vision"), vision=vision,
                                      bias_vl=bias)
-    other, _ = _mmproj(tmp_path, projector="gemma4v")
+    other, _ = _mmproj(tmp_path, projector="deepseek3v")
     with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf, \
             GGUFFile(other) as vision, SafetensorsSource(short) as bias:
         with pytest.raises(ValueError, match="projector"):

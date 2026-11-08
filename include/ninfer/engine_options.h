@@ -69,7 +69,7 @@ struct SpeculativeOptions {
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
     // The backend was left to the Engine (no --spec): a MoE model with host or disk experts whose
-    // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next, Gemma 4) drafts with it,
+    // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next) drafts with it,
     // kAutomaticDraftTokens a round, since a verification window's routes share the layer's
     // missing experts (Flash-Next ending a round's drafting at its first draft at or below
     // kAutomaticDraftMinP); others run without drafts. The Engine's options() report the resolved
@@ -363,7 +363,7 @@ struct ModelSuspendOptions {
 
 // Host and disk experts: how a decode or verification call gets the routed experts the device
 // cache lacks. The GPU copies a share of them and the CPU computes the rest: for GGUF banks
-// (Flash-Next, Gemma 4, Flint) and Qwen3.5/3.6 MoE experts the GPU's results bit for bit, for
+// (Flash-Next) and Qwen3.5/3.6 MoE experts the GPU's results bit for bit, for
 // Flash-Next native banks different numerical results (and concurrency one).
 struct HybridExpertOptions {
     // Host or disk experts: the share 0..1 of a decode or verification call's missing experts the
@@ -473,7 +473,7 @@ struct EngineOptions {
     // The devices share every layer instead of dealing layers out: tensor parallelism over the GDN
     // heads, the attention's KV heads with their cache and the dense FFN rows, or expert
     // parallelism over a MoE layer's experts, with the embedding, the head, the shared expert and
-    // MTP on the first device. Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1-Flash divide
+    // MTP on the first device. Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash divide
     // only their routed experts. The cards may differ.
     bool tensor_parallel = false;
     // With tensor parallelism, the relative size of each device's share, one positive weight per
@@ -489,11 +489,11 @@ struct EngineOptions {
     // bytes whether it is decoded alone, verified in a draft window or batched with others. The
     // other kernels (projections, experts, Gated DeltaNet) keep their own schedules.
     bool invariant_attention = false;
-    // Native Qwen MoE, Qwen3.8-Flash-Next, Gemma 4 MoE and Flint.
+    // Native Qwen MoE and Qwen3.8-Flash-Next.
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Host/disk experts: device memory lent to the persistent cache, split
     // evenly over the devices. Automatic sizing follows each family's KV/workspace reservations.
-    // Zero disables the cache for native Qwen and Gemma, which retain bounded transient slots;
+    // Zero disables the cache for native Qwen, which retains bounded transient slots;
     // Flash-Next disk residency requires a nonzero cache.
     std::optional<std::uint64_t> expert_cache_bytes;
     HybridExpertOptions hybrid_experts;
@@ -558,7 +558,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
     // whose routed experts live in host memory or files (each chunk carries the whole expert bank
-    // across the bus once). Gemma 4 and Flint choose their own chunk.
+    // across the bus once).
     std::uint32_t prefill_chunk        = 0;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode

@@ -250,8 +250,7 @@ container, so the cause is not confirmed.
 `--devices A,B,... --tensor-parallel` divides every layer of a Qwen3.5-core model over the devices
 instead of dealing layers out. It targets decode: each card reads only its share of the weights for
 every token. Qwen3.8-Flash-Next divides its layers too ([tensor parallelism of
-Qwen3.8-Flash-Next](#tensor-parallelism-of-qwen38-flash-next)); Gemma 4, Flint and
-DeepSeek-V4.1-Flash divide only their routed experts ([expert parallelism of the other MoE
+Qwen3.8-Flash-Next](#tensor-parallelism-of-qwen38-flash-next)); DeepSeek-V4.1-Flash divides only its routed experts ([expert parallelism of the other MoE
 families](#expert-parallelism-of-the-other-moe-families)).
 
 - **The shares.** Rank r holds a contiguous range of GDN key heads with the value heads that read
@@ -629,7 +628,7 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
 
 ### Expert parallelism of the other MoE families
 
-Gemma 4, Flint and DeepSeek-V4.1-Flash keep every layer on rank 0 and divide only the routed
+DeepSeek-V4.1-Flash keeps every layer on rank 0 and divides only the routed
 experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a contiguous range
 of `--tensor-split`'s weights (`split_shares` over single experts). Rank 0 runs attention, the
 router, the shared expert, the head, the drafters and Vision, as one device does.
@@ -647,17 +646,17 @@ router, the shared expert, the head, the drafters and Vision, as one device does
 - **Numerics.** Each pair's contribution is computed and rounded exactly as on one device and integer
   addition commutes, so the sum does not depend on the split. Where one device also sums in this
   fixed point the result is one device's bit for bit: the decode and verification calls of up to
-  eight tokens of Gemma 4, Flint and DeepSeek. Their prompt chunks on one device weigh the
+  eight tokens of DeepSeek. Their prompt chunks on one device weigh the
   experts' FP32 rows in FP32 in the block's combine; under expert parallelism the same rows are
   weighted into the fixed-point sum (`moe_weighted_rows`), which rounds differently.
-- **Residency.** Gemma 4 and Flint divide device-resident experts: each
+- **Residency.** DeepSeek-V4.1-Flash divides device-resident experts: each
   rank binds its rows of every bank as a piece of its own (with the matrix kernel's zero tail) and
   builds expert tables whose other entries are null. DeepSeek-V4.1-Flash, whose experts live in
   pinned host memory or the artifact's files, gives every rank an `ExpertDelivery` of its own over
   its experts (tables of those alone, local ids from `moe_local_experts`): its own layer banks and
   device cache, filled over its own bus. Without `--tensor-split` the device families size the
   shares by each card's copy bandwidth within its free memory (`models::default_expert_split`),
-  DeepSeek equally. Refused: Gemma 4's and Flint's host or disk experts, DeepSeek's device experts and its CPU share
+  DeepSeek equally. Refused: DeepSeek's device experts and its CPU share
   (`--expert-dma-share`, `--expert-cpu-threads`); DeepSeek's prompt spans are off.
 
 Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
@@ -665,22 +664,8 @@ Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host 
 about 7,000 tokens, one pass per configuration). Every MoE call crosses the bus twice, so on this
 pair the exchange costs more decode time than the divided experts save:
 
-- **Gemma 4** 26B-A4B QAT (fits one card), against one card: decode 164.6-166.2 tok/s against
-  216.3-218.4 (-24%), 155.1 against 195.5 after the long prompt (-21%); with `--spec mtp
-  --draft-tokens 3` 240.4-377.0 against 249.7-398.1 (-6% to +1%) and 199.1 against 197.1. A short
-  prompt's TTFT is 44.3-49.2 ms against 45.1-51.7 ms; the 6,966-token prompt prefills at 4,858
-  tok/s against 5,995 (-19%). Perplexity over 6,952 tokens of the same document (2,048-token
-  windows, stride 1,024, int8 KV) is 1,653.84 against 1,647.85 (+0.36%; the instruction-tuned
-  model scores raw Markdown poorly), the same for `--tensor-split 1,1` and `3,1`. One answer of five
-  matched one card's; the others part after 12 to 452 characters, from prompts the pair prefilled
-  with the fixed-point weighting.
-- **Flint** UD-Q4_K_XL, which does not fit one 24 GB card with its experts, against one card with
-  host experts (98% of decode routes from its device cache): decode 141.5-141.9 tok/s against
-  147.3-150.4 (-4% to -6%), 135.1 against 142.1 after the long prompt (-5%). A short prompt's TTFT
-  is 43.0-45.2 ms against 78.0-99.4 ms and the 6,932-token prompt prefills at 4,593 tok/s against
-  5,042 (-9%). Perplexity over 6,927 tokens (F16 KV) is 45.397 against 45.362 (+0.08%), the same
-  for `--tensor-split 1,1` and `3,1`. No answer matched the host run's; they part after 23 to 923
-  characters.
+
+
 - **DeepSeek-V4.1-Flash** GSQ-RCO IQ1_M (`--no-ngram-table`), on 2x A40 (Vast, PCIe 4.0 x16) against
   one A40, experts in pinned host memory: each card serves 192 experts from its own cache (33 GiB)
   and bus. Decode 41.9-42.7 tok/s against 34.0-37.9 (+12% to +24%), 39.6 against 32.0 after the
