@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/softmax_attention/kv_attn_coverage.h"
+
 #include <cstdint>
 #include <stdexcept>
 
@@ -33,9 +35,11 @@ using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
                                                                  std::int32_t kv_heads) {
     if (kv_heads <= 0 || query_heads % kv_heads != 0) { return false; }
     const std::int32_t group = query_heads / kv_heads;
-    return (group == CausalD256H24Kv4::GroupSize && kv_heads <= CausalD256H24Kv4::ModelKVHeads) ||
-           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads) ||
-           (group == 4 && kv_heads <= 4);
+    return (NINFER_KV_ATTN_GEOM_H24 &&
+            group == CausalD256H24Kv4::GroupSize && kv_heads <= CausalD256H24Kv4::ModelKVHeads) ||
+           (NINFER_KV_ATTN_GEOM_H16 &&
+            group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads) ||
+           (NINFER_KV_ATTN_GEOM_G4 && group == 4 && kv_heads <= 4);
 }
 
 // Calls `f.template operator()<Geometry>()` with the geometry of `query_heads` over `kv_heads`.
@@ -46,13 +50,25 @@ decltype(auto) with_causal_geometry(std::int32_t query_heads, std::int32_t kv_he
         throw std::invalid_argument("causal attention: unsupported head geometry");
     }
     if (query_heads / kv_heads == CausalD256H24Kv4::GroupSize) {
+#if NINFER_KV_ATTN_GEOM_H24
         return f.template operator()<CausalD256H24Kv4>();
+#else
+        throw std::invalid_argument("causal attention: this build omits the H24 geometry");
+#endif
     }
     if (query_heads / kv_heads == 4) {
+#if NINFER_KV_ATTN_GEOM_G4
         if (kv_heads <= 2) return f.template operator()<CausalD256H8Kv2>();
         return f.template operator()<CausalD256H16Kv4>();
+#else
+        throw std::invalid_argument("causal attention: this build omits the group-4 geometry");
+#endif
     }
+#if NINFER_KV_ATTN_GEOM_H16
     return f.template operator()<CausalD256H16Kv2>();
+#else
+    throw std::invalid_argument("causal attention: this build omits the H16 geometry");
+#endif
 }
 
 } // namespace ninfer::ops

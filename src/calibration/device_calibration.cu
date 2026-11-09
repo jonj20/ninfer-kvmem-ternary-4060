@@ -1815,15 +1815,18 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     if (projections && options.nvfp4 && !gguf_only) { calibrate_nvfp4_fused(profile, timer, options); }
     if (options.linear_attention && !gguf_only) { calibrate_linear_attention(profile, timer, options); }
     if (attention) {
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
-                            "rk8v4");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedLloyd4KeyInt4Value,
-                            "rk4v4");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt4KeyInt4ValueE8,
-                            "rk4v4-e8");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedE8RootKeyInt4Value,
-                            "rk2v4-e8");
-        calibrate_attention(profile, timer, options, KvCacheStorage::Int8Group64, "int8");
+        // Only the codings this build carries can be timed: the calibration runs the real
+        // attention kernels, and a build that left a coding out (the coverage switches, see
+        // ops/softmax_attention/kv_attn_coverage.h) has no kernel for it to run.
+        const auto calibrate_storage = [&](KvCacheStorage storage, const char* name) {
+            if (!kv_attn_storage_compiled(storage)) { return; }
+            calibrate_attention(profile, timer, options, storage, name);
+        };
+        calibrate_storage(KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, "rk8v4");
+        calibrate_storage(KvCacheStorage::RotatedLloyd4KeyInt4Value, "rk4v4");
+        calibrate_storage(KvCacheStorage::RotatedInt4KeyInt4ValueE8, "rk4v4-e8");
+        calibrate_storage(KvCacheStorage::RotatedE8RootKeyInt4Value, "rk2v4-e8");
+        calibrate_storage(KvCacheStorage::Int8Group64, "int8");
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

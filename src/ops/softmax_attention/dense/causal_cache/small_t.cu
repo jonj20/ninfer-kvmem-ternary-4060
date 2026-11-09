@@ -2,6 +2,7 @@
 // preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_geometry.cuh"
+#include "ops/softmax_attention/kv_attn_coverage.h"
 
 #include "core/paged_kv_storage.h"
 #include "ops/common/device_multiprocessors.h"
@@ -436,6 +437,11 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                      Tensor& out, cudaStream_t stream, const void* gate,
                                      float* partial_out) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("causal small-T attention: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                              envelope, column_begin, width, partial_acc, partial_m,
@@ -478,6 +484,11 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
                                             Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("causal small-T attention: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, partial_acc,
                                                     partial_m, partial_l, out, stream);

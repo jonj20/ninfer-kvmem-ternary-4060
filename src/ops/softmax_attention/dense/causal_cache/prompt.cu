@@ -11,11 +11,13 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
+#include "ops/softmax_attention/kv_attn_coverage.h"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 static_assert(kPromptWaveRows == CausalPromptI8FastShape<8>::Br);
@@ -136,30 +138,38 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                 stream);
             return;
         }
+#if NINFER_KV_ATTN_CODING_RK8V4
         if (fast && cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
                 stream);
             return;
         }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4
         if (fast && cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Lloyd4>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
                 stream);
             return;
         }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
         if (fast && cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Int4E8>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
                 stream);
             return;
         }
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
         if (fast && cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::RootE8>(
                 q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out,
                 stream);
             return;
         }
+#endif
     }
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
@@ -227,15 +237,29 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                 }
                 launch_i8.template operator()<PackedValues, Keys, false>();
             };
-            if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+            if (false) {
+            }
+#if NINFER_KV_ATTN_CODING_RK4V4
+            else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
                 with_pv.template operator()<true, KvKeyCoding::Lloyd4>();
-            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
+            else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
                 with_pv.template operator()<true, KvKeyCoding::Int4E8>();
-            } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
+            else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
                 launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
-            } else if (cache_v.dtype == DType::U8) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK8V4
+            else if (cache_v.dtype == DType::U8) {
                 with_pv.template operator()<true, KvKeyCoding::Int8>();
-            } else {
+            }
+#endif
+            else {
                 launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
             }
         }
@@ -272,11 +296,22 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
     // The fast kernels hold 100 KiB of shared memory, past a Volta card's 96 KiB.
     if (current_device_volta()) { return false; }
     const bool supported = storage == KvCacheStorage::Int8Group64 ||
+#if NINFER_KV_ATTN_CODING_RK8V4
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
                            storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
                            storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
-                           storage == KvCacheStorage::Nvfp4Group16;
+#endif
+#if NINFER_KV_ATTN_NVFP4
+                           storage == KvCacheStorage::Nvfp4Group16 ||
+#endif
+                           false;
     if (!supported) { return false; }
     // A card without the standard INT8-family prompt kernel (causal_prompt_i8_standard) takes the
     // fast one for every INT8-family coding.
@@ -318,6 +353,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
                                               std::uint32_t max_visible_keys,
                                               WorkspaceArena& workspace, Tensor& out, bool fast,
                                               cudaStream_t stream) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("causal prompt attention: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
         return;
@@ -344,6 +384,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                     PagedKVBatchLayerView cache, std::uint32_t max_visible_keys,
                                     WorkspaceArena& workspace, Tensor& out, bool fast,
                                     cudaStream_t stream) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("causal prompt attention: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                             cache, out, stream);

@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "ninfer/kv_cache_storage.h"
 #include "kvmem/lrfu.hpp"
 #include "kvmem/retrieval_options.hpp"
 
@@ -290,6 +291,16 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    // A deployment build may compile only the KV cache codings it runs (the RTX 4060 profile
+    // omits some). The Engine refuses such a storage here, by name, before any weight is uploaded,
+    // so a --kv-dtype this build cannot serve fails at startup instead of inside the first
+    // generation's attention Op.
+    if (!kv_attn_storage_compiled(options.kv_cache)) {
+        throw std::invalid_argument(std::string("this build was compiled without the ") +
+                                     kv_attn_storage_name(options.kv_cache) +
+                                     " KV cache coding (compiled: " +
+                                     kv_attn_compiled_storage_names() + ")");
+    }
     if (options.purpose == EnginePurpose::Generation) {
         const auto requested_ngram = options.speculative.ngram_draft_tokens;
         options.speculative.ngram_draft_tokens =

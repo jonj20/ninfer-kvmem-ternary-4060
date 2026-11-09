@@ -4,9 +4,11 @@
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
 #include "ops/kv_cache/plane_types.h"
+#include "ops/softmax_attention/kv_attn_coverage.h"
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -57,7 +59,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         Tensor& cache_v_scale = cache.v_scale_pages;
         // A U8 value plane is the packed signed int4 coding (rk8v4, rk4v4, rk4v4-e8); a U8 key
         // plane is a packed key coding, told apart by storage. Otherwise the plane is plain INT8.
-        const bool packed_values = cache.v_pages.dtype == DType::U8;
+        [[maybe_unused]] const bool packed_values = cache.v_pages.dtype == DType::U8;
         const auto issue         = [&]<bool PackedValues, KvKeyCoding Keys>() {
             if (tokens >= 128 && Geometry::KVHeads <= 2) {
                 constexpr int TokensPerTile = 8;
@@ -90,15 +92,29 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                         static_cast<__half*>(cache_v_scale.data), tokens);
             }
         };
-        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+        if (false) {
+        }
+#if NINFER_KV_ATTN_CODING_RK4V4
+        else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
             issue.template operator()<true, KvKeyCoding::Lloyd4>();
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
+        else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             issue.template operator()<true, KvKeyCoding::Int4E8>();
-        } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
+        else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             issue.template operator()<true, KvKeyCoding::RootE8>();
-        } else if (packed_values) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK8V4
+        else if (packed_values) {
             issue.template operator()<true, KvKeyCoding::Int8>();
-        } else {
+        }
+#endif
+        else {
             issue.template operator()<false, KvKeyCoding::Int8>();
         }
         CUDA_CHECK(cudaGetLastError());
@@ -200,6 +216,11 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("kv cache append: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
         return;
@@ -218,6 +239,11 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (!kv_attn_storage_in_build(cache.storage)) {
+        throw std::invalid_argument(
+            std::string("kv cache append: this build omits the ") +
+            kv_attn_storage_name(cache.storage) + " KV cache coding");
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
                                           stream);

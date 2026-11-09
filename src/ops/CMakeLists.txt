@@ -7,6 +7,31 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
 target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 
+# Compile-time coverage of the KV attention codings and geometries. Options live here so every
+# family's sources.cmake can read them; the definitions are applied per source in those files, so
+# changing the profile rebuilds only the KV attention units instead of all of ninfer_ops. The
+# product default is every coding and geometry ON (ops/softmax_attention/kv_attn_coverage.h).
+foreach(_ninfer_kv_attn_switch
+    NINFER_KV_ATTN_CODING_RK8V4
+    NINFER_KV_ATTN_CODING_RK4V4
+    NINFER_KV_ATTN_CODING_RK4V4E8
+    NINFER_KV_ATTN_CODING_RK2V4E8
+    NINFER_KV_ATTN_FP8
+    NINFER_KV_ATTN_NVFP4
+    NINFER_KV_ATTN_K8V4
+    NINFER_KV_ATTN_GEOM_H24
+    NINFER_KV_ATTN_GEOM_H16
+    NINFER_KV_ATTN_GEOM_G4)
+  option(${_ninfer_kv_attn_switch} "Compile the ${_ninfer_kv_attn_switch} KV attention coverage" ON)
+  if(${_ninfer_kv_attn_switch})
+    set(${_ninfer_kv_attn_switch}_VALUE 1)
+  else()
+    set(${_ninfer_kv_attn_switch}_VALUE 0)
+  endif()
+  list(APPEND NINFER_KV_ATTN_COMPILE_DEFINITIONS
+    "${_ninfer_kv_attn_switch}=${${_ninfer_kv_attn_switch}_VALUE}")
+endforeach()
+
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
 # self-contained kernels therefore use a non-RDC archive and host launchers.

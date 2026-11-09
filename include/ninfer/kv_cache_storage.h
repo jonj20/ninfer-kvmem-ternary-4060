@@ -4,6 +4,7 @@
 // share it; it depends on nothing else in the public interface.
 
 #include <cstdint>
+#include <string>
 
 namespace ninfer {
 
@@ -32,5 +33,17 @@ enum class KvCacheStorage : std::uint8_t {
     // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
     RotatedE8RootKeyInt4Value,
 };
+
+// The KV cache codings this build carries. The product default compiles every coding; a
+// deployment build (the RTX 4060 profile) may omit the ones it never runs, through the CMake
+// options NINFER_KV_ATTN_CODING_*. A build that omits one refuses it here, so the Engine rejects
+// such a --kv-dtype at admission with the storage's name instead of failing inside an Op later.
+[[nodiscard]] bool kv_attn_storage_compiled(KvCacheStorage storage);
+
+// The --kv-dtype name of a storage ("rk8v4", "rk4v4-e8", ...).
+[[nodiscard]] const char* kv_attn_storage_name(KvCacheStorage storage);
+
+// The names of the storages this build carries, comma separated, for the refusal message.
+[[nodiscard]] std::string kv_attn_compiled_storage_names();
 
 } // namespace ninfer

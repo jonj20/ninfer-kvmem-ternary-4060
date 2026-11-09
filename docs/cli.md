@@ -284,7 +284,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--ngram-ram-mib N` | `disk`: budget for cached rows and their index (`0` disables); `ram-hot`: budget for the profile's resident rows and index | `0` for disk; `4096` for ram-hot |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01); DeepSeek-V4.1: without its Engram table (the IQ1_M release's perplexity on a 1,112-token WikiText slice rose from 3.07 to 9.68 on October 25) | off |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; DeepSeek-V4.1 BF16 only | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; the parser takes all nine on every build target, and a build that compiles only some of them (the `NINFER_KV_ATTN_CODING_*` CMake options) refuses the others by name at startup, listing the ones it carries (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; DeepSeek-V4.1 BF16 only | `bf16` |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
 | `--spec none\|mtp\|dflash\|dflash2\|dspark` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)); DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)) | `mtp` with 3 drafts for Flash-Next (with `--draft-min-p 0.5`); otherwise off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for DeepSeek-V4.1's context lookup; `1..5` for DSpark, its block | unset (their lookup: 3; DSpark: 5) |
@@ -383,7 +383,10 @@ KV format. The artifact describes its model configuration and weight representat
 `--kv-dtype` independently selects runtime KV storage, BF16 by default. All nine formats — `bf16`,
 `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
 build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
-*weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
+*weights and activations*, not to KV storage. A deployment build may compile only the codings it
+runs (the `NINFER_KV_ATTN_CODING_*` CMake options); the parser still takes all nine names, and the
+Engine refuses the ones this build left out, by name and with the list of the ones it carries, at
+startup. Measured size, decode speed and perplexity of seven of
 them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
 [configuration calculator](config-calculator.html).
 

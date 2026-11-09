@@ -9,6 +9,7 @@
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#include "ops/softmax_attention/kv_attn_coverage.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -528,20 +529,34 @@ void with_codings(KvCacheStorage storage, F&& f) {
         return f.template operator()<Coding::Bf16, Coding::Bf16, false, false>();
     case KvCacheStorage::Int8Group64:
         return f.template operator()<Coding::Int8, Coding::Int8, true, false>();
+#if NINFER_KV_ATTN_CODING_RK8V4
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         return f.template operator()<Coding::Int8, Coding::Int4, true, false>();
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4
     case KvCacheStorage::RotatedLloyd4KeyInt4Value:
         return f.template operator()<Coding::Lloyd4, Coding::Int4, true, false>();
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8:
         return f.template operator()<Coding::Int4E8, Coding::Int4, true, false>();
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
     case KvCacheStorage::RotatedE8RootKeyInt4Value:
         return f.template operator()<Coding::RootE8, Coding::Int4, true, false>();
+#endif
+#if NINFER_KV_ATTN_FP8
     case KvCacheStorage::Fp8E4M3Row256:
         return f.template operator()<Coding::Fp8, Coding::Fp8, true, false>();
+#endif
+#if NINFER_KV_ATTN_NVFP4
     case KvCacheStorage::Nvfp4Group16:
         return f.template operator()<Coding::Nvfp4, Coding::Nvfp4, true, true>();
+#endif
+#if NINFER_KV_ATTN_K8V4
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return f.template operator()<Coding::Fp8, Coding::Nvfp4, true, true>();
+#endif
     }
     throw std::invalid_argument("causal_attention_prompt_sm70: unknown KV storage");
 }

@@ -10,6 +10,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_pipelined.cuh"
 #include "ops/common/device_route.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+#include "ops/softmax_attention/kv_attn_coverage.h"
 #if defined(NINFER_TIER_VOLTA)
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
 #endif
@@ -44,7 +45,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
     // A U8 value plane is the packed signed int4 coding (rk8v4 and the packed-key storages); a
     // U8 key plane is a packed key coding, told apart by storage.
-    const bool packed_values = cache_v.dtype == DType::U8;
+    [[maybe_unused]] const bool packed_values = cache_v.dtype == DType::U8;
 #if defined(NINFER_TIER_VOLTA)
     if (current_device_volta()) {
         // Volta's own kernel (small_t_sm70.cuh) takes every INT8-family storage: the same grid,
@@ -75,15 +76,29 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     invocation.partition);
         };
-        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+        if (false) {
+        }
+#if NINFER_KV_ATTN_CODING_RK4V4
+        else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
             run.template operator()<true, KvKeyCoding::Lloyd4>();
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
+        else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             run.template operator()<true, KvKeyCoding::Int4E8>();
-        } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
+        else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             run.template operator()<true, KvKeyCoding::RootE8>();
-        } else if (packed_values) {
+        }
+#endif
+#if NINFER_KV_ATTN_CODING_RK8V4
+        else if (packed_values) {
             run.template operator()<true, KvKeyCoding::Int8>();
-        } else {
+        }
+#endif
+        else {
             run.template operator()<false, KvKeyCoding::Int8>();
         }
         CUDA_CHECK(cudaGetLastError());
@@ -135,15 +150,29 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     issue_pv.template operator()<PackedValues, Keys, false>();
                 }
             };
-            if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+            if (false) {
+            }
+#if NINFER_KV_ATTN_CODING_RK4V4
+            else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
                 issue.template operator()<true, KvKeyCoding::Lloyd4>();
-            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK4V4E8
+            else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
                 issue.template operator()<true, KvKeyCoding::Int4E8>();
-            } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK2V4E8
+            else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
                 issue.template operator()<true, KvKeyCoding::RootE8>();
-            } else if (packed_values) {
+            }
+#endif
+#if NINFER_KV_ATTN_CODING_RK8V4
+            else if (packed_values) {
                 issue.template operator()<true, KvKeyCoding::Int8>();
-            } else {
+            }
+#endif
+            else {
                 issue.template operator()<false, KvKeyCoding::Int8>();
             }
         };

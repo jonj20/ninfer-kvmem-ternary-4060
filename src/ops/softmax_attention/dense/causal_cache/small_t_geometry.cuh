@@ -15,9 +15,17 @@ decltype(auto) with_causal_small_t_geometry(std::int32_t query_heads, std::int32
         throw std::invalid_argument("causal small-T attention: unsupported head geometry");
     }
     if (query_heads / kv_heads == CausalD256H24Kv4::GroupSize) {
+#if NINFER_KV_ATTN_GEOM_H24
         return f.template operator()<CausalD256H24Kv4>();
+#else
+        throw std::invalid_argument("causal small-T attention: this build omits the H24 geometry");
+#endif
     }
+#if NINFER_KV_ATTN_GEOM_H16
     return f.template operator()<CausalD256H16Kv2>();
+#else
+    throw std::invalid_argument("causal small-T attention: this build omits the H16 geometry");
+#endif
 }
 
 } // namespace ninfer::ops::detail
