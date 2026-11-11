@@ -499,6 +499,9 @@ up. A router instead unloads the failed model once its requests are gone and rep
 | `GET /slots` | per-cell occupancy of the private context cache (see [Slots](#slots)) |
 | `POST /slots/{id}?action=save\|restore\|erase` | save a retained session to a file, restore one, or evict one (see [Slots](#slots)) |
 | `GET /props` | llama.cpp-shaped server properties: default sampling, context, lanes, modalities (see [Props](#props)) |
+| `GET /tools` | llama.cpp's server-side tool list; empty here, because NInfer's tools travel in the chat request |
+| `GET /api/monitor/snapshot` | the live request monitor: the requests in flight and the ones just finished, with the card's load, temperature, power and PCIe traffic |
+| `GET /kvmem/` | the monitoring view: this server's load, KV occupancy, KVMem state and live requests (see [WebUI](#webui)) |
 | `GET /v1` | endpoint index for the announced API base: the model alias and this table |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`, also as `context_window` and `context_length`), input modalities (`modalities.vision` and an OpenRouter-style `architecture`), and a llama.cpp-compatible `meta` object (see [Models](#models)) |
 | `GET /v1/models/{id}` | lookup of the configured alias with the same fields |
@@ -560,8 +563,9 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
  "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 2026-10-25.1+2026-10-25.1-5-gb3402a6fd",
- "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
- "cors_proxy_enabled": false}
+  "kv_dtype": "rk4v4-e8",
+  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
+  "cors_proxy_enabled": false}
 ```
 
 `n_ctx` is `--max-context` and `total_slots` is `--max-concurrency`. `n_predict` and its alias
@@ -571,6 +575,8 @@ cap. The sampler is the loaded model's preset for the default thinking mode (thi
 `--no-thinking`) under the process sampling flags and `--greedy`; request fields still override it
 per request. `seed` is `--seed`, or `-1` when requests draw a fresh random seed. `model_alias` is the
 public model id and `model_path` the artifact path the server was started with.
+`kv_dtype` is the `--kv-dtype` the server runs with. A build that does not carry that coding
+refuses it at startup, by name and with the list of the codings it carries.
 `cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). `build_info` is
 `ninfer <version>` (see [Server version](#server-version)). There is no `chat_template` or writable
 `POST /props`.
@@ -862,6 +868,18 @@ streamed Chat Completions, and prints the directory to configure with.
 ./scripts/fetch-webui.sh
 cmake -S . -B build -DNINFER_WEBUI_DIR=<the directory it printed>
 ```
+
+On Windows, `scripts\fetch-webui.bat` does the same (the tag defaults to the same release).
+
+The monitoring view is ours and ships with every build: `GET /kvmem/` serves a page that reads
+this server's own `/stats`, `/props` and `/api/monitor/snapshot` and shows the card's load, the KV
+occupancy on the device and in host memory, the KVMem window, sessions, history and payload tiers,
+the scheduler's queue and the live requests. `GET /monitor/` serves it too, unless the WebUI bundle
+carries a monitor page of its own. It needs no API key, like the WebUI's pages.
+
+`GET /tools` answers llama.cpp's server-side tool list. NInfer's tools travel in the chat request
+(the model calls the client's tools), so the list is empty and the WebUI offers no execution the
+server does not have.
 
 `--ui-config-file PATH` gives the WebUI settings that survive a restart: the file holds one JSON
 object of the WebUI's setting keys, which `/props` reports as `ui_settings` and the WebUI applies

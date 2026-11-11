@@ -46,25 +46,29 @@ target_link_libraries(ninfer_serve
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_product_prompt_input
           ${NINFER_CUDART_TARGET})
 
-# A WebUI is compiled in only from a local directory, never downloaded at configure time, so offline
-# and hermetic builds are unaffected. scripts/fetch-webui.sh unpacks llama.cpp's released WebUI into
-# such a directory.
+# The WebUI is compiled in only from local directories, never downloaded at configure time, so
+# offline and hermetic builds are unaffected. scripts/fetch-webui.sh (scripts/fetch-webui.bat on
+# Windows) unpacks llama.cpp's released WebUI into such a directory; NINFER_WEBUI_DIR names it.
+# The monitoring view is ours and ships with every build: it reads the server's own /stats and
+# /api/monitor/snapshot and is served from the same port, under /kvmem/.
 set(NINFER_WEBUI_DIR "" CACHE PATH
-    "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty embeds none")
+    "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty serves the monitoring view alone")
+set(NINFER_WEBUI_MONITOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webui/kvmem")
+add_executable(ninfer_webui_embed webui/embed.cpp)
+file(GLOB_RECURSE NINFER_WEBUI_MONITOR_FILES CONFIGURE_DEPENDS "${NINFER_WEBUI_MONITOR_DIR}/*")
+set(NINFER_WEBUI_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/webui_assets.cpp")
+set(NINFER_WEBUI_EMBED_SPECS "${NINFER_WEBUI_MONITOR_DIR}=kvmem")
 if(NINFER_WEBUI_DIR)
   if(NOT EXISTS "${NINFER_WEBUI_DIR}/index.html" AND NOT EXISTS "${NINFER_WEBUI_DIR}/index.html.gz")
     message(FATAL_ERROR "NINFER_WEBUI_DIR has no index.html: ${NINFER_WEBUI_DIR}")
   endif()
-  add_executable(ninfer_webui_embed webui/embed.cpp)
   file(GLOB_RECURSE NINFER_WEBUI_FILES CONFIGURE_DEPENDS "${NINFER_WEBUI_DIR}/*")
-  set(NINFER_WEBUI_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/webui_assets.cpp")
-  add_custom_command(
-    OUTPUT "${NINFER_WEBUI_SOURCE}"
-    COMMAND ninfer_webui_embed "${NINFER_WEBUI_SOURCE}" "${NINFER_WEBUI_DIR}"
-    DEPENDS ninfer_webui_embed ${NINFER_WEBUI_FILES}
-    COMMENT "Embedding the WebUI from ${NINFER_WEBUI_DIR}"
-    VERBATIM)
-  target_sources(ninfer_serve PRIVATE "${NINFER_WEBUI_SOURCE}")
-else()
-  target_sources(ninfer_serve PRIVATE webui_none.cpp)
+  list(INSERT NINFER_WEBUI_EMBED_SPECS 0 "${NINFER_WEBUI_DIR}")
 endif()
+add_custom_command(
+  OUTPUT "${NINFER_WEBUI_SOURCE}"
+  COMMAND ninfer_webui_embed "${NINFER_WEBUI_SOURCE}" ${NINFER_WEBUI_EMBED_SPECS}
+  DEPENDS ninfer_webui_embed ${NINFER_WEBUI_FILES} ${NINFER_WEBUI_MONITOR_FILES}
+  COMMENT "Embedding the WebUI and the monitoring view"
+  VERBATIM)
+target_sources(ninfer_serve PRIVATE "${NINFER_WEBUI_SOURCE}")

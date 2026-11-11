@@ -1,6 +1,8 @@
-// Build-time generator for the WebUI files of ninfer-serve: `embed <out.cpp> <asset-dir>` writes one
+// Build-time generator for the WebUI files of ninfer-serve: `embed <out.cpp> <spec>...` writes one
 // translation unit that defines webui_assets() and find_webui_asset() over every file below the
-// directory. A file ending in .gz is served as its inner name with Content-Encoding: gzip.
+// given directories. A spec is a directory, optionally followed by "=<prefix>" to place its files
+// under that prefix (the first spec without a prefix is the site's root and must carry an
+// index.html). A file ending in .gz is served as its inner name with Content-Encoding: gzip.
 
 #include <algorithm>
 #include <cstdint>
@@ -62,36 +64,51 @@ std::string escaped(const std::string& text) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: %s <out.cpp> <asset-dir>\n", argv[0]);
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s <out.cpp> <dir>[=<prefix>] ...\n", argv[0]);
         return 2;
     }
-    const fs::path root = argv[2];
     std::vector<Asset> assets;
-    for (const auto& entry : fs::recursive_directory_iterator(root)) {
-        if (!entry.is_regular_file()) { continue; }
-        Asset asset;
-        asset.path = entry.path().lexically_relative(root).generic_string();
-        if (asset.path.size() > 3 && asset.path.ends_with(".gz")) {
-            asset.path.resize(asset.path.size() - 3);
-            asset.encoding = "gzip";
+    bool root_given = false;
+    bool root_has_index = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string spec = argv[i];
+        std::string prefix;
+        const std::size_t eq = spec.find('=');
+        if (eq != std::string::npos) {
+            prefix = spec.substr(eq + 1);
+            spec   = spec.substr(0, eq);
         }
-        asset.content_type = content_type_for(asset.path);
-        std::ifstream in(entry.path(), std::ios::binary);
-        asset.bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        if (!in.good() && !in.eof()) {
-            std::fprintf(stderr, "embed: cannot read %s\n", entry.path().string().c_str());
-            return 1;
+        const fs::path root = spec;
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file()) { continue; }
+            Asset asset;
+            asset.path = entry.path().lexically_relative(root).generic_string();
+            if (!prefix.empty()) { asset.path = prefix + "/" + asset.path; }
+            if (asset.path.size() > 3 && asset.path.ends_with(".gz")) {
+                asset.path.resize(asset.path.size() - 3);
+                asset.encoding = "gzip";
+            }
+            asset.content_type = content_type_for(asset.path);
+            std::ifstream in(entry.path(), std::ios::binary);
+            asset.bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            if (!in.good() && !in.eof()) {
+                std::fprintf(stderr, "embed: cannot read %s\n", entry.path().string().c_str());
+                return 1;
+            }
+            assets.push_back(std::move(asset));
         }
-        assets.push_back(std::move(asset));
+        if (prefix.empty()) {
+            root_given     = true;
+            root_has_index = std::any_of(assets.begin(), assets.end(),
+                                         [](const Asset& a) { return a.path == "index.html"; });
+        }
     }
     std::sort(assets.begin(), assets.end(), [](const Asset& a, const Asset& b) {
         return a.path != b.path ? a.path < b.path : a.encoding < b.encoding;
     });
-    const bool has_index = std::any_of(assets.begin(), assets.end(),
-                                       [](const Asset& a) { return a.path == "index.html"; });
-    if (!has_index) {
-        std::fprintf(stderr, "embed: %s has no index.html\n", root.string().c_str());
+    if (root_given && !root_has_index) {
+        std::fprintf(stderr, "embed: no index.html in the site root\n");
         return 1;
     }
 

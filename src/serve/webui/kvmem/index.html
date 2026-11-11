@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NInfer monitor</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #101317; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --dim: #97a0ad;
+    --ok: #4cc38a; --warn: #e3b341; --bad: #f0616d; --accent: #6aa9ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+           padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .kv { color: var(--dim); }
+  header .kv b { color: var(--text); font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); display: inline-block; }
+  .dot.up { background: var(--ok); }
+  main { padding: 14px 18px 40px; }
+  .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card h2 { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em;
+             text-transform: uppercase; color: var(--dim); }
+  .big { font-size: 19px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 12px; }
+  .bar { height: 5px; border-radius: 3px; background: #232832; margin-top: 7px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.warn { background: var(--warn); } .bar > i.bad { background: var(--bad); }
+  section { margin-top: 18px; }
+  section > h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+                 margin: 0 0 8px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .grid2 { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .kvlist { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .kvlist div { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .kvlist span:first-child { color: var(--dim); }
+  .kvlist span:last-child { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--dim); padding: 8px 2px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>NInfer monitor</h1>
+  <span class="kv">model <b id="model">-</b></span>
+  <span class="kv">kv <b id="kv">-</b></span>
+  <span class="kv">context <b id="ctx">-</b></span>
+  <span class="kv">build <b id="build">-</b></span>
+  <span class="kv">uptime <b id="uptime">-</b></span>
+  <span class="kv" style="margin-left:auto"><a href="/" style="color:var(--accent)">chat UI</a></span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>Requests</h2>
+    <table>
+      <thead><tr><th>id</th><th>endpoint</th><th>status</th><th class="num">prompt</th>
+        <th class="num">cached</th><th class="num">generated</th><th class="num">prefill</th>
+        <th class="num">decode</th><th class="num">elapsed</th></tr></thead>
+      <tbody id="requests"></tbody>
+    </table>
+  </section>
+
+  <div class="grid2">
+    <section>
+      <h2>KVMem</h2>
+      <div class="kvlist" id="kvmem"></div>
+    </section>
+    <section>
+      <h2>Scheduler and cache</h2>
+      <div class="kvlist" id="sched"></div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const num = (v) => (v === undefined || v === null) ? "-" :
+  (typeof v === "number" ? v.toLocaleString("en-US", { maximumFractionDigits: 1 }) : String(v));
+const gib = (b) => (b === undefined || b === null) ? "-" : (b / (1 << 30)).toFixed(2) + " GiB";
+const mib = (b) => (b === undefined || b === null) ? "-" : (b / (1 << 20)).toFixed(0) + " MiB";
+const pct = (a, b) => (!b) ? 0 : Math.max(0, Math.min(100, (a / b) * 100));
+const rows = (el, pairs) => {
+  $(el).innerHTML = pairs.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join("");
+};
+const card = (title, big, sub, ratio, level) => `
+  <div class="card"><h2>${title}</h2><div class="big">${big}</div><div class="sub">${sub}</div>
+  ${ratio === undefined ? "" : `<div class="bar"><i class="${level || ""}" style="width:${ratio}%"></i></div>`}</div>`;
+
+async function get(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+async function tick() {
+  try {
+    const [stats, snap, props] = await Promise.all([
+      get("/stats"), get("/api/monitor/snapshot"), get("/props")]);
+    $("dot").classList.add("up");
+    const cap = stats.capacity || {}, occ = stats.context_cache?.occupancy || {};
+    const kv = stats.kvmem || {}, tps = stats.throughput_tokens_per_second || {};
+    const hw = snap.hardware || {}, gpu = (hw.gpus || [])[0] || {};
+    const kvmemUsage = props.kvmem?.usage || {};
+
+    $("model").textContent = stats.model || "-";
+    $("kv").textContent = props.kvmem?.kv_dtype || props.kv_dtype || "-";
+    $("ctx").textContent = num(cap.max_context);
+    $("build").textContent = props.build_info || "-";
+    $("uptime").textContent = Math.round(stats.uptime_seconds || 0) + " s";
+
+    const kvPages = occ.device_main_kv_pages || 0;
+    const kvPagesLease = occ.device_main_kv_lease_pages || 0;
+    $("cards").innerHTML = [
+      card("GPU", gpu.utilization_percent !== undefined ? gpu.utilization_percent + "%" : "-",
+           gpu.name || "-", gib(gpu.used_bytes) + " / " + gib(gpu.total_bytes),
+           pct(gpu.used_bytes, gpu.total_bytes), pct(gpu.used_bytes, gpu.total_bytes) > 92 ? "bad" : ""),
+      card("GPU temperature", gpu.temperature_c !== undefined ? gpu.temperature_c + " C" : "-",
+           (gpu.power_w !== undefined ? gpu.power_w.toFixed(1) + " W" : "-") +
+           " | PCIe " + (gpu.pcie_width || "-") + "x" + (gpu.pcie_generation || "-"),
+           undefined),
+      card("CPU / RAM", (hw.cpu_percent !== undefined ? hw.cpu_percent.toFixed(0) + "%" : "-"),
+           gib(hw.ram_used_bytes) + " / " + gib(hw.ram_total_bytes),
+           pct(hw.ram_used_bytes, hw.ram_total_bytes)),
+      card("KV on device", num(kvPages) + " / " + num(cap.kv_capacity_pages) + " pages",
+           num(cap.kv_capacity_tokens) + " tokens | lease " + num(kvPagesLease) +
+           " | host " + mib(occ.host_kv_bytes),
+           pct(kvPages + kvPagesLease, cap.kv_capacity_pages)),
+      card("Throughput", (tps.decode || 0).toFixed(1) + " tok/s",
+           "prefill " + (tps.prefill || 0).toFixed(1) + " tok/s | decode tokens " +
+           num(stats.tokens?.committed_decode) + " | prefill tokens " + num(stats.tokens?.computed_prefill),
+           undefined),
+      card("Requests", num(stats.requests?.running) + " running",
+           "admitted " + num(stats.requests?.admitted) + " | waiting " + num(stats.requests?.waiting) +
+           " | peak " + num(stats.requests?.peak_admitted),
+           undefined),
+    ].join("");
+
+    const live = (snap.active || []).concat(snap.recent || []).slice(0, 12);
+    $("requests").innerHTML = live.length ? live.map((r) => `<tr>
+      <td>${r.id ?? "-"}</td><td>${r.endpoint ?? "-"}</td><td>${r.status ?? "-"}</td>
+      <td class="num">${num(r.prompt_tokens)}</td><td class="num">${num(r.cached_tokens)}</td>
+      <td class="num">${num(r.generated_tokens)}</td>
+      <td class="num">${r.prefill_tps ? r.prefill_tps.toFixed(1) : "-"}</td>
+      <td class="num">${r.decode_tps ? r.decode_tps.toFixed(1) : "-"}</td>
+      <td class="num">${r.elapsed_ms !== undefined ? r.elapsed_ms + " ms" : "-"}</td></tr>`).join("")
+      : `<tr><td colspan="9" class="empty">no request yet</td></tr>`;
+
+    rows("kvmem", [
+      ["enabled", kv.enabled ? "yes" : "no"],
+      ["selected tokens", num(kvmemUsage.selected_tokens ?? kv.selected_tokens)],
+      ["reserve tokens", num(kvmemUsage.reserve_tokens ?? kv.reserve_tokens)],
+      ["sessions", num(kv.active_sessions) + " active / " + num(kv.retained_sessions) + " retained"],
+      ["resident pages", num(kv.resident_pages)],
+      ["history hits / misses", num(kv.history_hits) + " / " + num(kv.history_misses)],
+      ["history evictions", num(kv.history_evictions)],
+      ["swaps", num(kv.history_swaps)],
+      ["host payload", mib(kv.host_payload_bytes) + " / " + mib(kv.host_payload_budget_bytes)],
+      ["disk payload", mib(kv.disk_payload_bytes) + " / " + mib(kv.disk_payload_budget_bytes)],
+      ["checkpoints", mib(kv.checkpoint_bytes) + " / " + num(kv.checkpoint_tokens) + " tokens"],
+      ["evaluated tokens", num(kv.evaluated_tokens)],
+    ]);
+
+    const cc = stats.context_cache || {}, pr = cc.pressure || {};
+    rows("sched", [
+      ["running", num(stats.scheduler?.running)],
+      ["prefilling", num(stats.scheduler?.prefilling)],
+      ["decode ready", num(stats.scheduler?.decode_ready)],
+      ["materializing", num(stats.scheduler?.materializing)],
+      ["waiting", num(stats.scheduler?.waiting)],
+      ["queue depth", num(stats.queue?.depth)],
+      ["device state slots", num(occ.device_state_slots)],
+      ["host state slots", num(occ.host_state_slots)],
+      ["reused prompt tokens", num(stats.counters?.reused_prompt_tokens)],
+      ["KV transfers d2h / h2d", mib(cc.main_kv_transfers?.d2h?.bytes) + " / " + mib(cc.main_kv_transfers?.h2d?.bytes)],
+      ["state transfers d2h / h2d", num(cc.state_transfers?.d2h?.count) + " / " + num(cc.state_transfers?.h2d?.count)],
+      ["pressure: evicted / degraded", num(pr.private_owners_evicted) + " / " + num(pr.private_owners_degraded)],
+      ["pressure: searches", num(pr.searches)],
+    ]);
+  } catch (e) {
+    $("dot").classList.remove("up");
+    console.error(e);
+  }
+}
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

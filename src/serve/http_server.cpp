@@ -40,7 +40,7 @@ bool is_api_path(std::string_view path) {
            path == "/stats" || path == "/slots" || path == "/props" || path == "/models" ||
            path.starts_with("/models/") || path == "/completion" || path == "/completions" ||
            path == "/tokenize" || path == "/detokenize" || path == "/apply-template" ||
-           path == "/rerank" || path == "/reranking" || path == kMcpProxyPath;
+           path == "/tools" || path == "/rerank" || path == "/reranking" || path == kMcpProxyPath;
 }
 
 
@@ -661,6 +661,13 @@ void HttpServer::register_routes() {
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
+    // llama.cpp's server-side tool list. NInfer's tools travel in the chat request (the model
+    // calls the client's tools), so the list of tools the server itself offers is empty. The
+    // WebUI reads this route to show that list, and an empty one keeps it from offering an
+    // execution the server does not have.
+    server_.Get("/tools", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("[]", "application/json");
+    });
     for (const char* base : {"/v1", "/v1/"}) {
         server_.Get(base, [this](const httplib::Request&, httplib::Response& res) {
             res.set_content(
@@ -802,10 +809,18 @@ void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& re
     }
     const bool gzip         = req.get_header_value("Accept-Encoding").find("gzip") != std::string::npos;
     if (req.path == "/monitor") { res.set_redirect("/monitor/"); return; }
-    const std::string asset_path = req.path == "/monitor/" ? "/monitor/index.html" : req.path;
+    // A directory path serves its own index.html ("/kvmem/" -> "kvmem/index.html"); the site's
+    // root ("/") is the bundle's index.html, and any path the bundle does not carry falls back to
+    // it, which is how the chat UI's client-side router keeps its own routes.
+    std::string asset_path = req.path;
+    if (!asset_path.empty() && asset_path.back() == '/') { asset_path += "index.html"; }
     const WebUiAsset* asset = asset_path.size() > 1
                                   ? find_webui_asset(std::string_view(asset_path).substr(1), gzip)
                                   : nullptr;
+    // The WebUI's own monitor page when the bundle carries one, our monitoring view otherwise.
+    if (asset == nullptr && req.path.starts_with("/monitor")) {
+        asset = find_webui_asset("kvmem/index.html", gzip);
+    }
     if (asset == nullptr) { asset = find_webui_asset("index.html", gzip); }
     if (asset == nullptr) {
         res.status = 404;
@@ -1098,6 +1113,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"model_path", options.artifact_path},
         {"modalities", {{"vision", options.enable_vision}, {"audio", false}}},
         {"build_info", "ninfer " + options_.build_version},
+        {"kv_dtype", ninfer::kv_attn_storage_name(options.kv_cache)},
         {"is_sleeping", service.residency().state == ninfer::ModelResidency::Suspended},
         {"endpoint_slots", true},
         {"endpoint_props", true},

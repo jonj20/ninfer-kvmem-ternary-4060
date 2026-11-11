@@ -95,6 +95,20 @@ if exist "%BLD%\CMakeCache.txt" (
   )
 )
 
+rem The WebUI is llama.cpp's own, unpacked by scripts\fetch-webui.bat into third_party\webui
+rem (git-ignored). The build embeds it into ninfer-serve, which then serves it from its own port:
+rem no second web service. Without it the binary has no UI and --no-webui has nothing to hide.
+set "WEBUI_DIR="
+if exist "%ROOT%\third_party\webui" (
+  for /f "delims=" %%F in ('dir /b /s "%ROOT%\third_party\webui\index.html" 2^>nul') do if not defined WEBUI_DIR set "WEBUI_DIR=%%~dpF"
+)
+if defined WEBUI_DIR (
+  if "%WEBUI_DIR:~-1%"=="\" set "WEBUI_DIR=%WEBUI_DIR:~0,-1%"
+  echo WebUI: %WEBUI_DIR%
+) else (
+  echo WebUI: none (run scripts\fetch-webui.bat to unpack llama.cpp's WebUI)
+)
+
 if not defined BLD_ONLY (
   echo === configuring %BLD% ===
   cmake -S "%ROOT%" -B "%BLD%" -G Ninja ^
@@ -107,6 +121,7 @@ if not defined BLD_ONLY (
     -DNINFER_BUILD_APPS=ON ^
     -DNINFER_BUILD_BENCHMARKS=OFF ^
     -DNINFER_CUDA_PRUNE_PTX=ON ^
+    -DNINFER_WEBUI_DIR="%WEBUI_DIR%" ^
     -DNINFER_KV_ATTN_CODING_RK8V4=ON ^
     -DNINFER_KV_ATTN_CODING_RK4V4=ON ^
     -DNINFER_KV_ATTN_CODING_RK4V4E8=ON ^
