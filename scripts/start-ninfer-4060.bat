@@ -18,7 +18,7 @@ rem                                      [-log-level L] [-log-colours on|off] [-
 rem
 rem Defaults for 27B MoE + KVMem + MTP on RTX 4060 (8 GB):
 rem   ctx=262144, budget=23040, reserve=2048, hostmib=12288, sink=12288, recent=1024,
-rem   sessions=1, prefill=256, drafts=2, kvtype=nvfp4, concurrency=1, device=0,
+rem   sessions=1, prefill=256, drafts=2, kvtype=rk4v4-e8, concurrency=1, device=0,
 rem   expert-residency=device, expert-cache-mib=auto, fast-prefill=off, mtp-q4=off,
 rem   gdn-fp16=off, cuda-policy=default, stats-port=off, cors=off, log-level=info
 rem
@@ -26,10 +26,10 @@ rem The kvtype must be one the build carries: scripts\build-ninfer-4060.bat comp
 rem rk4v4, rk4v4-e8 and nvfp4 (and always bf16 and int8). The server refuses any other coding by
 rem name at startup, so a build and a launcher that disagree fail there, not inside the first
 rem generation.
-rem Their KV sizes differ: rk8v4 holds 8-bit keys, rk4v4/rk4v4-e8 4-bit keys and nvfp4 4-bit keys
-rem with a group-16 scale, so a context that fits one does not always fit the other on an 8 GB card.
-rem Their speeds differ too: rk8v4 decodes fastest, nvfp4 slowest (docs\cli.md, "Context and
-rem memory").
+rem rk4v4-e8 is the default: measured on this card at a 17,088-token KVMem budget (one prompt,
+rem one 160-token answer each), it needs 925.6 MiB of KV runtime, the same as rk4v4 and nvfp4,
+rem and decodes at 68.3 tok/s against nvfp4's 66.5 and rk8v4's 64.4 - and rk8v4's 8-bit keys
+rem cost 14% more memory for no speed. docs\cli.md has the formats' size and quality numbers.
 
 set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
@@ -48,7 +48,7 @@ set "RECENT=1024"
 set "SESSIONS=1"
 set "PRE=256"
 set "DRAFTS=2"
-set "KVTYPE=nvfp4"
+set "KVTYPE=rk4v4-e8"
 set "CONCURRENCY=1"
 set "DEVICE=0"
 set "DEVICES="
