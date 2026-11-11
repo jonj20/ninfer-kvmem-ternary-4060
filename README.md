@@ -8,6 +8,11 @@ own, all from one process on one port.
 This repository is a fork, not a new engine. It carries upstream's code and changes only what this
 deployment needs.
 
+> **The old branch is deprecated.** The earlier version stays on `main`
+> (<https://github.com/jonj20/ninfer-kvmem-ternary-4060/tree/main>) and is no longer maintained;
+> the work continues on `master`. What follows describes `master`. A Chinese version of this file
+> is [README.zh-CN.md](README.zh-CN.md).
+
 - **Upstream:** [NInfer-all](https://github.com/iamwavecut/ninfer-all) (which continues
   [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line), at base commit
   `d0da39796697b79fd08fc570e1781d75943dddb1`.
@@ -215,3 +220,5 @@ The KV format numbers this branch measured on its own card are in
 This fork keeps upstream's [LICENSE](LICENSE) and [NOTICE](NOTICE), and credits
 [CONTRIBUTORS.md](CONTRIBUTORS.md). NInfer-all continues [NInfer](https://github.com/Neroued/ninfer)
 by Neroued; the KVMem line and this deployment carry the work of several forks.
+
+[中文版](README.zh-CN.md)
